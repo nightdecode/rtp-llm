@@ -726,6 +726,31 @@ TEST(PlannerGroupA, A11b_BothSidesShardedAndEqualIsAllowed) {
     expectAllRouteBytesMatch(result.plan);
 }
 
+TEST(PlannerGroupA, LocalFullPageRoundRobinRoutesEachKeyOnce) {
+    for (const auto& [src_tp, dst_tp] : {std::pair<int, int>{8, 4}, {4, 8}, {8, 8}}) {
+        auto src               = mlaLayout(src_tp, CPRotateMethod::ALL_GATHER, true);
+        auto dst               = mlaLayout(dst_tp);
+        src.local_full_page_rr = true;
+        dst.local_full_page_rr = true;
+        dst.pc.role_type       = RoleType::DECODE;
+
+        const auto result = KVCacheTransferPlanner::plan(src, dst, {kFullTag});
+        ASSERT_TRUE(result.ok()) << result.error.ToString();
+        ASSERT_EQ(result.plan.routes.size(), static_cast<size_t>(std::max(src_tp, dst_tp)));
+        constexpr size_t kKeyCount = 17;
+        std::vector<int> visits(kKeyCount, 0);
+        for (const auto& route : result.plan.routes) {
+            for (const auto pos : KVCacheTransferPlanner::resolveKeys(route.src_keys, kKeyCount)) {
+                EXPECT_EQ(route.src_rank, static_cast<int>(pos % src_tp));
+                EXPECT_EQ(route.dst_rank, static_cast<int>(pos % dst_tp));
+                ++visits[pos];
+            }
+        }
+        EXPECT_EQ(visits, std::vector<int>(kKeyCount, 1));
+        expectAllRouteBytesMatch(result.plan);
+    }
+}
+
 // ===========================================================================
 // 组 B：键选择规则的展开
 // ===========================================================================
@@ -827,6 +852,51 @@ TEST(PlannerGroupB, LinearStateRejectsUnsupportedAsymmetricHeadSharding) {
         EXPECT_EQ(route.src_partition.count, 1);
         EXPECT_EQ(route.dst_partition.count, 1);
     }
+}
+
+TEST(PlannerGroupB, LinearQkvRoutesHeadPartitionsIndependentlyOfPageRoundRobin) {
+    const auto linear_layout = [](int tp, RoleType role) {
+        ShardLayout layout;
+        layout.pc                                      = makePc(tp, CPRotateMethod::ALL_GATHER, true);
+        layout.pc.role_type                            = role;
+        layout.pc.prefill_cp_config.preserve_tp_layout = true;
+        layout.local_full_page_rr                      = true;
+        layout.cache_key_tokens_per_block              = kSeqSizePerBlock;
+        auto&        group                             = layout.groups[kFixedTag];
+        const size_t factor                            = 8 / tp;
+        group.policy                                   = defaultCacheGroupPolicy(CacheGroupType::LINEAR);
+        group.spec_type                                = KVCacheSpecType::LinearAttention;
+        group.seq_size_per_block                       = kSeqSizePerBlock;
+        group.k_block_payload_bytes                    = 64 * factor;
+        group.linear_history_rows                      = 3;
+        group.linear_q_row_bytes                       = 8 * factor;
+        group.linear_k_row_bytes                       = 8 * factor;
+        group.linear_v_row_bytes                       = 16 * factor;
+        group.kv_block_stride_bytes                    = (64 + 3 * (8 + 8 + 16)) * factor;
+        layout.deriveHeadShardCounts();
+        return layout;
+    };
+
+    const auto src    = linear_layout(8, RoleType::PREFILL);
+    auto       dst    = linear_layout(4, RoleType::DECODE);
+    const auto result = KVCacheTransferPlanner::plan(src, dst, {kFixedTag});
+    ASSERT_TRUE(result.ok()) << result.error.ToString();
+    ASSERT_EQ(result.plan.routes.size(), 8u);
+    for (const auto& route : result.plan.routes) {
+        EXPECT_TRUE(route.linear_qkv_segments);
+        EXPECT_EQ(route.dst_rank, route.src_rank / 2);
+        EXPECT_EQ(route.src_partition, (PartitionSpec{1, 0}));
+        EXPECT_EQ(route.dst_partition, (PartitionSpec{2, route.src_rank % 2}));
+        EXPECT_EQ(KVCacheTransferPlanner::resolveKeys(route.src_keys, 17), (std::vector<size_t>{16}));
+    }
+    expectAllRouteBytesMatch(result.plan);
+
+    // Total bytes still match, but changing the component boundaries is unsafe.
+    ++dst.groups[kFixedTag].linear_q_row_bytes;
+    --dst.groups[kFixedTag].linear_v_row_bytes;
+    const auto mismatched = KVCacheTransferPlanner::plan(src, dst, {kFixedTag});
+    EXPECT_FALSE(mismatched.ok());
+    EXPECT_NE(mismatched.error.ToString().find("incompatible LINEAR_QKV layout"), std::string::npos);
 }
 
 TEST(PlannerGroupB, UnscaledStateGroupDoesNotCompactKeysByTransportCp) {

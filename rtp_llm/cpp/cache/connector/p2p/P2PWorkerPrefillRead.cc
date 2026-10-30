@@ -466,19 +466,21 @@ int P2PWorkerPrefillRead::sendLayerToPartitions(const std::shared_ptr<LayerCache
         if (!route.sendsLayer(layer_id, layer_cache_buffer->cacheTag())) {
             continue;
         }
+        const auto*  spec = config_.topology ? config_.topology->group(route.cache_tag).spec.get() : nullptr;
         const size_t payload_bytes =
-            route.slice_payload_bytes != 0 ?
-                route.slice_payload_bytes :
-                (config_.topology ? config_.topology->group(route.cache_tag).spec->k_block_payload_bytes() : 0);
+            route.slice_payload_bytes != 0 ? route.slice_payload_bytes : (spec ? spec->k_block_payload_bytes() : 0);
 
         // partition / slice 均来自 route（本侧那一半）。§2.3 的修正就在这里生效：
         // NP1D 下 planner 给源端的是 {1,0}（整块），不再对本地 block 二次切分。
-        auto key_block_infos = LayerCacheBufferUtil::buildKeyBlockInfosSliced(layer_block_converter_,
-                                                                              layer_cache_buffer,
-                                                                              route.partition.count,
-                                                                              route.partition.id,
-                                                                              route.slice,
-                                                                              payload_bytes);
+        auto key_block_infos = route.linear_qkv_segments ?
+                                   LayerCacheBufferUtil::buildKeyBlockInfosLinearQkv(
+                                       layer_block_converter_, layer_cache_buffer, route.partition, spec) :
+                                   LayerCacheBufferUtil::buildKeyBlockInfosSliced(layer_block_converter_,
+                                                                                  layer_cache_buffer,
+                                                                                  route.partition.count,
+                                                                                  route.partition.id,
+                                                                                  route.slice,
+                                                                                  payload_bytes);
         if (!key_block_infos.ok() || key_block_infos.value().empty()
             || key_block_infos.value().size() != layer_cache_buffer->blockIdMap().size()) {
             const std::string conversion_message =

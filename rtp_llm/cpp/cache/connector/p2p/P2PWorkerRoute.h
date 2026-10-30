@@ -32,6 +32,7 @@ struct P2PWorkerRoute {
     uint32_t    dst_port = 0;
     std::set<int> prefill_layer_ids;
     size_t        slice_payload_bytes = 0;
+    bool          linear_qkv_segments = false;
 
     bool sendsLayer(int layer_id, const std::string& tag) const {
         return cache_tag == tag && (prefill_layer_ids.empty() || prefill_layer_ids.count(layer_id) != 0);

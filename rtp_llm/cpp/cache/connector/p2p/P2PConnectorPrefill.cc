@@ -440,6 +440,7 @@ bool P2PConnectorPrefill::processReadPerRank(int64_t                            
         worker_route.partition = local.partition;
         worker_route.slice     = local.slice;
         worker_route.slice_payload_bytes = route_pb.slice_payload_bytes();
+        worker_route.linear_qkv_segments = local.linear_qkv_segments;
         for (auto layer_id : route_pb.prefill_layer_ids()) {
             if (!config_.worker_config.topology || layer_id >= config_.worker_config.topology->layers().size()
                 || !worker_route.prefill_layer_ids.insert(layer_id).second) {

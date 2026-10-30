@@ -99,6 +99,7 @@ struct TransferRoute {
     std::vector<LayerMapping> layers                     = {};
     size_t                    src_slice_payload_bytes    = 0;
     size_t                    dst_slice_payload_bytes    = 0;
+    bool                      linear_qkv_segments        = false;
 };
 
 struct TransferPlan {

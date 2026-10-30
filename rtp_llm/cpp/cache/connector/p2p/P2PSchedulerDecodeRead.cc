@@ -179,8 +179,11 @@ P2PSchedulerDecodeRead::buildDecodeRankRoutes(const TransferPlan&        plan,
                                      std::min(logical_count, window_begin + static_cast<size_t>(block_range.second)) :
                                      logical_count;
 
-    const auto layout = ShardLayoutFactory::fromTopology(
-        *config_.topology, config_.parallelism_config, RoleType::DECODE, config_.cache_key_tokens_per_block);
+    const auto layout = ShardLayoutFactory::fromTopology(*config_.topology,
+                                                         config_.parallelism_config,
+                                                         RoleType::DECODE,
+                                                         config_.cache_key_tokens_per_block,
+                                                         config_.local_full_page_rr);
     for (const auto& route : plan.routes) {
         if (route.dst_rank < 0 || static_cast<size_t>(route.dst_rank) >= worker_num
             || !layout.hasGroup(route.cache_tag)) {
@@ -201,8 +204,12 @@ P2PSchedulerDecodeRead::buildDecodeRankRoutes(const TransferPlan&        plan,
                 continue;
             }
             const int cp_size = layout.physicalCpSize(route->cache_tag);
-            // COMPACT keeps the same state slots on every Decode rank; FULL uses identity mapping.
-            const int       worker_cp_rank = 0;
+            // FULL PageRR resolves the logical key against this worker's local table.
+            // Compact state slots remain identical on all Decode ranks.
+            const int worker_cp_rank =
+                layout.effectiveMapping(route->cache_tag) == CpBlockMappingMode::BLOCK_ROUND_ROBIN ?
+                    layout.routeCpRank(static_cast<int>(worker_rank), route->cache_tag) :
+                    0;
             TransferRoutePB pb;
             RouteCodec::encodeForDecode(*route, &pb);
             const auto append_buffer = [&](const std::shared_ptr<LayerCacheBuffer>& buffer) {
