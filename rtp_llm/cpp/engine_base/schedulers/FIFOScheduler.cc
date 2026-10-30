@@ -324,7 +324,9 @@ bool FIFOScheduler::tryAdmitWaitingStream(ScheduleRuntime&         runtime,
         return false;
     }
     // PD decode streams may already carry CanRun before FIFO admission.
-    if (!evaluateRunningBatch(runtime, stream)) {
+    bool newly_reserved = false;
+    if (!evaluateRunningBatch(runtime, stream)
+        || !stream->streamCacheResource().reserveLinearReplaySlot(&newly_reserved)) {
         return false;
     }
 
@@ -338,6 +340,9 @@ bool FIFOScheduler::tryAdmitWaitingStream(ScheduleRuntime&         runtime,
     const bool load_initiated = !load_initiated_before && stream->hasEvent(StreamEvents::LoadInitiated);
     const bool progressed     = state == StreamState::RUNNING || state == StreamState::LOADING_CACHE
                             || (state == StreamState::WAITING && (kv_initialized || load_initiated));
+    if (newly_reserved && !progressed) {
+        stream->streamCacheResource().releaseUnusedLinearReplaySlot();
+    }
     runtime.newly_inited_kv_streams += kv_initialized;
     // Explicit groups are checked as a batch before their loads finish and they are published.
     // Ordinary fixed-workspace streams go through admission again when cache loading completes.

@@ -711,6 +711,14 @@ public:
     bool deferResourceReleaseIfBusy();
     bool isDeferredReleasePending() const;
 
+    using LinearReplayWindow = rtp_llm::LinearReplayWindow;
+    using LinearReplayRound  = rtp_llm::LinearReplayRound;
+
+    absl::StatusOr<LinearReplayRound> prepareLinearReplayRound();
+    void publishLinearReplayWindow(std::shared_ptr<const LinearReplayWindow> window);
+    std::shared_ptr<LinearReplayBlockHold> linearReplayStateBlockHold() const;
+    void clearLinearReplayWindow();
+
     // Per-stream CUDA state used to prepare the next MTP decode step while host
     // bookkeeping may still be in flight. It carries accept_len/tokens,
     // next_seq_len, propose_tokens; epoch guards stale clears in tests.
