@@ -282,14 +282,13 @@ absl::StatusOr<ScheduleOutput> PDFusionRatioScheduler::schedule() {
         decode_since_prefill_ += 1;
         prefill_since_decode_ = 0;
     }
-    if (!pending_decode_streams_.empty() || !new_streams_.empty()
-        || (made_progress && !waiting_streams_.empty())) {
+    if (!new_streams_.empty() || (made_progress && (!pending_decode_streams_.empty() || !waiting_streams_.empty()))) {
         schedule_trigger_ = true;
     }
-    if (running_streams_.empty() && !made_progress && !waiting_streams_.empty()) {
+    if (running_streams_.empty() && !made_progress && (!waiting_streams_.empty() || !pending_decode_streams_.empty())) {
         cond_.wait_for(lock, kNoProgressScheduleGap, [this] {
             return stop_ || schedule_trigger_ || !loading_cache_streams_.empty() || !running_streams_.empty()
-                   || !pending_decode_streams_.empty() || !new_streams_.empty();
+                   || !new_streams_.empty();
         });
     }
 

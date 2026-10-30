@@ -21,20 +21,15 @@ FIFOScheduler::FIFOScheduler(const RuntimeConfig&                   runtime_conf
                              const std::shared_ptr<KVCacheManager>& cache_manager,
                              const kmonitor::MetricsReporterPtr     metrics_reporter,
                              const int                              max_score_len):
-    FIFOSchedulerBase(runtime_config,
-                      model_config,
-                      pd_sep_config,
-                      parallelism_config,
-                      cache_manager,
-                      metrics_reporter),
+    FIFOSchedulerBase(runtime_config, model_config, pd_sep_config, parallelism_config, cache_manager, metrics_reporter),
     max_batch_kv_len_(static_cast<size_t>(std::max<int64_t>(runtime_config.fifo_scheduler_config.max_batch_kv_len, 0))),
-    max_batch_tokens_without_cache_(static_cast<size_t>(
-        std::max<int64_t>(runtime_config.fifo_scheduler_config.max_batch_tokens_without_cache, 0))),
+    max_batch_tokens_without_cache_(
+        static_cast<size_t>(std::max<int64_t>(runtime_config.fifo_scheduler_config.max_batch_tokens_without_cache, 0))),
     prefill_cp_size_(parallelism_config.prefill_cp_config.is_enabled() ?
                          static_cast<size_t>(std::max<int64_t>(parallelism_config.tp_size, 1)) :
                          1) {
     RTP_LLM_LOG_INFO("max_generate_batch_size is [%zu], max_batch_tokens_size is [%zu], "
-                     "max_batch_tokens_without_cache is [%zu], cp_force_single_prefill is [%d], "
+                     "max_batch_tokens_without_cache is [%zu], force_single_prefill is [%d], "
                      "prefill_cp_size is [%zu], max_inited_kv_cache_streams is [%zu]",
                      max_generate_batch_size_,
                      max_batch_tokens_size_,
@@ -108,7 +103,11 @@ FIFOScheduler::enqueueGroup(const vector<GenerateStreamPtr>& streams) {
 
     const bool exceeds_inited_kv_limit =
         max_inited_kv_cache_streams_ > 0 && valid_streams.size() > max_inited_kv_cache_streams_;
-    const bool exceeds_batch_limit            = valid_streams.size() > max_generate_batch_size_;
+    size_t group_batch_size = 0;
+    for (const auto& stream : valid_streams) {
+        group_batch_size += admissionBatchSize(stream);
+    }
+    const bool exceeds_batch_limit            = group_batch_size > max_generate_batch_size_;
     const bool fallback_to_individual_streams = exceeds_inited_kv_limit || exceeds_batch_limit;
     if (fallback_to_individual_streams) {
         RTP_LLM_LOG_DEBUG("enqueue group exceeds scheduler limits; fallback to individual streams: "
@@ -135,17 +134,24 @@ FIFOScheduler::enqueueGroup(const vector<GenerateStreamPtr>& streams) {
     return {std::move(enqueue_successes), streams};
 }
 
-bool FIFOScheduler::evaluateRunningBatch(const ScheduleRuntime&   schedule_runtime,
-                                         const GenerateStreamPtr& new_stream) const {
+bool FIFOScheduler::evaluateRunningMemory(const list<GenerateStreamPtr>& streams, const GenerateStreamPtr& new_stream) {
+    auto runtime = initScheduleRuntime();
+    for (const auto& stream : streams) {
+        runtime.reserved_sequences += admissionBatchSize(stream);
+        accountAdmission(runtime, stream);
+    }
+    return evaluateRunningBatch(runtime, new_stream);
+}
+
+bool FIFOScheduler::evaluateRunningBatch(const ScheduleRuntime& runtime, const GenerateStreamPtr& new_stream) const {
     RTP_LLM_PROFILE_FUNCTION();
-    const auto admitted_stream_count = schedule_runtime.admitted_stream_count;
+    const size_t used = runtime.reserved_sequences;
+    if (!ownsExecutionReservation(new_stream)
+        && (used > max_generate_batch_size_ || admissionBatchSize(new_stream) > max_generate_batch_size_ - used)) {
+        return false;
+    }
     if (pd_sep_config_.role_type == RoleType::DECODE) {
-        // Decode-only scheduling can top up an existing running decode batch.
-        // max_generate_batch_size_ is an inclusive cap; only requests above it
-        // should be rejected.
-        if (running_streams_.size() + admitted_stream_count + 1 <= max_generate_batch_size_) {
-            return true;
-        }
+        return true;
     }
     // Active decode rows cannot mix with prefill; parked decode rows may coexist with a chunked context round
     // because pending_decode_streams_ is excluded from the returned prefill batch.
@@ -154,83 +160,39 @@ bool FIFOScheduler::evaluateRunningBatch(const ScheduleRuntime&   schedule_runti
             && !(new_stream->chunkedPrefillEnabled() && new_stream->isContextStream()))) {
         return false;
     }
-    // Conservative CP prefill mode: cap at one stream per round unless
-    // runtime config explicitly allows CP prefill batching.
-    if (force_single_prefill_ && admitted_stream_count > 0) {
+    if (force_single_prefill_ && runtime.admitted_stream_count > 0) {
         return false;
     }
-    if (running_streams_.size() + pending_decode_streams_.size() + admitted_stream_count + 1
-        > max_generate_batch_size_) {
-        return false;
-    }
-
-    return fitsPrefillTokenLimits(admitted_stream_count,
-                                  schedule_runtime.admitted_prefill_token_size_with_cache,
-                                  schedule_runtime.admitted_prefill_token_size_without_cache,
-                                  schedule_runtime.admitted_prefill_max_seq_len_with_cache,
-                                  schedule_runtime.admitted_prefill_sequence_count,
-                                  new_stream);
+    return fitsPrefillTokenLimits(runtime, new_stream);
 }
 
-// Overload for group-queue admission: the admitted streams are tracked as a list
-// because ScheduleRuntime is not built in the group-queue path.
-bool FIFOScheduler::evaluateRunningBatch(const std::list<GenerateStreamPtr>& streams,
-                                         const GenerateStreamPtr&            new_stream) const {
-    RTP_LLM_PROFILE_FUNCTION();
-    const auto admitted_count = streams.size();
-    if (pd_sep_config_.role_type == RoleType::DECODE) {
-        if (running_streams_.size() + admitted_count + 1 <= max_generate_batch_size_) {
+void FIFOScheduler::accountAdmission(ScheduleRuntime& runtime, const GenerateStreamPtr& stream) const {
+    ++runtime.admitted_stream_count;
+    const auto sequences = static_cast<size_t>(stream->currentBatchSize());
+    const auto length    = prefillSeqLenWithCache(stream);
+    runtime.admitted_prefill_token_size_with_cache += length * sequences;
+    runtime.admitted_prefill_max_seq_len_with_cache = std::max(runtime.admitted_prefill_max_seq_len_with_cache, length);
+    runtime.admitted_prefill_sequence_count += sequences;
+    if (stream->isContextStream()) {
+        runtime.admitted_prefill_token_size_without_cache += prefillTokenCostWithoutCache(stream);
+    }
+}
+
+bool FIFOScheduler::fitsPrefillTokenLimits(const ScheduleRuntime& runtime, const GenerateStreamPtr& candidate) const {
+    const auto admitted_stream_count   = runtime.admitted_stream_count;
+    const auto admitted_tokens         = runtime.admitted_prefill_token_size_with_cache;
+    const auto admitted_max_seq_len    = runtime.admitted_prefill_max_seq_len_with_cache;
+    const auto admitted_sequence_count = runtime.admitted_prefill_sequence_count;
+    const bool prefill_only            = isPrefillOnly(candidate);
+    if (admitted_stream_count == 0) {
+        if (hasHardPrefillTokenBudget(candidate)) {
+            return prefillTokenCostWithCache(candidate) <= max_batch_tokens_size_;
+        }
+        // Prefill-only requests need no decode-token reserve at the sequence limit.
+        const auto singleton_tokens = candidate->contextLength() + running_streams_.size();
+        if (singleton_tokens < max_seq_len_ || (prefill_only && singleton_tokens == max_seq_len_)) {
             return true;
         }
-    }
-    if (!running_streams_.empty()) {
-        return false;
-    }
-    if (force_single_prefill_ && admitted_count > 0) {
-        return false;
-    }
-    if (running_streams_.size() + admitted_count + 1 > max_generate_batch_size_) {
-        return false;
-    }
-    size_t admitted_tokens               = 0;
-    size_t admitted_tokens_without_cache = 0;
-    size_t admitted_max_seq_len          = 0;
-    size_t admitted_sequence_count       = 0;
-    for (const auto& stream : streams) {
-        admitted_tokens += prefillTokenCostWithCache(stream);
-        admitted_tokens_without_cache += prefillTokenCostWithoutCache(stream);
-        admitted_max_seq_len = std::max(admitted_max_seq_len, prefillSeqLenWithCache(stream));
-        admitted_sequence_count += static_cast<size_t>(stream->currentBatchSize());
-    }
-    return fitsPrefillTokenLimits(admitted_count,
-                                  admitted_tokens,
-                                  admitted_tokens_without_cache,
-                                  admitted_max_seq_len,
-                                  admitted_sequence_count,
-                                  new_stream);
-}
-
-bool FIFOScheduler::evaluateRunningMemory(const list<GenerateStreamPtr>& streams,
-                                          const GenerateStreamPtr&       new_stream) {
-    // FIFOScheduler's own scheduling loop uses the counter-based evaluateRunningBatch();
-    // this list-based FIFOSchedulerBase entry point delegates to the list overload so
-    // both paths agree.
-    return evaluateRunningBatch(streams, new_stream);
-}
-
-bool FIFOScheduler::fitsPrefillTokenLimits(size_t                   admitted_stream_count,
-                                           size_t                   admitted_tokens,
-                                           size_t                   admitted_tokens_without_cache,
-                                           size_t                   admitted_max_seq_len,
-                                           size_t                   admitted_sequence_count,
-                                           const GenerateStreamPtr& candidate) const {
-    // Preserve the historical singleton fast path for all execution modes,
-    // including when the batch token budget is smaller than the prompt or zero.
-    // Prefill-only requests need no decode-token reserve at the sequence limit.
-    const auto singleton_tokens = candidate->contextLength() + running_streams_.size();
-    if (admitted_stream_count == 0
-        && (singleton_tokens < max_seq_len_ || (isPrefillOnly(candidate) && singleton_tokens == max_seq_len_))) {
-        return true;
     }
 
     // Preserve the existing one-token reserve for each already-running stream.
@@ -238,8 +200,8 @@ bool FIFOScheduler::fitsPrefillTokenLimits(size_t                   admitted_str
     // keeping it here makes both callers retain the original boundary semantics.
     const auto running_token_reserve = running_streams_.size();
     if (max_batch_kv_len_ > 0) {
-        const auto fits = [running_token_reserve, prefill_only = isPrefillOnly(candidate)](
-                              size_t admitted, size_t candidate_tokens, size_t limit) {
+        const auto fits = [running_token_reserve,
+                           prefill_only](size_t admitted, size_t candidate_tokens, size_t limit) {
             if (running_token_reserve >= limit) {
                 return false;
             }
@@ -247,7 +209,9 @@ bool FIFOScheduler::fitsPrefillTokenLimits(size_t                   admitted_str
             return admitted <= available_tokens && candidate_tokens <= available_tokens - admitted;
         };
         return fits(admitted_tokens, prefillTokenCostWithCache(candidate), max_batch_kv_len_)
-               && fits(admitted_tokens_without_cache, prefillTokenCostWithoutCache(candidate), max_batch_tokens_size_);
+               && fits(runtime.admitted_prefill_token_size_without_cache,
+                       prefillTokenCostWithoutCache(candidate),
+                       max_batch_tokens_size_);
     }
 
     if (running_token_reserve >= max_batch_tokens_size_) {
@@ -255,7 +219,6 @@ bool FIFOScheduler::fitsPrefillTokenLimits(size_t                   admitted_str
     }
     // Admission partitions execution modes before reaching this helper. On this
     // budget path, only prefill-only batches may fill the cap; generation retains its strict reserve.
-    const bool prefill_only     = isPrefillOnly(candidate);
     const auto available_tokens = max_batch_tokens_size_ - running_token_reserve - (prefill_only ? 0 : 1);
 
     // Include reused prefixes. Subtraction avoids overflow in the token sum.
@@ -351,6 +314,43 @@ bool FIFOScheduler::waitPredicate() {
     return stop_ || schedule_trigger_ || !running_streams_.empty() || !pending_decode_streams_.empty();
 }
 
+bool FIFOScheduler::tryAdmitWaitingStream(ScheduleRuntime&         runtime,
+                                          const GenerateStreamPtr& stream,
+                                          size_t                   inited_kv_streams,
+                                          bool                     grouped) {
+    const bool already_inited_kv = stream->curBlocksNum() > 0;
+    if (max_inited_kv_cache_streams_ > 0 && !already_inited_kv
+        && inited_kv_streams + runtime.newly_inited_kv_streams >= max_inited_kv_cache_streams_) {
+        return false;
+    }
+    // PD decode streams may already carry CanRun before FIFO admission.
+    if (!evaluateRunningBatch(runtime, stream)) {
+        return false;
+    }
+
+    const bool already_reserved      = ownsExecutionReservation(stream);
+    const bool load_initiated_before = stream->hasEvent(StreamEvents::LoadInitiated);
+    if (!stream->hasEvent(StreamEvents::CanRun)) {
+        stream->reportEvent(StreamEvents::CanRun);
+    }
+    const auto state          = stream->moveToNext();
+    const bool kv_initialized = !already_inited_kv && stream->curBlocksNum() > 0;
+    const bool load_initiated = !load_initiated_before && stream->hasEvent(StreamEvents::LoadInitiated);
+    const bool progressed     = state == StreamState::RUNNING || state == StreamState::LOADING_CACHE
+                            || (state == StreamState::WAITING && (kv_initialized || load_initiated));
+    runtime.newly_inited_kv_streams += kv_initialized;
+    // Explicit groups are checked as a batch before their loads finish and they are published.
+    // Ordinary fixed-workspace streams go through admission again when cache loading completes.
+    const bool admitted = fixed_workspace_ && !grouped ? state == StreamState::RUNNING : progressed;
+    if (admitted) {
+        if (!already_reserved) {
+            runtime.reserved_sequences += admissionBatchSize(stream);
+        }
+        accountAdmission(runtime, stream);
+    }
+    return admitted;
+}
+
 void FIFOScheduler::admitWaitingStreams(list<GenerateStreamPtr>&       waiting_streams,
                                         const list<GenerateStreamPtr>& already_admitted_streams) {
     RTP_LLM_PROFILE_FUNCTION();
@@ -391,20 +391,15 @@ void FIFOScheduler::admitWaitingStreams(list<GenerateStreamPtr>&       waiting_s
     capture_execution_mode(running_streams_);
     capture_execution_mode(already_admitted_streams);
 
-    ScheduleRuntime schedule_runtime;
+    auto schedule_runtime = initScheduleRuntime();
     for (const auto& stream : already_admitted_streams) {
-        if (!stream || stream->getStatus() != StreamState::RUNNING) {
+        if (stream->getStatus() != StreamState::RUNNING) {
             continue;
         }
-        ++schedule_runtime.admitted_stream_count;
-        schedule_runtime.admitted_prefill_token_size_with_cache += prefillTokenCostWithCache(stream);
-        schedule_runtime.admitted_prefill_max_seq_len_with_cache =
-            std::max(schedule_runtime.admitted_prefill_max_seq_len_with_cache, prefillSeqLenWithCache(stream));
-        schedule_runtime.admitted_prefill_sequence_count += static_cast<size_t>(stream->currentBatchSize());
+        accountAdmission(schedule_runtime, stream);
         if (stream->isContextStream()) {
             ++last_admitted_context_batch_size_;
             last_admitted_context_token_size_ += stream->contextLength();
-            schedule_runtime.admitted_prefill_token_size_without_cache += prefillTokenCostWithoutCache(stream);
         }
     }
 
@@ -435,61 +430,21 @@ void FIFOScheduler::admitWaitingStreams(list<GenerateStreamPtr>&       waiting_s
             continue;
         }
 
-        // Check admission capacity and memory constraints.
-        //
-        // Some PD decode streams already carry CanRun before entering FIFO: DecodeRpcServer uses
-        // CanRun to drive the pre-enqueue KV allocation path. CanRun is a permanent event, so it
-        // cannot be used as proof that FIFO has admitted this stream in the current scheduling
-        // round. Always run FIFO capacity checks and only advance streams admitted here.
-        const bool already_inited_kv = stream->curBlocksNum() > 0;
-        if (max_inited_kv_cache_streams_ > 0 && !already_inited_kv
-            && inited_kv_streams + schedule_runtime.newly_inited_kv_streams >= max_inited_kv_cache_streams_) {
-            continue;
-        }
-
-        if (!evaluateRunningBatch(schedule_runtime, stream)) {
-            continue;
-        }
-
-        const auto state                 = stream->getStatus();
-        const bool load_initiated_before = stream->hasEvent(StreamEvents::LoadInitiated);
-        if (!stream->hasEvent(StreamEvents::CanRun)) {
-            stream->reportEvent(StreamEvents::CanRun);
-        }
-
-        const auto new_state           = stream->moveToNext();
-        const bool kv_initialized      = !already_inited_kv && stream->curBlocksNum() > 0;
-        const bool load_initiated      = !load_initiated_before && stream->hasEvent(StreamEvents::LoadInitiated);
-        const bool scheduling_progress = new_state == StreamState::RUNNING || new_state == StreamState::LOADING_CACHE
-                                         || (new_state == StreamState::WAITING && (kv_initialized || load_initiated));
-
-        if (scheduling_progress) {
-            // A failed KV allocation owns no work this round and must not pin its execution mode.
+        const auto previous_state = stream->getStatus();
+        if (tryAdmitWaitingStream(schedule_runtime, stream, inited_kv_streams)) {
             if (!has_execution_mode) {
                 has_execution_mode      = true;
                 scheduling_prefill_only = prefill_only;
             }
-            // Admission limits cover every stream that made progress in this
-            // round, including an async cache load. Otherwise multiple pending
-            // loads can oversubscribe max_generate_batch_size before any one of
-            // them reaches RUNNING.
-            ++schedule_runtime.admitted_stream_count;
-            schedule_runtime.admitted_prefill_token_size_with_cache += prefillTokenCostWithCache(stream);
-            schedule_runtime.admitted_prefill_max_seq_len_with_cache =
-                std::max(schedule_runtime.admitted_prefill_max_seq_len_with_cache, prefillSeqLenWithCache(stream));
-            schedule_runtime.admitted_prefill_sequence_count += static_cast<size_t>(stream->currentBatchSize());
-            if (kv_initialized) {
-                ++schedule_runtime.newly_inited_kv_streams;
-            }
             if (stream->isContextStream()) {
                 ++last_admitted_context_batch_size_;
                 last_admitted_context_token_size_ += stream->contextLength();
-                schedule_runtime.admitted_prefill_token_size_without_cache += prefillTokenCostWithoutCache(stream);
             }
         }
 
-        if (new_state != state) {
-            addStreamToNewState(stream, new_state);
+        const auto state = stream->getStatus();
+        if (state != previous_state) {
+            addStreamToNewState(stream, state);
             waiting_streams.erase(current);
         }
     }
@@ -548,7 +503,8 @@ void FIFOScheduler::evaluateLoadingCacheGroupQueue() {
         })) {
         return;
     }
-    if (!running_streams_.empty() || !new_streams_.empty()) {
+    // Parked Decode can rejoin as a whole when the current Prefill finishes.
+    if (!running_streams_.empty() || !new_streams_.empty() || (fixed_workspace_ && !pending_decode_streams_.empty())) {
         return;
     }
 
@@ -572,6 +528,7 @@ void FIFOScheduler::evaluateWaitingGroupQueue() {
     // Evaluate at most one waiting group per scheduling round.
     auto&        group         = waiting_group_queue_.front();
     const size_t original_size = group.size();
+    auto         schedule_runtime = initScheduleRuntime();
     for (auto it = group.begin(); it != group.end();) {
         if ((*it)->hasError()) {
             (*it)->moveToNext();
@@ -586,27 +543,11 @@ void FIFOScheduler::evaluateWaitingGroupQueue() {
     }
 
     StreamGroup  admitted_streams;
-    const size_t inited_kv_streams       = max_inited_kv_cache_streams_ > 0 ? countInitedKVCacheStreams() : 0;
-    size_t       newly_inited_kv_streams = 0;
+    const size_t inited_kv_streams = max_inited_kv_cache_streams_ > 0 ? countInitedKVCacheStreams() : 0;
     for (auto it = group.begin(); it != group.end();) {
-        auto       current           = it++;
-        auto&      stream            = *current;
-        const bool already_inited_kv = stream->curBlocksNum() > 0;
-        if (max_inited_kv_cache_streams_ > 0 && !already_inited_kv
-            && inited_kv_streams + newly_inited_kv_streams >= max_inited_kv_cache_streams_) {
-            continue;
-        }
-        if (!evaluateRunningBatch(admitted_streams, stream)) {
-            continue;
-        }
-
-        if (!stream->hasEvent(StreamEvents::CanRun)) {
-            stream->reportEvent(StreamEvents::CanRun);
-        }
-        const auto state = stream->moveToNext();
-        if (!already_inited_kv && stream->curBlocksNum() > 0) {
-            ++newly_inited_kv_streams;
-        }
+        auto current = it++;
+        tryAdmitWaitingStream(schedule_runtime, *current, inited_kv_streams, /*grouped=*/true);
+        const auto state = (*current)->getStatus();
         if (state == StreamState::FINISHED) {
             group.erase(current);
             continue;
@@ -641,6 +582,41 @@ void FIFOScheduler::evaluateWaitingGroupQueue() {
         dispatchPreparedGroup(admitted_streams);
         pending_group_fallback_count_.fetch_add(1, std::memory_order_relaxed);
     }
+}
+
+bool FIFOScheduler::ownsExecutionReservation(const GenerateStreamPtr& stream) const {
+    return !fixed_workspace_ && pd_sep_config_.role_type != RoleType::DECODE && stream->hasEvent(StreamEvents::CanRun)
+           && (stream->hasEvent(StreamEvents::LoadInitiated) || stream->curBlocksNum() > 0);
+}
+
+FIFOScheduler::ScheduleRuntime FIFOScheduler::initScheduleRuntime() const {
+    ScheduleRuntime runtime;
+    const auto      charge = [&](const auto& streams, bool waiting = false) {
+        for (const auto& stream : streams) {
+            if (fixed_workspace_
+                || (!stream->isFakeStream() && stream->isActive() && !stream->hasEvent(StreamEvents::GenerateDone)
+                    && (!waiting || ownsExecutionReservation(stream)))) {
+                runtime.reserved_sequences += admissionBatchSize(stream);
+            }
+        }
+    };
+    // Charge every row in these lists until the scheduler removes it, even if a completion event arrived.
+    charge(running_streams_);
+    charge(new_streams_);
+    charge(pending_decode_streams_);
+    if (fixed_workspace_) {
+        return runtime;
+    }
+    charge(loading_cache_streams_);
+    charge(waiting_streams_, true);
+    // Only the front group can have started admission in either queue.
+    if (!loading_cache_group_queue_.empty()) {
+        charge(loading_cache_group_queue_.front());
+    }
+    if (!waiting_group_queue_.empty()) {
+        charge(waiting_group_queue_.front(), true);
+    }
+    return runtime;
 }
 
 bool FIFOScheduler::partitionChunkContinuations() {

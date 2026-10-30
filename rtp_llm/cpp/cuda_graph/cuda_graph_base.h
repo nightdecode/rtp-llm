@@ -22,6 +22,16 @@ enum class CudaGraphCheckMode : uint8_t {
     PREPARE,
 };
 
+// Resolve the Python model's draft layout at the entry point shared by batch building and graph capture.
+inline bool readMtpDraftPrefillRequestLanes(pybind11::handle model) {
+    if (!Py_IsInitialized() || !model) {
+        return false;
+    }
+    pybind11::gil_scoped_acquire gil;
+    constexpr const char*        hook = "cuda_graph_draft_prefill_uses_request_lanes";
+    return !model.is_none() && pybind11::hasattr(model, hook) && model.attr(hook)().cast<bool>();
+}
+
 // Current state of CUDA graph execution (used when calling canRun/forward with graph runner)
 struct CudaGraphState {
     int                              current_batch_size{1};
@@ -48,6 +58,7 @@ struct GraphParams {
     // Zero keeps the existing per-request bound equal to max_seq_len.
     int    request_max_seq_len    = 0;
     int    num_tokens_per_bs      = 1;  // Number of tokens per batch (1 for decode, max_seq_len for prefill)
+    int    sequence_parallel_size = 1;
     size_t max_context_batch_size = 128;
     std::size_t      hidden_size           = 0;
     c10::ScalarType  model_data_type       = c10::ScalarType::Float;
@@ -72,6 +83,8 @@ struct GraphParams {
     // the model output hidden_size because auxiliary feature rows may be wider.
     std::size_t input_hidden_size      = 0;
     float       input_embedding_scalar = 1.0f;
+    // Draft Prefill input layout selected alongside the executor batch layout.
+    bool mtp_draft_prefill_uses_request_lanes = false;
     // Model-owned embedding weights must be installed before initCapture();
     // setting them after capture leaves the graph bound to undefined tensors.
     torch::Tensor position_encoding;

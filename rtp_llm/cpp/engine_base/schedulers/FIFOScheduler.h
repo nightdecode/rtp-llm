@@ -51,9 +51,7 @@ private:
         GROUP,
     };
 
-    // Per-round admission accounting for admitWaitingStreams(). Only streams that actually
-    // made scheduling progress contribute, so a stream whose KV malloc failed and stayed
-    // WAITING does not consume this round's token budget.
+    // Per-round admission accounting for an execution batch or an explicit group being prepared.
     struct ScheduleRuntime {
         size_t admitted_stream_count                     = 0;
         size_t admitted_prefill_token_size_with_cache    = 0;
@@ -61,6 +59,8 @@ private:
         size_t admitted_prefill_sequence_count           = 0;
         size_t admitted_prefill_token_size_without_cache = 0;
         size_t newly_inited_kv_streams                   = 0;
+
+        size_t reserved_sequences = 0;
     };
 
     const char* schedulerName() const override {
@@ -71,18 +71,15 @@ private:
     // Counter-based admission check used by admitWaitingStreams(). evaluateRunningMemory()
     // is the list-based FIFOSchedulerBase entry point and delegates here.
     bool   evaluateRunningBatch(const ScheduleRuntime& schedule_runtime, const GenerateStreamPtr& new_stream) const;
-    // Overload for group-queue admission: the admitted streams are tracked as a list
-    // because ScheduleRuntime is not built in the group-queue path.
-    bool   evaluateRunningBatch(const std::list<GenerateStreamPtr>& streams, const GenerateStreamPtr& new_stream) const;
-    bool   fitsPrefillTokenLimits(size_t                   admitted_stream_count,
-                                  size_t                   admitted_tokens,
-                                  size_t                   admitted_tokens_without_cache,
-                                  size_t                   admitted_max_seq_len,
-                                  size_t                   admitted_sequence_count,
-                                  const GenerateStreamPtr& candidate) const;
+    bool   fitsPrefillTokenLimits(const ScheduleRuntime& runtime, const GenerateStreamPtr& candidate) const;
     size_t prefillTokenCostWithoutCache(const GenerateStreamPtr& stream) const;
     size_t prefillSeqLenWithCache(const GenerateStreamPtr& stream) const;
     size_t prefillTokenCostWithCache(const GenerateStreamPtr& stream) const;
+
+    ScheduleRuntime initScheduleRuntime() const;
+    void            accountAdmission(ScheduleRuntime& runtime, const GenerateStreamPtr& stream) const;
+    bool            ownsExecutionReservation(const GenerateStreamPtr& stream) const;
+
     // Group-aware shadow of FIFOSchedulerBase::countInitedKVCacheStreams(): streams parked
     // in the group queues also hold inited KV blocks and must count against the limit.
     size_t countInitedKVCacheStreams() const;
@@ -90,6 +87,10 @@ private:
     void   accountBatchMetrics(const GenerateStreamPtr& new_stream);
     bool   waitPredicate() override;
     void   onRunningStream(const GenerateStreamPtr& stream) override;
+    bool   tryAdmitWaitingStream(ScheduleRuntime&         runtime,
+                                 const GenerateStreamPtr& stream,
+                                 size_t                   inited_kv_streams,
+                                 bool                     grouped = false);
     // FIFO-specific replacement for FIFOSchedulerBase::evaluateWaitingStreams(): admission and
     // state transition happen in a single pass so that per-round token budgets only account for
     // streams that really advanced, and errored streams behind a saturated budget are still

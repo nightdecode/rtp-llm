@@ -5,7 +5,6 @@
 #include <list>
 #include <memory>
 #include <mutex>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -19,7 +18,7 @@
 
 namespace rtp_llm {
 
-int64_t computeChunkGrant(int64_t budget, int64_t rows, int64_t remaining, int64_t block_size);
+int64_t computeChunkGrant(int64_t budget, int64_t rows, int64_t remaining, int64_t alignment, int64_t prefix = 0);
 
 class FIFOSchedulerBase: public SchedulerBase {
 public:
@@ -56,7 +55,7 @@ public:
 protected:
     virtual const char* schedulerName() const                                            = 0;
     virtual bool        evaluateRunningMemory(const std::list<GenerateStreamPtr>& streams,
-                                              const GenerateStreamPtr&            new_stream) = 0;
+                                              const GenerateStreamPtr&            new_stream)       = 0;
     virtual bool        waitPredicate()                                                  = 0;
     virtual void        onRunningStream(const GenerateStreamPtr& stream) {}
     virtual void        cancelExtraStreams() {}
@@ -66,6 +65,8 @@ protected:
     virtual void fillExtraMetrics(RtpLLMSchedulerMetricsCollector& collector) const {}
     virtual void appendExtraRunningTaskList(std::vector<EngineScheduleInfo::TaskInfo>& task_list) const {}
 
+    size_t                              admissionBatchSize(const GenerateStreamPtr& stream) const;
+    bool                                hasHardPrefillTokenBudget(const GenerateStreamPtr& stream) const;
     bool   checkInputLength(const GenerateStreamPtr& stream);
     absl::Status checkChunkedPrefillRequest(const GenerateStreamPtr& stream);
     std::list<GenerateStreamPtr> selectPrefillPrefix(std::list<GenerateStreamPtr>& active_streams);
@@ -94,9 +95,13 @@ protected:
     // Force at most one stream per prefill round. The CP conservative prefill
     // path and the --force_single_prefill option use it to pin the prefill
     // batch-total M to the admitted request's own length.
-    bool                            force_single_prefill_    = false;
+    bool                            force_single_prefill_ = false;
+    const bool                      fixed_workspace_;
     size_t                          max_inited_kv_cache_streams_ = 0;
     int64_t                         prefill_chunk_size_      = 0;
+    int64_t                         prefill_chunk_alignment_     = 0;
+    int64_t                         prefill_chunk_cp_size_       = 0;
+    int64_t                         prefill_chunk_padded_rows_   = 0;
     bool                            need_fill_fake_stream_   = false;
     std::atomic<bool>               stop_                    = false;
     bool                            schedule_trigger_        = false;

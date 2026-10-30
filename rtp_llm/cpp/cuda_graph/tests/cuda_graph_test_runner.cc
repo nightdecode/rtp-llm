@@ -92,6 +92,8 @@ public:
         params.model_data_type          = c10::ScalarType::BFloat16;
         params.position_id_len_factor   = 1;
         params.kv_cache_group_tags      = {"full"};
+
+        params.mtp_draft_prefill_uses_request_lanes = readMtpDraftPrefillRequestLanes(py_instance);
         runner_ = CudaGraphRunner::initializeCapture(std::make_unique<CudaGraphRunner>(params, std::move(py_instance)));
     }
 
@@ -131,6 +133,28 @@ public:
         if (token_type_embedding.has_value()) {
             params.token_type_embedding = std::move(*token_type_embedding);
         }
+        runner_ = CudaGraphRunner::initializeCapture(std::make_unique<CudaGraphRunner>(params, std::move(py_instance)));
+    }
+
+    void init_mtp_draft_prefill_sp(
+        py::object py_instance, int max_requests, int query_width, int sequence_parallel_size, int hc_mult) {
+        reset_runner();
+        GraphParams params;
+        params.enable_cuda_graph          = true;
+        params.is_prefill_cuda_graph_mode = true;
+        params.role                       = CudaGraphRole::MTP_DRAFT_PREFILL;
+        params.max_seq_len                = 64;
+        params.num_tokens_per_bs          = query_width;
+        params.sequence_parallel_size     = sequence_parallel_size;
+        params.max_context_batch_size     = max_requests;
+        params.hidden_size                = 4;
+        params.input_hidden_size          = 4 * hc_mult;
+        params.model_data_type            = c10::ScalarType::BFloat16;
+        params.kv_cache_group_tags        = {"full", "aux"};
+        params.position_id_len_factor     = 1;
+        params.kernel_block_table_width   = 8;
+
+        params.mtp_draft_prefill_uses_request_lanes = readMtpDraftPrefillRequestLanes(py_instance);
         runner_ = CudaGraphRunner::initializeCapture(std::make_unique<CudaGraphRunner>(params, std::move(py_instance)));
     }
 
@@ -286,6 +310,7 @@ PYBIND11_MODULE(libtest_cuda_graph_runner, m) {
              py::arg("hidden_size"),
              py::arg("num_tokens_per_request") = 4,
              py::arg("hc_mult")                = 4)
+        .def("init_mtp_draft_prefill_sp", &CudaGraphTestRunner::init_mtp_draft_prefill_sp)
         .def("init_decode",
              &CudaGraphTestRunner::init_decode,
              py::arg("py_instance"),

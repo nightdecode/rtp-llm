@@ -41,6 +41,7 @@ from rtp_llm.openai.api_datatype import (
     RoleEnum,
     ToolCall,
     UsageInfo,
+    get_tool_choice_function_name,
 )
 from rtp_llm.openai.renderer_factory import ChatRendererFactory
 from rtp_llm.openai.renderers.basic_renderer import BasicRenderer
@@ -243,14 +244,28 @@ class OpenaiEndpoint(object):
                     stop_word_ids.append(list(token_ids))
         return stop_word_ids
 
+    @staticmethod
+    def _validate_renderer_tool_choice(
+        request: ChatCompletionRequest,
+        renderer: CustomChatRenderer,
+    ) -> None:
+        tool_name = get_tool_choice_function_name(request.tool_choice)
+        if request.tool_choice == "required" or tool_name is not None:
+            names = renderer.get_chat_completion_tool_names(request)
+            if not names or (tool_name is not None and tool_name not in names):
+                raise FtRuntimeException(
+                    ExceptionType.INVALID_PARAMS,
+                    "tool_choice requires a tool supported by the selected renderer",
+                )
+
     def _extract_generation_config(
         self,
         request: ChatCompletionRequest,
         input_ids: Optional[List[int]] = None,
         renderer: Optional[CustomChatRenderer] = None,
     ) -> GenerateConfig:
-        # TODO(wangyin): implement this
         renderer = renderer or self.chat_renderer
+        self._validate_renderer_tool_choice(request, renderer)
         config = (
             request.extra_configs.model_copy(deep=True)
             if request.extra_configs is not None
@@ -295,6 +310,7 @@ class OpenaiEndpoint(object):
         request_stop_words_list.extend(config.stop_words_str)
         # Force overrides configured defaults, while renderer/tokenizer framing
         # remains required. Both engine and renderer consume this effective config.
+        # Upstream tokenizers can omit the RTP-specific stop metadata.
         tokenizer_stop_words_str = list(
             getattr(self.tokenizer, "stop_words_str_list", []) or []
         )
@@ -377,14 +393,17 @@ class OpenaiEndpoint(object):
             if config.thinking_mode == ThinkingMode.ADAPTIVE
             else config.thinking_mode == ThinkingMode.ENABLED
         )
-        config.add_thinking_params(
-            self.tokenizer,
-            self.generate_env_config,
-            enable_thinking=enable_thinking,
-            reasoning_format=self._reasoning_format_for_prompt(
-                config, renderer, input_ids
-            ),
-        )
+        if not renderer.try_finalize_chat_completion_response_format(
+            request, config, enable_thinking, input_ids
+        ):
+            config.add_thinking_params(
+                self.tokenizer,
+                self.generate_env_config,
+                enable_thinking=enable_thinking,
+                reasoning_format=self._reasoning_format_for_prompt(
+                    config, renderer, input_ids
+                ),
+            )
         if request.debug_info:
             config.return_output_ids = True
         return config
@@ -473,7 +492,10 @@ class OpenaiEndpoint(object):
         aux_info = None
         extra_outputs = None
         async for response in choice_generator:
-            if len(response.choices) != len(all_choices):
+            if not response.choices and response.usage is not None:
+                # The final usage-only stream frame does not replace choices.
+                pass
+            elif len(response.choices) != len(all_choices):
                 if all_choices == []:
                     all_choices = [
                         ChatCompletionResponseChoice(
@@ -655,6 +677,8 @@ class OpenaiEndpoint(object):
         renderer = (
             self.template_renderer if chat_request.user_template else self.chat_renderer
         )
+        self._validate_renderer_tool_choice(chat_request, renderer)
+        renderer.validate_chat_completion_prefix(chat_request)
         prepopulate_str = ""
         if len(chat_request.messages) > 0 and chat_request.messages[-1].partial:
             prepopulate_str = str(chat_request.messages[-1].content)
