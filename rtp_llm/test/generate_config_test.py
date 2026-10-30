@@ -3,6 +3,7 @@ import os
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Union
 from unittest import TestCase, main
+from unittest.mock import Mock
 
 from transformers import AutoTokenizer
 
@@ -29,7 +30,7 @@ from rtp_llm.frontend.tokenizer_factory.tokenizers.tokenization_qwen import (
 from rtp_llm.openai.api_datatype import ChatCompletionRequest, GenerateConfig
 from rtp_llm.openai.api_datatype import ResponseFormat as OpenAIResponseFormat
 from rtp_llm.openai.openai_endpoint import OpenaiEndpoint
-from rtp_llm.openai.renderers.custom_renderer import CustomChatRenderer
+from rtp_llm.openai.renderers.custom_renderer import CustomChatRenderer, RenderedInputs
 from rtp_llm.ops import SpecialTokens
 from rtp_llm.pipeline.pipeline import Pipeline
 
@@ -692,20 +693,59 @@ class OpenaiGenerateConfigTest(TestCase):
             self.tokenizer.encode("</think>\n\n", add_special_tokens=False),
         )
 
-    def test_renderer_chat_constraints_are_applied_to_generate_config(self):
-        class Renderer:
-            def apply_chat_completion_constraints(self, request, config):
-                config.structural_tag = '{"type":"test"}'
+    def test_generic_renderer_constraints_precede_response_format_finalization(self):
+        schema = {"anyOf": [{"type": "object"}, {"type": "array"}]}
 
-        config = GenerateConfig()
+        def assert_finalized(config):
+            validate_engine_ready(config)
+            self.assertEqual(config.json_schema, schema)
+            self.assertIsNone(config.structural_tag)
 
-        OpenaiEndpoint._apply_renderer_chat_constraints(
-            Renderer(),
-            ChatCompletionRequest(messages=[]),
-            config,
+        def apply_constraints(_request, config):
+            self.assertEqual(config.response_format.type, "json_object")
+            self.assertIsNone(config.json_schema)
+
+        renderer = CustomChatRenderer.__new__(CustomChatRenderer)
+        renderer.resolve_thinking_mode = Mock(return_value=ThinkingMode.DISABLED)
+        renderer.get_all_extra_stop_word_ids_list = Mock(return_value=[])
+        renderer.tokenize_words = Mock(return_value=[])
+        renderer.render_chat = Mock(return_value=RenderedInputs([1]))
+        renderer.apply_chat_completion_constraints = Mock(side_effect=apply_constraints)
+        renderer.generate_choice = Mock()
+        endpoint = OpenaiEndpoint.__new__(OpenaiEndpoint)
+        endpoint.chat_renderer = renderer
+        endpoint.model_type = "test"
+        endpoint.tokenizer = self.tokenizer
+        endpoint.generate_env_config = GenerateEnvConfig()
+        endpoint.stop_words_id_list = []
+        endpoint.stop_words_str_list = []
+        endpoint.backend_rpc_server_visitor = None
+        endpoint._get_debug_info = Mock()
+        request = ChatCompletionRequest(
+            messages=[], response_format={"type": "json_object"}
         )
 
-        self.assertEqual(config.structural_tag, '{"type":"test"}')
+        _, batch_config = endpoint._prepare_chat_input(1, request)
+        assert_finalized(batch_config)
+        renderer.apply_chat_completion_constraints.assert_called_once_with(
+            request, batch_config
+        )
+        renderer.apply_chat_completion_constraints.reset_mock()
+
+        endpoint.chat_completion(2, request, SimpleNamespace(headers={}))
+        single_config = renderer.generate_choice.call_args.args[3]
+        assert_finalized(single_config)
+        renderer.apply_chat_completion_constraints.assert_called_once_with(
+            request, single_config
+        )
+        renderer.apply_chat_completion_constraints.reset_mock()
+
+        endpoint.chat_render(request)
+        render_config = endpoint._get_debug_info.call_args.args[2]
+        assert_finalized(render_config)
+        renderer.apply_chat_completion_constraints.assert_called_once_with(
+            request, render_config
+        )
 
     def test_default_renderer_chat_constraints_allow_non_forcing_tool_choice(self):
         renderer = CustomChatRenderer.__new__(CustomChatRenderer)
@@ -722,8 +762,7 @@ class OpenaiGenerateConfigTest(TestCase):
 
         for tool_choice in (None, "auto", "none"):
             with self.subTest(tool_choice=tool_choice):
-                OpenaiEndpoint._apply_renderer_chat_constraints(
-                    renderer,
+                renderer.apply_chat_completion_constraints(
                     ChatCompletionRequest(
                         messages=[],
                         tools=tools,
@@ -733,8 +772,7 @@ class OpenaiGenerateConfigTest(TestCase):
                 )
 
         with self.assertRaisesRegex(Exception, "is not supported"):
-            OpenaiEndpoint._apply_renderer_chat_constraints(
-                renderer,
+            renderer.apply_chat_completion_constraints(
                 ChatCompletionRequest(
                     messages=[],
                     tools=tools,

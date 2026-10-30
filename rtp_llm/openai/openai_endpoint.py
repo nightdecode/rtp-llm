@@ -293,12 +293,25 @@ class OpenaiEndpoint(object):
             # output so the recipe parser can stop generation promptly.
             config.is_streaming = True
         request_stop_words_list.extend(config.stop_words_str)
+        # Force overrides configured defaults, while renderer/tokenizer framing
+        # remains required. Both engine and renderer consume this effective config.
+        tokenizer_stop_words_str = list(
+            getattr(self.tokenizer, "stop_words_str_list", []) or []
+        )
         config.stop_words_str = list(
-            set(self.stop_words_str_list + request_stop_words_list)
+            set(
+                self.stop_words_str_list
+                + tokenizer_stop_words_str
+                + request_stop_words_list
+            )
         )
         config.stop_words_list = self._dedup_stop_words_list(
             self.stop_words_id_list
-            + self.chat_renderer.tokenize_words(self.stop_words_str_list)
+            + renderer.get_all_extra_stop_word_ids_list()
+            + list(getattr(self.tokenizer, "stop_words_id_list", []) or [])
+            + renderer.tokenize_words(
+                self.stop_words_str_list + tokenizer_stop_words_str
+            )
             + self._tokenize_request_stop_words(request_stop_words_list)
             + config.stop_words_list
         )
@@ -357,14 +370,17 @@ class OpenaiEndpoint(object):
             config.max_new_tokens = backend_max_new_tokens
         elif request.max_tokens != None:
             config.max_new_tokens = request.max_tokens
+        # Renderer constraints are inputs to grammar finalization on every path.
+        renderer.apply_chat_completion_constraints(request, config)
+        enable_thinking = (
+            None
+            if config.thinking_mode == ThinkingMode.ADAPTIVE
+            else config.thinking_mode == ThinkingMode.ENABLED
+        )
         config.add_thinking_params(
             self.tokenizer,
             self.generate_env_config,
-            enable_thinking=(
-                None
-                if config.thinking_mode == ThinkingMode.ADAPTIVE
-                else config.thinking_mode == ThinkingMode.ENABLED
-            ),
+            enable_thinking=enable_thinking,
             reasoning_format=self._reasoning_format_for_prompt(
                 config, renderer, input_ids
             ),
@@ -372,16 +388,6 @@ class OpenaiEndpoint(object):
         if request.debug_info:
             config.return_output_ids = True
         return config
-
-    @staticmethod
-    def _apply_renderer_chat_constraints(
-        renderer,
-        request: ChatCompletionRequest,
-        config: GenerateConfig,
-    ) -> None:
-        apply_constraints = getattr(renderer, "apply_chat_completion_constraints", None)
-        if apply_constraints is not None:
-            apply_constraints(request, config)
 
     @staticmethod
     def _merge_tool_calls(
@@ -652,6 +658,17 @@ class OpenaiEndpoint(object):
         prepopulate_str = ""
         if len(chat_request.messages) > 0 and chat_request.messages[-1].partial:
             prepopulate_str = str(chat_request.messages[-1].content)
+            if prepopulate_str and (
+                chat_request.json_format
+                or (
+                    chat_request.response_format is not None
+                    and chat_request.response_format.type != "text"
+                )
+            ):
+                raise FtRuntimeException(
+                    ExceptionType.INVALID_PARAMS,
+                    "partial does not support structured output without grammar prefix state",
+                )
             chat_request.messages.pop()
         from rtp_llm.openai.reasoning_effort import validate_reasoning_effort_for_model
 
@@ -739,8 +756,6 @@ class OpenaiEndpoint(object):
         parse_and_fill_banned_combo(
             rendered_input.rendered_prompt, generate_config, self.tokenizer
         )
-        self._apply_renderer_chat_constraints(renderer, chat_request, generate_config)
-
         mm_inputs = rendered_input.multimodal_inputs
 
         if generate_config.return_prompt_logits and (
@@ -940,6 +955,5 @@ class OpenaiEndpoint(object):
         generate_config = self._extract_generation_config(
             chat_request, rendered_input.input_ids, renderer
         )
-        self._apply_renderer_chat_constraints(renderer, chat_request, generate_config)
         debug_info = self._get_debug_info(renderer, rendered_input, generate_config)
         return debug_info

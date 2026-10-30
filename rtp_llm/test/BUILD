@@ -115,16 +115,28 @@ py_test(
 )
 
 py_test(
-    name = "stop_words_pipeline_test",
-    srcs = [
-        "stop_words_pipeline_test.py",
+    name = "renderer_protocol_stops_integration_test",
+    srcs = ["renderer_protocol_stops_integration_test.py"],
+    data = [
+        "//rtp_llm:sdk",
+        "//rtp_llm/test/model_test/fake_test/testdata",
     ],
-    data = [],
     deps = [
         "//rtp_llm:testlib",
-        "//rtp_llm/test/model_test/test_util",
+        "//rtp_llm:torch",
     ],
-    imports = [],
+    exec_properties = {"gpu": "L20_CU13", "gpu_count": "1"},
+    tags = ["L20_CU13"],
+)
+
+py_test(
+    name = "frontend_review_repro_test",
+    srcs = ["frontend_review_repro_test.py"],
+    data = ["//rtp_llm:sdk"],
+    deps = [
+        "//rtp_llm:testlib",
+        "//rtp_llm:torch",
+    ],
     exec_properties = {"gpu": "L20_CU13"},
     tags = ["L20_CU13"],
 )
