@@ -190,7 +190,8 @@ int NormalEngine::calculateReserveStep(const EngineInitParams& params) {
 }
 
 NormalEngine::NormalEngine(const EngineInitParams&                       params,
-                           std::unique_ptr<ProposeModelEngineInitParams> propose_params):
+                           std::unique_ptr<ProposeModelEngineInitParams> propose_params,
+                           bool defer_loop_start):
     EngineBase(params),
     model_config_(params.model_config_),
     parallelism_config(params.parallelism_config),
@@ -324,7 +325,13 @@ NormalEngine::NormalEngine(const EngineInitParams&                       params,
     releaseHostMemoryCache();
 
     initScheduler();
-    (void)startLoop();
+    if (defer_loop_start) {
+        // DP dummy streams also launch kernels without incoming requests.
+        // Keep the loop absent until the template has been released.
+        RTP_LLM_LOG_INFO("normal engine loop deferred until SCR release");
+    } else {
+        (void)startLoop();
+    }
     (void)construction_guard.release();
 }
 
@@ -1107,6 +1114,9 @@ KVCacheInfo NormalEngine::getCacheStatusInfo(int64_t latest_version, bool need_c
 }
 
 absl::Status NormalEngine::startLoop() {
+    if (loop_thread_) {
+        return absl::OkStatus();
+    }
     if (parallelism_config.tp_rank == 0) {
         THROW_IF_STATUS_ERROR(initSystemPrompt());
     }
@@ -1129,8 +1139,10 @@ absl::Status NormalEngine::stop() {
     // Ask rank 0 to stop at a step boundary. Receivers must finish all model
     // collectives for inputs that rank 0 has already published before exiting.
     CpuTpBroadcaster::instance().requestStop();
-    loop_thread_->join();
-    loop_thread_.reset();
+    if (loop_thread_) {
+        loop_thread_->join();
+        loop_thread_.reset();
+    }
     scheduler_->finalizeCancelledStreams();
     // Join the async dispatch runner and release the dispatcher-owned worker pool.
     executor_.reset();
