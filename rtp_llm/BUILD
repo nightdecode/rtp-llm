@@ -171,11 +171,19 @@ py_library(
 )
 
 py_library(
+    name = "scr_lifecycle",
+    srcs = ["utils/scr/__init__.py", "utils/scr/lifecycle.py"],
+    visibility = ["//visibility:public"],
+)
+
+py_library(
     name = "utils",
     srcs = glob([
         "utils/**/*.py",
     ], exclude = _JIT_CACHE_SRCS + _JIT_CACHE_ENV_SRCS + [
         "utils/warmup.py",
+        "utils/scr/__init__.py",
+        "utils/scr/lifecycle.py",
         "utils/test/*.py",
         "utils/test/**/*.py",
         "utils/scr/test/*.py",
@@ -184,6 +192,7 @@ py_library(
     data = glob(["utils/moe_luts/*"]),
     deps = [
         ":jit_cache_env",
+        ":scr_lifecycle",
         ":torch",
         ":safetensors",
         #":decord",

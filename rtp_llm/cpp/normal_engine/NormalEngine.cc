@@ -1113,6 +1113,9 @@ KVCacheInfo NormalEngine::getCacheStatusInfo(int64_t latest_version, bool need_c
 }
 
 absl::Status NormalEngine::startLoop() {
+    if (!executor_) {
+        return absl::FailedPreconditionError("cannot start engine loop without an executor");
+    }
     if (loop_thread_) {
         return absl::OkStatus();
     }
@@ -1138,15 +1141,15 @@ absl::Status NormalEngine::stop() {
     RTP_LLM_LOG_INFO("stop normal engine");
     running_                    = false;
     const auto scheduler_status = scheduler_->stop();
-    // Ask rank 0 to stop at a step boundary. Receivers must finish all model
-    // collectives for inputs that rank 0 has already published before exiting.
-    CpuTpBroadcaster::instance().requestStop();
     if (loop_thread_) {
+        // The live loop completes outstanding collectives before teardown.
+        CpuTpBroadcaster::instance().requestStop();
         loop_thread_->join();
         loop_thread_.reset();
     }
     scheduler_->finalizeCancelledStreams();
-    // Join the async dispatch runner and release the dispatcher-owned worker pool.
+    // An aborted template has never scheduled a step or admitted an async
+    // output. Executor destruction releases its workers in either phase.
     executor_.reset();
     const auto finalize_status = scheduler_->finalizeStop();
     if (!finalize_status.ok()) {
