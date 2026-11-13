@@ -171,6 +171,18 @@ class WeightManager:
             - `Exception`: If the tensor cannot be built from the IPC metadata (e.g., invalid descriptor).
                           This is a general catch-all for unexpected failures in `_t_helper.build_from_meta`.
         """
+        name = req.get("name", "")
+        if name and "layers" not in name:
+            internal_name = rename_function(name)
+            updater = self._weights.global_weight_update_handlers.get(internal_name)
+            if updater is not None:
+                # Like ordinary updates, this is rank-local. The caller pauses
+                # all engines and resumes only after all rank updates succeed.
+                with self._lock, torch.cuda.device(self._device), torch.cuda.stream(
+                    self._working_stream
+                ):
+                    updater(lambda: self._prepare_global_update(req, internal_name))
+                return
         if "desc" not in req:
             raise KeyError(
                 "Update request is missing the 'desc' field. "
@@ -195,32 +207,19 @@ class WeightManager:
                     raise PermissionError(
                         f"shared projection {internal_name!r} requires a service restart to update"
                     )
+        else:
+            internal_name = rename_function(req["name"])
+            destination = self._weights.global_weights.get(internal_name)
+            if getattr(destination, "_rtp_requires_restart_for_update", False):
+                raise PermissionError(
+                    f"global weight {internal_name!r} requires a service restart to update"
+                )
         method: str = req["method"]
         desc: str = req["desc"]
         name: str = req["name"]
         stored_name: str = name
 
-        if method not in {"cuda_ipc", "shm"}:
-            raise ValueError(
-                f"Invalid IPC method '{method}' provided. Only 'cuda_ipc' and 'shm' are allowed."
-            )
-        tensor: torch.Tensor | None = None
-
-        if method == "cuda_ipc":
-            helper = CudaIpcHelper()
-            tensor = helper.build_from_meta(bytes.fromhex(desc))
-        else:  # method == "shm"
-            sm_meta: SharedMemIpcMeta = SharedMemIpcMeta.decode(desc)
-            tensor = self._s_helper.build_from_meta(sm_meta)
-
-        if tensor is None:
-            logging.error(
-                f"Fail to build tensor from ipc description {desc}, method: {method}"
-            )
-            # This should ideally not be reached if build_from_meta consistently returns a tensor or raises an error.
-            raise Exception(
-                f"Failed to build tensor from IPC description '{desc}' using method '{method}'. Tensor is None."
-            )
+        tensor = self._load_update_tensor(method, desc)
 
         logging.info(
             f"update weight request: {name}, shape: {tensor.shape}, device: {tensor.device}, dtype: {tensor.dtype}"
@@ -301,3 +300,36 @@ class WeightManager:
                     )
 
             self._working_stream.synchronize()
+
+    def _load_update_tensor(self, method, desc):
+        if method == "cuda_ipc":
+            tensor = CudaIpcHelper().build_from_meta(bytes.fromhex(desc))
+        elif method == "shm":
+            tensor = self._s_helper.build_from_meta(SharedMemIpcMeta.decode(desc))
+        else:
+            raise ValueError(
+                f"Invalid IPC method '{method}' provided. Only 'cuda_ipc' and 'shm' are allowed."
+            )
+        if tensor is None:
+            raise ValueError("IPC weight update produced no tensor")
+        return tensor
+
+    def _prepare_global_update(self, req, name):
+        if name in self._non_owned_global_weights:
+            raise PermissionError(
+                f"global weight {name!r} is a non-owning alias; update its owner instead"
+            )
+        if not self._weights_loader.is_global_weight_local(name):
+            raise ValueError(f"global weight {name!r} is not local")
+        tensor = self._load_update_tensor(req["method"], req["desc"])
+        for weight in self._weight_module.weights:
+            if weight.name == name:
+                shard = weight.update(
+                    tensor,
+                    self._device,
+                    load_config=self._weights_loader.get_load_config(),
+                )
+                # Keep the full IPC tensor available for model-owned layouts;
+                # it avoids exchanging the loader's hidden shards across TP.
+                return tensor, shard[name] if isinstance(shard, dict) else shard
+        raise KeyError(f"global weight {name!r} has no update descriptor")
