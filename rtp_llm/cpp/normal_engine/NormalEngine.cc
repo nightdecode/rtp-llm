@@ -1149,7 +1149,8 @@ absl::Status NormalEngine::stop() {
     }
     scheduler_->finalizeCancelledStreams();
     // An aborted template has never scheduled a step or admitted an async
-    // output. Executor destruction releases its workers in either phase.
+    // output. PP finish would enter collectives that require serving peers.
+    // On startup failure the launcher tears down the rank processes together.
     executor_.reset();
     const auto finalize_status = scheduler_->finalizeStop();
     if (!finalize_status.ok()) {
