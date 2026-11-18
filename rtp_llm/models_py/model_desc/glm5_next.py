@@ -38,6 +38,7 @@ from rtp_llm.models_py.model_desc.glm5 import Glm5MoeLayer
 from rtp_llm.models_py.model_desc.kimi_linear import (
     KimiLinearKDA,
     KimiLinearMetadata,
+    build_cp_linear_attn_metadata,
 )
 from rtp_llm.models_py.model_desc.module_base import GptModelBase
 from rtp_llm.models_py.modules import (
@@ -407,6 +408,35 @@ class Glm5NextModel(GptModelBase):
         )
         return get_group_tags_for_layers(self.kv_cache, full_attention_layers)
 
+    def _linear_attention_inputs(
+        self, inputs: PyModelInputs, fallback: PyAttentionInputs
+    ) -> PyAttentionInputs:
+        """Attention inputs of the first KDA layer, which carry the CP info.
+
+        All 34 KDA layers share one cache group ("linear") and therefore one
+        set of context-parallel offsets, so the first one is representative.
+        """
+        if self.kv_cache is None:
+            return fallback
+        linear_layer_idx = next(
+            (
+                layer_idx
+                for layer_idx, layer in enumerate(self.layers[: self.layer_num])
+                if layer.layer_type == HybridAttentionType.LINEAR
+            ),
+            None,
+        )
+        if linear_layer_idx is None:
+            return fallback
+        selected = select_attention_inputs_for_layer(
+            inputs, self.kv_cache, linear_layer_idx
+        )
+        if isinstance(selected, list):
+            raise RuntimeError(
+                "GLM-5.3-Flash LINEAR layer must map to exactly one attention-input tag"
+            )
+        return selected
+
     def prepare_fmha_impl(
         self,
         inputs: PyModelInputs,
@@ -428,12 +458,44 @@ class Glm5NextModel(GptModelBase):
         attention_inputs = get_primary_attention_inputs(inputs, self.kv_cache)
         is_target_verify = bool(getattr(attention_inputs, "is_target_verify", False))
         prefill_conv1d_meta = None
+        full_prefill_conv1d_meta = None
+        full_prefill_cu_seqlens = None
+        cp_restore_indices = None
+        cp_local_extract_indices = None
+        cp_local_valid_mask = None
         if attention_inputs.is_prefill and not is_target_verify:
-            prefill_conv1d_meta = prepare_causal_conv1d_metadata(
-                query_start_loc=attention_inputs.cu_seqlens_device,
-                device=hidden_states.device,
-            )
-        attn_meta = KimiLinearMetadata(prefill_conv1d_meta, is_target_verify)
+            # KDA recurs along the sequence, so under context parallel every
+            # rank has to see the full sequence; build the gather/restore
+            # metadata once per forward and share it across the 34 KDA layers.
+            if self.parallelism_config.prefill_cp_config.is_enabled():
+                linear_attention_inputs = self._linear_attention_inputs(
+                    inputs, attention_inputs
+                )
+                (
+                    full_prefill_conv1d_meta,
+                    full_prefill_cu_seqlens,
+                    cp_restore_indices,
+                    cp_local_extract_indices,
+                    cp_local_valid_mask,
+                ) = build_cp_linear_attn_metadata(
+                    linear_attention_inputs,
+                    self.parallelism_config,
+                    hidden_states.device,
+                )
+            if cp_restore_indices is None:
+                prefill_conv1d_meta = prepare_causal_conv1d_metadata(
+                    query_start_loc=attention_inputs.cu_seqlens_device,
+                    device=hidden_states.device,
+                )
+        attn_meta = KimiLinearMetadata(
+            prefill_conv1d_meta,
+            is_target_verify,
+            full_prefill_conv1d_meta=full_prefill_conv1d_meta,
+            full_prefill_cu_seqlens=full_prefill_cu_seqlens,
+            cp_restore_indices=cp_restore_indices,
+            cp_local_extract_indices=cp_local_extract_indices,
+            cp_local_valid_mask=cp_local_valid_mask,
+        )
 
         if fmha_impl is None:
             fmha_impl = self.prepare_fmha_impl(inputs)

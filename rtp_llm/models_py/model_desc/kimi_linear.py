@@ -14,7 +14,11 @@ from torch import nn
 
 from rtp_llm.config.model_config import ModelConfig
 from rtp_llm.model_loader.model_weight_info import ModelWeights
-from rtp_llm.models_py.distributed.collective_torch import Group, all_reduce
+from rtp_llm.models_py.distributed.collective_torch import (
+    Group,
+    all_gather,
+    all_reduce,
+)
 from rtp_llm.models_py.model_desc.block_map import (
     get_group_tags_for_layers,
     get_primary_attention_inputs,
@@ -70,12 +74,91 @@ class KimiLinearMetadata(object):
         self,
         prefill_conv1d_meta: Optional[CausalConv1dMetadata] = None,
         is_target_verify: bool = False,
+        full_prefill_conv1d_meta: Optional[CausalConv1dMetadata] = None,
+        full_prefill_cu_seqlens: Optional[torch.Tensor] = None,
+        cp_restore_indices: Optional[torch.Tensor] = None,
+        cp_local_extract_indices: Optional[torch.Tensor] = None,
+        cp_local_valid_mask: Optional[torch.Tensor] = None,
     ):
         self.prefill_conv1d_meta = prefill_conv1d_meta
         self.is_target_verify = is_target_verify
+        # Context-parallel prefill metadata. KDA recurs along the sequence, so
+        # each rank must see the whole sequence; these describe how to restore
+        # the all-gathered tokens to sequence order and how to take this rank's
+        # zigzag slice back out. Mirrors Qwen3NextMetadata.
+        self.full_prefill_conv1d_meta = full_prefill_conv1d_meta
+        self.full_prefill_cu_seqlens = full_prefill_cu_seqlens
+        self.cp_restore_indices = cp_restore_indices
+        self.cp_local_extract_indices = cp_local_extract_indices
+        self.cp_local_valid_mask = cp_local_valid_mask
 
     def get_prefill_conv1d_meta(self) -> Optional[CausalConv1dMetadata]:
         return self.prefill_conv1d_meta
+
+    @property
+    def is_cp_linear_attn(self) -> bool:
+        return self.cp_restore_indices is not None
+
+
+def build_cp_linear_attn_metadata(
+    attention_inputs: PyAttentionInputs,
+    parallelism_config: ParallelismConfig,
+    device: torch.device,
+) -> tuple[
+    Optional[CausalConv1dMetadata],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+]:
+    """Precompute the per-layer all-gather metadata for CP linear attention.
+
+    Returns (full_conv1d_meta, full_cu_seqlens, restore_indices,
+             local_extract_indices, local_valid_mask). Ported verbatim from
+    Qwen3NextModel._build_cp_linear_attn_metadata; the two linear-attention
+    layouts are identical, only the recurrence kernel differs.
+    """
+    cp_info = attention_inputs.context_parallel_info
+    if cp_info is None:
+        return None, None, None, None, None
+
+    # In CP mode the TP group is repurposed as the CP group, so tp_size == cp_size.
+    cp_size = parallelism_config.tp_size
+    cp_rank = parallelism_config.tp_rank
+
+    full_new_lengths = cp_info.prefill_actual_input_lengths_cpu
+    full_cu = torch.zeros(
+        full_new_lengths.shape[0] + 1, dtype=torch.int32, device=device
+    )
+    full_cu[1:] = full_new_lengths.cumsum(0).to(device)
+    full_conv1d_meta = prepare_causal_conv1d_metadata(
+        query_start_loc=full_cu, device=device
+    )
+
+    restore_indices = cp_info.prefill_qkv_restore_indice
+    padding_mask = cp_info.prefill_qkv_padding_mask
+    unpad_restore = restore_indices[padding_mask == 1]
+
+    total_ag = padding_mask.shape[0]
+    local_chunk_total = total_ag // cp_size
+    local_start = cp_rank * local_chunk_total
+
+    inv_restore = torch.full((total_ag,), -1, dtype=torch.long, device=device)
+    inv_restore[unpad_restore.long()] = torch.arange(
+        unpad_restore.shape[0], device=device
+    )
+
+    local_inv = inv_restore[local_start : local_start + local_chunk_total]
+    cp_local_valid_mask = local_inv >= 0
+    cp_local_extract_indices = local_inv[cp_local_valid_mask]
+
+    return (
+        full_conv1d_meta,
+        full_cu,
+        restore_indices,
+        cp_local_extract_indices,
+        cp_local_valid_mask,
+    )
 
 
 class KimiLinearKDABase(nn.Module):
@@ -107,11 +190,16 @@ class KimiLinearKDABase(nn.Module):
         assert (
             self.head_k_dim == self.head_v_dim
         ), "head_k_dim and head_v_dim must be the same now"
+        # Shard by the attention TP view, not the raw TP size: under prefill CP
+        # the TP group is repurposed as the CP group, get_attn_tp_size() is 1 and
+        # the loader (LoadConfig.tp_size, model_weight_info.py) keeps attention
+        # weights unsharded on every rank. Without CP the two are equal.
+        attn_tp_size = parallelism_config.get_attn_tp_size()
         self.local_num_k_heads: int = (
-            linear_attn_config.linear_num_key_heads // parallelism_config.tp_size
+            linear_attn_config.linear_num_key_heads // attn_tp_size
         )
         self.local_num_v_heads: int = (
-            linear_attn_config.linear_num_value_heads // parallelism_config.tp_size
+            linear_attn_config.linear_num_value_heads // attn_tp_size
         )
         self.linear_conv_kernel_dim: int = (
             self.linear_attn_config.linear_conv_kernel_dim
@@ -188,8 +276,13 @@ class KimiLinearKDAPrefill(KimiLinearKDABase):
         seq_size_per_block: int,
         attn_inputs: PyAttentionInputs,
         metadata: Optional[CausalConv1dMetadata] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        cu_seqlen_without_padding = attn_inputs.cu_seqlens_device
+        # Under context parallel the caller passes the full-sequence offsets;
+        # attn_inputs still describes this rank's local slice.
+        cu_seqlen_without_padding = (
+            attn_inputs.cu_seqlens_device if cu_seqlens is None else cu_seqlens
+        )
         conv_states = (
             self._get_conv_states(kv_cache_tensor).transpose(1, 2)
             if kv_cache_tensor is not None
@@ -216,6 +309,7 @@ class KimiLinearKDAPrefill(KimiLinearKDABase):
         kv_cache_tensor: Optional[torch.Tensor],
         seq_size_per_block: int,
         attn_inputs: PyAttentionInputs,
+        cu_seqlens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # Compute gate: [T, local_H*D] -> [1, T, local_H, D]
         g = forget_gate.view(
@@ -230,7 +324,11 @@ class KimiLinearKDAPrefill(KimiLinearKDABase):
             else None
         )
         context_batch_size = attn_inputs.input_lengths.shape[0]
-        cu_seqlens_without_padding = attn_inputs.cu_seqlens_device
+        # Under context parallel this is the full sequence's offsets; the
+        # request count is the same on every rank, only the token span differs.
+        cu_seqlens_without_padding = (
+            attn_inputs.cu_seqlens_device if cu_seqlens is None else cu_seqlens
+        )
         initial_states: Optional[torch.Tensor] = None
         if ssm_states is not None:
             initial_states = torch.empty(
@@ -354,6 +452,98 @@ class KimiLinearKDAPrefill(KimiLinearKDABase):
         ):
             cache_store_writer.write(cache_store_inputs, kv_cache)
         return attn_out
+
+    def forward_cp(
+        self,
+        mixed_qkv: torch.Tensor,
+        forget_gate: torch.Tensor,
+        beta: torch.Tensor,
+        attn_inputs: PyAttentionInputs,
+        kv_cache: Optional[LayerKVCache],
+        attn_meta: KimiLinearMetadata,
+    ) -> torch.Tensor:
+        """Context-parallel prefill: all-gather the projections, recur over the
+        full sequence on every rank, then take this rank's zigzag slice back.
+
+        Context parallel hands each rank one head chunk and one tail chunk of
+        the sequence (ZigzagProcessor). KDA carries state along the sequence, so
+        a rank that only sees its own chunks starts from a zero state in the
+        middle of the sequence and silently produces wrong output and wrong
+        cached state. Gathering first is the simplest correct scheme: it keeps
+        the kernel and the cache writes identical to the single-rank path and
+        costs one all-gather of [T, qkv + H*D + H] per layer. Splitting the
+        recurrence by head instead keeps the parallelism and belongs to the
+        performance step, not here.
+
+        Mirrors Qwen3NextGatedDeltaNet._forward_cp_prefill.
+        """
+        cp_info = attn_inputs.context_parallel_info
+        assert cp_info is not None, "CP prefill requires context_parallel_info"
+        full_cu = attn_meta.full_prefill_cu_seqlens
+        full_conv_meta = attn_meta.full_prefill_conv1d_meta
+        assert full_cu is not None and full_conv_meta is not None
+
+        qkv_dim = mixed_qkv.shape[-1]
+        gate_dim = forget_gate.shape[-1]
+        packed = torch.cat([mixed_qkv, forget_gate, beta], dim=-1)
+        full_packed = all_gather(packed, group=Group.TP)
+
+        padding_mask = cp_info.prefill_qkv_padding_mask
+        restore_indices = cp_info.prefill_qkv_restore_indice
+        unpad_restore = restore_indices[padding_mask == 1]
+        full_packed = full_packed[unpad_restore]
+
+        full_mixed_qkv = full_packed[:, :qkv_dim].contiguous()
+        full_forget_gate = full_packed[:, qkv_dim : qkv_dim + gate_dim].contiguous()
+        full_beta = full_packed[:, qkv_dim + gate_dim :].contiguous()
+
+        kv_cache_tensor: Optional[torch.Tensor] = None
+        seq_size_per_block = 1
+        if kv_cache is not None:
+            kv_cache_tensor = kv_cache.kv_cache_base.reshape(
+                kv_cache.kv_cache_base.shape[0], -1
+            )
+            seq_size_per_block = kv_cache.seq_size_per_block
+
+        full_mixed_qkv = self._conv1d(
+            full_mixed_qkv,
+            kv_cache_tensor,
+            seq_size_per_block,
+            attn_inputs,
+            metadata=full_conv_meta,
+            cu_seqlens=full_cu,
+        )
+        full_attn_out = self._fla(
+            full_mixed_qkv,
+            full_forget_gate,
+            full_beta,
+            kv_cache_tensor,
+            seq_size_per_block,
+            attn_inputs,
+            cu_seqlens=full_cu,
+        )
+
+        # Scatter this rank's zigzag tokens back into local order. Padding rows
+        # stay zero; they are never read downstream.
+        n_local = mixed_qkv.shape[0]
+        local_attn_out = torch.zeros(
+            n_local,
+            *full_attn_out.shape[1:],
+            device=full_attn_out.device,
+            dtype=full_attn_out.dtype,
+        )
+        valid_mask = attn_meta.cp_local_valid_mask
+        local_attn_out[valid_mask] = full_attn_out[attn_meta.cp_local_extract_indices]
+
+        cache_store_inputs = attn_inputs.cache_store_inputs
+        cache_store_writer = attn_inputs.cache_store_writer
+        if (
+            kv_cache is not None
+            and cache_store_inputs is not None
+            and cache_store_writer is not None
+        ):
+            cache_store_writer.write(cache_store_inputs, kv_cache)
+        return local_attn_out
 
 
 class KimiLinearKDADecode(KimiLinearKDABase):
@@ -592,8 +782,10 @@ class KimiLinearKDA(nn.Module):
 
         self.head_k_dim = linear_attn_config.linear_key_head_dim
         self.head_v_dim = linear_attn_config.linear_value_head_dim
+        # Same attention-TP view as KimiLinearKDAPrefill above.
         self.local_num_v_heads = (
-            linear_attn_config.linear_num_value_heads // parallelism_config.tp_size
+            linear_attn_config.linear_num_value_heads
+            // parallelism_config.get_attn_tp_size()
         )
 
         self.prefill_kda = KimiLinearKDAPrefill(
@@ -637,6 +829,9 @@ class KimiLinearKDA(nn.Module):
             attention_inputs.is_target_verify
             or not attention_inputs.is_prefill
             or attn_meta.get_prefill_conv1d_meta() is not None
+            # CP prefill carries full_prefill_conv1d_meta instead; the local
+            # per-rank conv1d metadata is never used on that path.
+            or attn_meta.is_cp_linear_attn
         ), "prefill_conv1d_meta is required for prefill"
 
         # 1. Projections
@@ -647,14 +842,24 @@ class KimiLinearKDA(nn.Module):
 
         # 2. Prefill or decode
         if attention_inputs.is_prefill and not attn_meta.is_target_verify:
-            attn_output = self.prefill_kda(
-                projected_qkv,
-                forget_gate,
-                beta_input,
-                attention_inputs,
-                kv_cache,
-                attn_meta,
-            )
+            if attn_meta.is_cp_linear_attn:
+                attn_output = self.prefill_kda.forward_cp(
+                    projected_qkv,
+                    forget_gate,
+                    beta_input,
+                    attention_inputs,
+                    kv_cache,
+                    attn_meta,
+                )
+            else:
+                attn_output = self.prefill_kda(
+                    projected_qkv,
+                    forget_gate,
+                    beta_input,
+                    attention_inputs,
+                    kv_cache,
+                    attn_meta,
+                )
         else:
             attn_output = self.decode_kda(
                 projected_qkv,
