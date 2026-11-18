@@ -12,11 +12,24 @@ from rtp_llm.utils.model_weight import W
 
 _DEVICE_TYPE = get_device_type()
 if _DEVICE_TYPE == DeviceType.Cuda:
+    from rtp_llm.models_py.modules.factory.linear.impl.cuda.fp8_gemm_linear import (
+        CudaFp8GEMMLinear,
+    )
     from rtp_llm.models_py.triton_kernels.sparse_mla.fused_logits_head_gate import (
         fused_logits_head_gate,
     )
+
+    _FP8_GEMM_LINEAR = CudaFp8GEMMLinear
+elif _DEVICE_TYPE == DeviceType.Ppu:
+    from rtp_llm.models_py.modules.factory.linear.ppu_impl.fp8_deepgemm_linear import (
+        PpuFp8DeepGemmLinear,
+    )
+
+    fused_logits_head_gate = None  # type: ignore
+    _FP8_GEMM_LINEAR = PpuFp8DeepGemmLinear
 else:
     fused_logits_head_gate = None  # type: ignore
+    _FP8_GEMM_LINEAR = None
 
 
 def _is_decode_phase(attention_inputs: Any) -> bool:
@@ -102,6 +115,18 @@ class Indexer(nn.Module):
             None,
             quant_config=quant_config,
             hw_kernel_config=hw_kernel_config,
+        )
+
+        # The caller hands down FP8 activations whenever the *MLA* projections
+        # are FP8, but the indexer keeps its own dtype: GLM-5.3-Flash ships
+        # indexer.wq_b / indexer.wk in BF16 while the MLA weights are FP8 per
+        # [128,128] block. A BF16 linear has no ``input_scales`` argument, so
+        # decide per linear whether the FP8 fast path is usable at all.
+        self._wq_b_accepts_fp8 = _FP8_GEMM_LINEAR is not None and isinstance(
+            self.wq_b, _FP8_GEMM_LINEAR
+        )
+        self._wk_accepts_fp8 = _FP8_GEMM_LINEAR is not None and isinstance(
+            self.wk, _FP8_GEMM_LINEAR
         )
 
         self.k_norm = LayerNorm(
@@ -213,13 +238,13 @@ class Indexer(nn.Module):
 
         Returns (q_fp8, q_scale).
         """
-        if q_c_fp8 is not None and q_c_scale is not None:
+        if self._wq_b_accepts_fp8 and q_c_fp8 is not None and q_c_scale is not None:
             q = self.wq_b(q_c_fp8, input_scales=q_c_scale)
         else:
             q = self.wq_b(q_lora)
         q = q.view(-1, self.index_n_heads, self.index_head_dim)
 
-        if x_fp8 is not None and x_scale is not None:
+        if self._wk_accepts_fp8 and x_fp8 is not None and x_scale is not None:
             k = self.wk(x_fp8, input_scales=x_scale)
         else:
             k = self.wk(x)
@@ -244,13 +269,13 @@ class Indexer(nn.Module):
         q_c_fp8: Optional[torch.Tensor] = None,
         q_c_scale: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if q_c_fp8 is not None and q_c_scale is not None:
+        if self._wq_b_accepts_fp8 and q_c_fp8 is not None and q_c_scale is not None:
             q = self.wq_b(q_c_fp8, input_scales=q_c_scale)
         else:
             q = self.wq_b(q_lora)
         q = q.view(-1, self.index_n_heads, self.index_head_dim)
 
-        if x_fp8 is not None and x_scale is not None:
+        if self._wk_accepts_fp8 and x_fp8 is not None and x_scale is not None:
             k = self.wk(x_fp8, input_scales=x_scale)
         else:
             k = self.wk(x)
@@ -285,13 +310,13 @@ class Indexer(nn.Module):
         q_c_fp8: Optional[torch.Tensor] = None,
         q_c_scale: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if q_c_fp8 is not None and q_c_scale is not None:
+        if self._wq_b_accepts_fp8 and q_c_fp8 is not None and q_c_scale is not None:
             q = self.wq_b(q_c_fp8, input_scales=q_c_scale)
         else:
             q = self.wq_b(q_lora)
         q = q.view(-1, self.index_n_heads, self.index_head_dim)
 
-        if x_fp8 is not None and x_scale is not None:
+        if self._wk_accepts_fp8 and x_fp8 is not None and x_scale is not None:
             k = self.wk(x_fp8, input_scales=x_scale)
         else:
             k = self.wk(x)
@@ -314,7 +339,7 @@ class Indexer(nn.Module):
     ):
         from rtp_llm.models_py.kernels.ppu.indexer_k_rope import fused_indexer_k_rope
 
-        if x_fp8 is not None and x_scale is not None:
+        if self._wk_accepts_fp8 and x_fp8 is not None and x_scale is not None:
             key = self.wk(x_fp8, input_scales=x_scale)
         else:
             key = self.wk(x)

@@ -548,6 +548,17 @@ class SparseMlaImpl(MlaImplBase):
         op_kwargs = {"parallelism_config": parallelism_config}
         if issubclass(op_cls, SparseMlaFp8Op):
             op_kwargs["use_cuda_graph"] = is_cuda_graph
+        # indexer_topk 是 indexer 的选择预算。没有压缩时它就是 token 数，
+        # 稀疏 kernel 的索引宽度与它相同；KPool（GLM-5.3-Flash）下 indexer 选的是
+        # 「池」，索引展开回 token 后宽度是 sparse_attention_topk，还要补齐到
+        # 128 的倍数（PPU 的稀疏 prefill kernel 断言 topk % (2*B_TOPK) == 0，
+        # S4 实测 2*B_TOPK = 128），2051 -> 2176。
+        semantic_top_k = int(getattr(attn_configs, "sparse_attention_topk", 0) or 0)
+        kernel_top_k = (
+            ((semantic_top_k + 127) // 128) * 128
+            if semantic_top_k > 0
+            else attn_configs.indexer_topk
+        )
         self.fmha_impl: SparseMlaOp = op_cls(
             attn_configs.head_num,
             attn_configs.kv_lora_rank,
@@ -555,19 +566,28 @@ class SparseMlaImpl(MlaImplBase):
             attn_configs.nope_head_dim,
             attn_configs.kernel_tokens_per_block,
             attn_configs.softmax_extra_scale,
-            attn_configs.indexer_topk,
+            kernel_top_k,
             **op_kwargs,
         )
 
-        self.rope_impl = NewMlaRotaryEmbeddingOp(
-            cos_sin_cache=cos_sin_cache,
-            is_neox_style=self.attn_configs.rope_config.is_neox_style,
+        # GLM-5.3 is NoPE: qk_rope_head_dim == 0, so there is no rope slice to
+        # rotate and the model carries no cos/sin cache. Skip the rope op (its
+        # constructor rejects a None cache) and the fused rope+cache kernel,
+        # which also takes the cache; plain KV cache writes still run below.
+        self._use_rope = self.rope_head_dim > 0
+        self.rope_impl = (
+            NewMlaRotaryEmbeddingOp(
+                cos_sin_cache=cos_sin_cache,
+                is_neox_style=self.attn_configs.rope_config.is_neox_style,
+            )
+            if self._use_rope
+            else None
         )
         self.kv_cache_write_op = MlaKVCacheWriteOp(
             kv_cache_dtype=attn_configs.kv_cache_dtype,
         )
 
-        self._fuse_qk_rope_cat_cache_mla = fuse_kernels_enabled()
+        self._fuse_qk_rope_cat_cache_mla = fuse_kernels_enabled() and self._use_rope
         self._kv_cache_type = (
             "fp8_ds_mla"
             if attn_configs.kv_cache_dtype == KvCacheDataType.FP8
@@ -586,7 +606,9 @@ class SparseMlaImpl(MlaImplBase):
 
     def configure_fusion(self, hw_kernel_config) -> None:
         """Use the same resolved fusion policy as the model's MLA/Indexer layers."""
-        self._fuse_qk_rope_cat_cache_mla = fuse_kernels_enabled(hw_kernel_config)
+        self._fuse_qk_rope_cat_cache_mla = (
+            fuse_kernels_enabled(hw_kernel_config) and self._use_rope
+        )
 
     def create_params(self, attn_inputs: PyAttentionInputs) -> None:
         """Allocate fmha_params and run the first prepare(). Override hook."""
@@ -860,7 +882,8 @@ class SparseMlaImpl(MlaImplBase):
                 kv_cache_type=self._kv_cache_type,
             )
         else:
-            self.rope_impl.forward(q_pe, k_pe, self.rope_params)
+            if self._use_rope:
+                self.rope_impl.forward(q_pe, k_pe, self.rope_params)
             self.kv_cache_write_op.forward(
                 compressed_kv,
                 k_pe,

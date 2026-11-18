@@ -799,8 +799,18 @@ class SparseMlaFp8CPOp(SparseMlaFp8Op):
             compressed_kv.contiguous(), group=Group.TP, role="mla_ckv"
         )
         gathered_ckv = gathered_ckv.reshape(-1, compressed_kv.size(-1))
-        gathered_k_pe = all_gather(k_pe.contiguous(), group=Group.TP, role="mla_kpe")
-        gathered_k_pe = gathered_k_pe.reshape(-1, k_pe.size(-1))
+        rope_dim = k_pe.size(-1)
+        if rope_dim == 0:
+            # NoPE (GLM-5.3-Flash sets qk_rope_head_dim = 0): there is nothing
+            # to gather, and reshape(-1, 0) on an empty tensor is ambiguous.
+            # Build the matching empty view directly; the row count has to line
+            # up with gathered_ckv so kv_restore_unpad_indices applies to both.
+            gathered_k_pe = k_pe.new_empty((gathered_ckv.size(0), 0))
+        else:
+            gathered_k_pe = all_gather(
+                k_pe.contiguous(), group=Group.TP, role="mla_kpe"
+            )
+            gathered_k_pe = gathered_k_pe.reshape(-1, rope_dim)
 
         restored_ckv = gathered_ckv[self.kv_restore_unpad_indices]
         restored_k_pe = gathered_k_pe[self.kv_restore_unpad_indices]
@@ -983,6 +993,15 @@ class SparseMlaFp8CPOp(SparseMlaFp8Op):
         """flash_mla_with_kvcache on FP8 paged cache (CP equivalent of non-CP baseline)."""
         if self.kv_cache_sharded:
             return self._attend_gather(q0, kv_cache, topk)
+        base = kv_cache.kv_cache_base
+        if base.element_size() != 1:
+            # BF16 MLA cache. GLM-5.3-Flash keeps the latent in BF16 because the
+            # PPU sparse kernels reject anything else, and flash_mla_with_kvcache's
+            # FP8 route below demands the packed byte row. Take the same route the
+            # non-CP BF16 operator takes (SparseMlaOp.forward): the flat pool plus
+            # global physical slot indices, which is what
+            # _convert_topk_indices_to_global already produces.
+            return self._attend_bf16_paged(q0, base, topk)
         kv_cache_flat = _as_uint8(
             kv_cache.kv_cache_base.view(-1, 1, kv_cache.kv_cache_base.size(-1))
         )
@@ -1025,6 +1044,34 @@ class SparseMlaFp8CPOp(SparseMlaFp8Op):
         )
         return attn_out.squeeze(0)
 
+    def _attend_bf16_paged(
+        self,
+        q0: torch.Tensor,
+        base: torch.Tensor,
+        topk: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sparse attention straight off a BF16 paged MLA cache.
+
+        No gather is needed: ``flash_mla_sparse_fwd`` indexes a flat KV buffer,
+        and the converted top-k are already physical slots in that same pool.
+        """
+        kv_flat = base.reshape(-1, 1, base.size(-1))
+        global_topk = self._convert_topk_indices_to_global(topk)
+        output = q0.new_empty((q0.size(0), q0.size(1), self.kv_lora_rank))
+        # Same launch bound as _attend_fresh_bf16: query rows and their index
+        # rows have to advance together.
+        for begin in range(0, q0.size(0), _PPU_FP8_MAX_QUERY_TOKENS):
+            end = min(begin + _PPU_FP8_MAX_QUERY_TOKENS, q0.size(0))
+            chunk, _, _ = flash_mla_sparse_fwd(
+                q0[begin:end],
+                kv_flat,
+                global_topk[begin:end],
+                self.scale,
+                d_v=self.kv_lora_rank,
+            )
+            output[begin:end].copy_(chunk)
+        return output
+
     def _attend_gather(
         self,
         q0: torch.Tensor,
@@ -1036,6 +1083,15 @@ class SparseMlaFp8CPOp(SparseMlaFp8Op):
         precomputed_req_ids (req id per global q token) for the offset lookup."""
         ws = self._gather
         assert ws is not None and self.precomputed_req_ids is not None
+        if kv_cache.kv_cache_base.element_size() != 1:
+            # The gather kernels below up-convert packed FP8 rows. A BF16 MLA
+            # cache (GLM-5.3-Flash) would be read with the wrong row width, so
+            # stop here rather than produce silently wrong attention.
+            raise NotImplementedError(
+                "CP sparse MLA cache gathering is implemented for the packed FP8 "
+                "cache only; this model keeps a BF16 MLA cache, so page-sharded "
+                "CP prefill is unsupported"
+            )
         fused_kv = self._allocate_fused_kv()
         if self.kv_cache_sharded:
             self._gather_sharded_kv_cache(kv_cache, fused_kv)
@@ -1313,7 +1369,9 @@ class SparseMlaCpImpl(SparseMlaImpl):
         # get pos=0 but never read: q is selected by total_local_ids; k_pe is
         # all-gathered then re-indexed by kv_restore_unpad_indices.
         q_pe = q[:, :, self.nope_head_dim :]
-        if self.fmha_impl.full_rope_pos_ids is not None:
+        # NoPE models (GLM-5.3: qk_rope_head_dim == 0) have no rope op; see
+        # SparseMlaImpl.__init__.
+        if self._use_rope and self.fmha_impl.full_rope_pos_ids is not None:
             self.rope_impl.forward(
                 q_pe,
                 k_pe,

@@ -40,6 +40,8 @@ def _fp8_mqa_logits_compat(*args, **kwargs):
 
 
 _paged_mqa_context_lens_dim: Optional[int] = None
+# DeepGEMM's paged MQA logits kernel only supports a 64-token KV page.
+_DEEPGEMM_PAGED_BLOCK_KV = 64
 
 
 def _get_paged_mqa_logits_metadata_compat(
@@ -81,7 +83,16 @@ def _fp8_paged_mqa_logits_compat(
     rank only after the complete logits call succeeds, instead of coupling
     RTP-LLM to a vendor package version string.
     """
-    if deep_gemm is None or not hasattr(deep_gemm, "fp8_paged_mqa_logits"):
+    # DeepGEMM's paged kernel is fixed at a 64-token page (``assert block_kv ==
+    # 64`` in paged_mqa_logits_common). PPU's default KV block is 256 tokens, so
+    # on that page size the vendor kernel is simply inapplicable and the Triton
+    # legacy scorer — which reads the page size out of the cache — is the
+    # intended path. Decide up front instead of paying an exception per call.
+    if (
+        deep_gemm is None
+        or not hasattr(deep_gemm, "fp8_paged_mqa_logits")
+        or block_kv != _DEEPGEMM_PAGED_BLOCK_KV
+    ):
         return legacy_fp8_paged_mqa_logits(
             q, kv_cache, weights, context_lens, block_table, max_context_len
         )
@@ -757,6 +768,24 @@ class IndexerOp(nn.Module):
             is_neox_style=self.is_neox_style,
             scale_fmt=self.query_scale_fmt,
         )
+
+    def quant_q_only(
+        self, query: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """只量化 Q，不碰 cache。KPool 路径自己管 K 的写入，用不了 quant_q_k。"""
+        query_flat = query.view(-1, self.index_head_dim)
+        q_fp8, q_scale = sgl_per_token_group_quant_fp8(
+            query_flat,
+            group_size=self.block_size,
+            eps=1e-4,
+            column_major_scales=True,
+            scale_tma_aligned=True,
+            scale_ue8m0=(self.query_scale_fmt == "ue8m0"),
+        )
+        q_fp8 = q_fp8.view(-1, self.index_n_heads, self.index_head_dim)
+        if self.query_scale_fmt == "ue8m0":
+            q_scale = _unpack_ue8m0_scale(q_scale)
+        return q_fp8, q_scale.view(-1, self.index_n_heads, 1)
 
     def quant_q_k_cp(
         self,
