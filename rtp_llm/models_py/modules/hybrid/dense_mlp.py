@@ -57,11 +57,15 @@ class DenseMLP(nn.Module):
         weights: Dict[str, torch.Tensor],
         quant_config: object,
         hw_kernel_config: Optional["HWKernelConfig"] = None,
+        swiglu_limit: float = 0.0,
     ):
         super().__init__()
 
         self.activation_type = activation_type
         self.parallelism_config = parallelism_config
+        # GLM-5.3-Flash clamps before SwiGLU: gate.clamp(max=limit) and
+        # up.clamp(-limit, limit). 0 disables the clamp (every other model).
+        self.swiglu_limit = float(swiglu_limit or 0.0)
         if self.activation_type not in _ACTIVATION_FUNC_MAP:
             raise ValueError(f"Unsupported activation type: {activation_type}")
         self.act_fn = _ACTIVATION_FUNC_MAP[activation_type]()
@@ -118,9 +122,12 @@ class DenseMLP(nn.Module):
         from rtp_llm.models_py.utils.fuse_config import fuse_kernels_enabled
 
         self._fuse_kernels = fuse_kernels_enabled(hw_kernel_config)
+        # Only the PPU fused kernel below takes a clamp limit. The CUDA fused
+        # kernels do not, so a clamping model falls back to the generic path.
         self._fuse_silu_quant = (
             self._fuse_kernels
             and self.is_gated
+            and self.swiglu_limit <= 0
             and CudaFp8GEMMLinear is not None
             and isinstance(self.down_proj, CudaFp8GEMMLinear)
             and (self.down_proj.K % 128 == 0)
@@ -164,8 +171,11 @@ class DenseMLP(nn.Module):
         else:
             up = self.up_proj(x)
         output = None
-        if self.is_gated and getattr(self, "_fuse_kernels", True) and getattr(
-            self.down_proj, "supports_fused_silu_quant", False
+        if (
+            self.is_gated
+            and self.swiglu_limit <= 0
+            and getattr(self, "_fuse_kernels", True)
+            and getattr(self.down_proj, "supports_fused_silu_quant", False)
         ):
             output = self.down_proj.forward_silu_and_mul_quantized(up)
         if output is None and getattr(self, "_fuse_ppu_silu_quant", False) and up.dim() == 2:
@@ -175,6 +185,7 @@ class DenseMLP(nn.Module):
                 column_major_scales=self.down_proj.prefers_column_major_scales(
                     up.shape[0]
                 ),
+                swiglu_limit=self.swiglu_limit,
             )
             output = self.down_proj(fp8_out, input_scales=scale_out)
         elif output is None and self._fuse_silu_quant and up.dim() == 2:
@@ -188,6 +199,17 @@ class DenseMLP(nn.Module):
             )
             output = self.down_proj(fp8_out, input_scales=scale_out)
         if output is None:
+            if self.is_gated and self.swiglu_limit > 0:
+                # Unfused fallback: clamp the packed [gate, up] halves before
+                # the activation, matching the reference's pre-SwiGLU clamp.
+                d = up.shape[-1] // 2
+                up = torch.cat(
+                    (
+                        up[..., :d].clamp(max=self.swiglu_limit),
+                        up[..., d:].clamp(-self.swiglu_limit, self.swiglu_limit),
+                    ),
+                    dim=-1,
+                )
             activated = self.act_fn(up)
             output = self.down_proj(activated)
         if not skip_allreduce and self.parallelism_config.get_ffn_tp_size() > 1:

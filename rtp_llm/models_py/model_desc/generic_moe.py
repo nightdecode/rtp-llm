@@ -40,6 +40,19 @@ from rtp_llm.utils.model_weight import W
 
 logger = logging.getLogger(__name__)
 
+# Models whose reference implementation clamps the *shared* expert before
+# SwiGLU, not only the routed ones. `swiglu_limit` alone is not enough to
+# decide: DeepSeek V4-Flash sets it for routed experts while its shared expert
+# runs unclamped (see triton_kernels/moe/test/test_silu_mul_split.py), so a
+# model has to opt in by name.
+_SHARED_EXPERT_CLAMP_MODELS = ("glm5_next", "glm5_next_mtp")
+
+
+def _shared_expert_swiglu_limit(config: object) -> float:
+    if getattr(config, "model_type", None) not in _SHARED_EXPERT_CLAMP_MODELS:
+        return 0.0
+    return float(getattr(config, "swiglu_limit", 0.0) or 0.0)
+
 
 class GenericMoeLayer(nn.Module):
     """Generic MoE layer supporting both Qwen3 and internal model."""
@@ -73,10 +86,12 @@ class GenericMoeLayer(nn.Module):
         gate_weight = getattr(self.gate, "weight", None)
         # GLM's non-MegaMoE PPU path uses this class too. Preserve the router's
         # FP32 GEMM output, rather than casting an already rounded BF16 output.
+        # GLM-5.3-Flash (glm5_next) routes through here as well and the reference
+        # implementation also scores its experts in FP32 (moe_router_dtype=float32).
         self._ppu_gate_weight_nt = (
             gate_weight.contiguous()
             if (
-                getattr(config, "model_type", None) == "glm_5"
+                getattr(config, "model_type", None) in ("glm_5", "glm5_next")
                 and is_ppu()
                 and isinstance(gate_weight, torch.Tensor)
                 and gate_weight.dtype == torch.bfloat16
@@ -109,6 +124,7 @@ class GenericMoeLayer(nn.Module):
                 weights,
                 quant_config,
                 hw_kernel_config=hw_kernel_config,
+                swiglu_limit=_shared_expert_swiglu_limit(config),
             )
         else:
             self.shared_expert = None

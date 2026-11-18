@@ -96,6 +96,8 @@ class DeepGemmBf16HybridExecutor(FusedMoeExpertExecutor):
     # Upper bound for prefill warmup tokens when not overridden via env.
     DEFAULT_WARMUP_MAX_TOKENS = 8192
     WARMUP_MASKED_LAYOUT = True
+    # Only the FP8 subclass threads swiglu_limit into its activation kernels.
+    SUPPORTS_SWIGLU_LIMIT = False
 
     @classmethod
     def executor_type(cls) -> ExecutorType:
@@ -140,6 +142,15 @@ class DeepGemmBf16HybridExecutor(FusedMoeExpertExecutor):
         self.top_k = config.moe_k
         self.activation = config.activation_type
         self.masked_max_token_num = config.masked_max_token_num
+        # Pre-activation clamp (GLM-5.3-Flash: swiglu_limit = 10). 0 disables it.
+        # Only the FP8 subclass threads it into its activation kernels; the bf16
+        # and int8 paths reject a nonzero limit rather than silently drop it.
+        self.swiglu_limit = float(getattr(config, "swiglu_limit", 0.0) or 0.0)
+        if self.swiglu_limit > 0 and not self.SUPPORTS_SWIGLU_LIMIT:
+            raise NotImplementedError(
+                f"{type(self).__name__} has no pre-activation clamp; the model "
+                f"requires swiglu_limit={self.swiglu_limit}"
+            )
 
         # Weight initialization (bf16, no quantization)
         self.w1 = weights[W.moe_w1]
@@ -854,6 +865,7 @@ class DeepGemmFp8HybridExecutor(DeepGemmBf16HybridExecutor):
     """
 
     QUANT_METHOD = "FP8_PER_BLOCK"
+    SUPPORTS_SWIGLU_LIMIT = True
 
     @classmethod
     def check_conditions(cls, checker: Any, config: MoEConfigAdapter) -> None:
@@ -1051,7 +1063,7 @@ class DeepGemmFp8HybridExecutor(DeepGemmBf16HybridExecutor):
             dispose_tensor(input_scale)
 
             down_q, down_scale = masked_silu_mul_fp8_quantize_128(
-                gateup_output, tokens_per_expert, expected_m
+                gateup_output, tokens_per_expert, expected_m, self.swiglu_limit
             )
             dispose_tensor(gateup_output)
 
@@ -1203,16 +1215,22 @@ class DeepGemmFp8HybridExecutor(DeepGemmBf16HybridExecutor):
             # Only the live packed prefix was produced by the ragged GEMM.
             # Keep its length on device and skip unoccupied capacity rows.
             down_q, down_scale = ragged_silu_mul_fp8_quantize_128(
-                gateup_output, token_counts
+                gateup_output, token_counts, self.swiglu_limit
             )
             dispose_tensor(gateup_output)
         elif self._fuse_silu_quant:
             down_q, down_scale = silu_mul_fp8_quantize_128(
                 gateup_output,
                 gate_first=False,
+                swiglu_limit=self.swiglu_limit,
             )
             dispose_tensor(gateup_output)
         else:
+            if self.swiglu_limit > 0:
+                raise NotImplementedError(
+                    "swiglu_limit is not implemented for the unfused "
+                    "silu_and_mul path; keep fused kernels enabled"
+                )
             down_bf16 = torch.empty(
                 (all_tokens, self.intermediate_size // 2),
                 device=device,

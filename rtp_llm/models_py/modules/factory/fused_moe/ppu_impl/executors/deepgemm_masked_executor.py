@@ -75,6 +75,11 @@ class DeepGemmBf16MaskedExecutor(FusedMoeExpertExecutor):
         weights: Dict[str, torch.Tensor],
     ) -> None:
         super().__init__(config, quant_config, weights)
+        if float(getattr(config, "swiglu_limit", 0.0) or 0.0) > 0:
+            raise NotImplementedError(
+                "%s has no pre-activation clamp; the model requires "
+                "swiglu_limit=%s" % (type(self).__name__, config.swiglu_limit)
+            )
         self._w1 = weights[W.moe_w1]
         self._w2 = weights[W.moe_w2]
         self._w1_scale = weights.get(W.moe_s1, None)
@@ -246,6 +251,11 @@ class DeepGemmInt8MaskedExecutor(FusedMoeExpertExecutor):
         weights: Dict[str, torch.Tensor],
     ):
         super().__init__(config, quant_config, weights)
+        if float(getattr(config, "swiglu_limit", 0.0) or 0.0) > 0:
+            raise NotImplementedError(
+                "%s has no pre-activation clamp; the model requires "
+                "swiglu_limit=%s" % (type(self).__name__, config.swiglu_limit)
+            )
         self._w1 = weights[W.moe_w1]
         self._w2 = weights[W.moe_w2]
         self._w1_scale = weights[W.moe_s1]
@@ -459,6 +469,8 @@ class DeepGemmFp8MaskedExecutor(FusedMoeExpertExecutor):
         weights: Dict[str, torch.Tensor],
     ) -> None:
         super().__init__(config, quant_config, weights)
+        # Pre-activation clamp (GLM-5.3-Flash: swiglu_limit = 10). 0 disables it.
+        self._swiglu_limit = float(getattr(config, "swiglu_limit", 0.0) or 0.0)
         self._w1 = weights[W.moe_w1]
         self._w2 = weights[W.moe_w2]
         self._w1_scale = weights[W.moe_s1]
@@ -621,7 +633,7 @@ class DeepGemmFp8MaskedExecutor(FusedMoeExpertExecutor):
             dispose_tensor(expert_x_scale)
 
             down_q, down_scale = masked_silu_mul_fp8_quantize_128(
-                gateup_output, masked_m, expected_m
+                gateup_output, masked_m, expected_m, self._swiglu_limit
             )
             dispose_tensor(gateup_output)
 

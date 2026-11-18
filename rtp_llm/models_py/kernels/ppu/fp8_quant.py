@@ -102,6 +102,8 @@ def _silu_mul_fp8_quant_128(
     GATE_FIRST: tl.constexpr,
     GROUPS: tl.constexpr,
     COLUMN_MAJOR: tl.constexpr,
+    APPLY_SWIGLU_LIMIT: tl.constexpr,
+    SWIGLU_LIMIT: tl.constexpr,
 ):
     groups = tl.program_id(0) * GROUPS + tl.arange(0, GROUPS)
     row = groups // (HIDDEN // 128)
@@ -113,6 +115,13 @@ def _silu_mul_fp8_quant_128(
     up = tl.load(
         x_ptr + base + (HIDDEN if GATE_FIRST else 0), row[:, None] < ROWS, other=0
     ).to(tl.float32)
+    if APPLY_SWIGLU_LIMIT:
+        # GLM-5.3-Flash clamps before the activation: gate.clamp(max=limit) and
+        # up.clamp(-limit, limit). The loaded BF16 values widen to FP32 without
+        # loss and the limit is exactly representable, so clamping here matches
+        # the reference's BF16 clamp bit for bit.
+        gate = tl.minimum(gate, SWIGLU_LIMIT)
+        up = tl.clamp(up, -SWIGLU_LIMIT, SWIGLU_LIMIT)
     value = (gate * tl.sigmoid(gate) * up).to(tl.bfloat16).to(tl.float32)
     amax = tl.maximum(tl.max(tl.abs(value), 1), 1e-10)
     scale = amax / 448.0
@@ -129,10 +138,13 @@ def silu_mul_fp8_quantize_128(
     *,
     gate_first: bool,
     column_major_scales: bool = False,
+    swiglu_limit: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fuse SiLU/multiply and FP8 quantization, retaining the BF16 boundary.
 
     Dense MLP uses [gate, up]; routed DeepGEMM experts use [up, gate].
+    ``swiglu_limit > 0`` enables GLM-5.3-Flash's pre-activation clamp
+    (``gate.clamp(max=limit)``, ``up.clamp(-limit, limit)``); 0 disables it.
     """
     if x.ndim != 2 or x.dtype != torch.bfloat16 or not x.is_contiguous():
         raise ValueError("SiLU FP8 quantization expects contiguous BF16 [M, 2K]")
@@ -159,6 +171,8 @@ def silu_mul_fp8_quantize_128(
             gate_first,
             4,
             column_major_scales,
+            swiglu_limit > 0,
+            float(swiglu_limit),
             num_warps=4,
             enable_fp_fusion=False,
         )
@@ -237,6 +251,8 @@ def _masked_silu_mul_fp8_quant_128(
     CAPACITY: tl.constexpr,
     HIDDEN: tl.constexpr,
     SCALE_CAPACITY: tl.constexpr,
+    APPLY_SWIGLU_LIMIT: tl.constexpr,
+    SWIGLU_LIMIT: tl.constexpr,
 ):
     expert = tl.program_id(2)
     group = tl.program_id(0)
@@ -248,6 +264,11 @@ def _masked_silu_mul_fp8_quant_128(
         offset = (expert * CAPACITY + row) * HIDDEN * 2 + cols
         up = tl.load(x_ptr + offset).to(tl.float32)
         gate = tl.load(x_ptr + offset + HIDDEN).to(tl.float32)
+        if APPLY_SWIGLU_LIMIT:
+            # See _silu_mul_fp8_quant_128: GLM-5.3-Flash clamps gate and up
+            # before the activation.
+            gate = tl.minimum(gate, SWIGLU_LIMIT)
+            up = tl.clamp(up, -SWIGLU_LIMIT, SWIGLU_LIMIT)
         # Match a BF16 SiLU-and-mul output followed by group quantization.
         value = ((gate * tl.sigmoid(gate)) * up).to(tl.bfloat16).to(tl.float32)
         amax = tl.maximum(tl.max(tl.abs(value), 0), 1e-10)
@@ -264,8 +285,12 @@ def masked_silu_mul_fp8_quantize_128(
     x: torch.Tensor,
     masked_m: torch.Tensor,
     expected_m: int,
+    swiglu_limit: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused [up, gate] SiLU/FP8 with a BF16 activation rounding boundary."""
+    """Fused [up, gate] SiLU/FP8 with a BF16 activation rounding boundary.
+
+    ``swiglu_limit > 0`` enables GLM-5.3-Flash's pre-activation clamp.
+    """
     if x.ndim != 3 or x.dtype != torch.bfloat16 or not x.is_contiguous():
         raise ValueError(
             "masked SiLU FP8 quantization expects contiguous BF16 [E, M, 2K]"
@@ -293,6 +318,8 @@ def masked_silu_mul_fp8_quantize_128(
             capacity,
             hidden,
             scale_capacity,
+            swiglu_limit > 0,
+            float(swiglu_limit),
             num_warps=4,
             num_stages=1,
         )

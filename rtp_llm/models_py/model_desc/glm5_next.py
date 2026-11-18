@@ -219,8 +219,21 @@ class Glm5NextDecoderLayer(nn.Module):
                 weights,
                 quant_config,
                 hw_kernel_config=hw_kernel_config,
+                # First `first_k_dense_replace` layers are plain MLPs and clamp
+                # before SwiGLU just like the experts do.
+                swiglu_limit=float(getattr(config, "swiglu_limit", 0.0) or 0.0),
             )
         elif moe_config.moe_strategy in MEGA_MOE_STRATEGIES:
+            # The pre-SwiGLU clamp is plumbed through the DenseMLP and the PPU
+            # DeepGEMM executors only. Whether MegaMoE picks `swiglu_limit` up
+            # for this model has not been verified, and dropping the clamp is a
+            # silent accuracy loss, so refuse the combination instead.
+            if float(getattr(config, "swiglu_limit", 0.0) or 0.0) > 0:
+                raise NotImplementedError(
+                    "glm5_next needs a pre-SwiGLU clamp "
+                    f"(swiglu_limit={config.swiglu_limit}); the MegaMoE strategy "
+                    f"{moe_config.moe_strategy} has not been verified to apply it"
+                )
             self.mlp = Glm5MoeLayer(
                 config,
                 parallelism_config,

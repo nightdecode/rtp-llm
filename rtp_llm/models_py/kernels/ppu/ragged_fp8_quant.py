@@ -17,6 +17,8 @@ def _ragged_silu_quant(
     EXPERTS: tl.constexpr,
     BLOCK_E: tl.constexpr,
     GROUPS: tl.constexpr,
+    APPLY_SWIGLU_LIMIT: tl.constexpr,
+    SWIGLU_LIMIT: tl.constexpr,
 ):
     experts = tl.arange(0, BLOCK_E)
     rows = tl.sum(tl.load(counts_ptr + experts, experts < EXPERTS, other=0), 0)
@@ -35,6 +37,11 @@ def _ragged_silu_quant(
         base = row[:, None] * (2 * HIDDEN) + cols
         up = tl.load(x_ptr + base, mask, other=0).to(tl.float32)
         gate = tl.load(x_ptr + base + HIDDEN, mask, other=0).to(tl.float32)
+        if APPLY_SWIGLU_LIMIT:
+            # GLM-5.3-Flash clamps gate and up before the activation; see
+            # rtp_llm/models_py/kernels/ppu/fp8_quant.py.
+            gate = tl.minimum(gate, SWIGLU_LIMIT)
+            up = tl.clamp(up, -SWIGLU_LIMIT, SWIGLU_LIMIT)
         value = (gate * tl.sigmoid(gate) * up).to(tl.bfloat16).to(tl.float32)
         amax = tl.maximum(tl.max(tl.abs(value), 1), 1e-10)
         scales = amax / 448.0
@@ -47,7 +54,7 @@ def _ragged_silu_quant(
 
 
 def ragged_silu_mul_fp8_quantize_128(
-    x: torch.Tensor, counts: torch.Tensor
+    x: torch.Tensor, counts: torch.Tensor, swiglu_limit: float = 0.0
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize only sum(counts) live [up,gate] rows; leave spare rows unused.
 
@@ -86,6 +93,8 @@ def ragged_silu_mul_fp8_quantize_128(
             counts.numel(),
             triton.next_power_of_2(counts.numel()),
             4,
+            swiglu_limit > 0,
+            float(swiglu_limit),
             num_warps=4,
             enable_fp_fusion=False,
         )
