@@ -113,6 +113,42 @@ def hc_pre(
     rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + rms_eps)
     mixes = F.linear(x_flat, hc_fn) * rsqrt
 
+    if mixes.is_cuda:
+        from rtp_llm.models_py.triton_kernels.common.mhc_gating import mhc_gating
+
+        pre, post, comb = mhc_gating(
+            mixes,
+            hc_base,
+            hc_scale,
+            n,
+            hc_eps,
+            sinkhorn_iters,
+            _MHC_POST_MULT_VALUE,
+        )
+    else:
+        pre, post, comb = _hc_gates_torch(
+            mixes, hc_base, hc_scale, n, hc_eps, sinkhorn_iters
+        )
+
+    layer_input = (pre.unsqueeze(-1) * residual.float()).sum(dim=1)
+    return layer_input.to(streams.dtype), comb, post
+
+
+def _hc_gates_torch(
+    mixes: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_scale: torch.Tensor,
+    n: int,
+    hc_eps: float,
+    sinkhorn_iters: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reference definition of the MHC gates; the fused kernel must match it.
+
+    The Sinkhorn loop below is ~114 kernels for an [T, n, n] tensor with n = 4,
+    which is why ``hc_pre`` prefers the fused kernel on device. This stays as
+    the semantic reference and the CPU path.
+    """
+    num_tokens = mixes.shape[0]
     pre_raw = mixes[:, :n]
     post_raw = mixes[:, n : 2 * n]
     comb_raw = mixes[:, 2 * n :].view(num_tokens, n, n)
@@ -129,9 +165,7 @@ def hc_pre(
     for _ in range(sinkhorn_iters - 1):
         comb = comb / (comb.sum(-1, keepdim=True) + hc_eps)
         comb = comb / (comb.sum(-2, keepdim=True) + hc_eps)
-
-    layer_input = (pre.unsqueeze(-1) * residual.float()).sum(dim=1)
-    return layer_input.to(streams.dtype), comb, post
+    return pre, post, comb
 
 
 def hc_post(
