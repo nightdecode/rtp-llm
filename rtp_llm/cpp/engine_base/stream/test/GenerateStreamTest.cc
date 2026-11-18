@@ -1948,8 +1948,6 @@ TEST_F(GenerateStreamTest, testChunkedPrefillActivationGates) {
         {"return_hidden_states", [](GenerateInput&, GenerateConfig& config) { config.return_hidden_states = true; }},
         {"return_all_hidden_states",
          [](GenerateInput&, GenerateConfig& config) { config.return_all_hidden_states = true; }},
-        {"return_all_probs",
-         [](GenerateInput&, GenerateConfig& config) { config.return_all_probs = ReturnAllProbsMode::DEFAULT; }},
         {"custom_output", [](GenerateInput& input, GenerateConfig&) { input.custom_output_token_position = 3; }},
         {"multimodal",
          [](GenerateInput& input, GenerateConfig&) {
@@ -1963,6 +1961,15 @@ TEST_F(GenerateStreamTest, testChunkedPrefillActivationGates) {
         EXPECT_FALSE(stream->chunkedPrefillEnabled());
         EXPECT_EQ(stream->stopReason(), "chunked prefill incompatible: " + std::string(test_case.name));
     }
+
+    // return_all_probs is sampler output attached to generated tokens: middle
+    // chunks neither sample nor publish an update, so chunking stays enabled.
+    auto all_probs_stream = builder.createChunkedContextStream(
+        input_ids, RoleType::PREFILL, /*chunk_size=*/8, [](GenerateInput&, GenerateConfig& config) {
+            config.return_all_probs = ReturnAllProbsMode::DEFAULT;
+        });
+    EXPECT_TRUE(all_probs_stream->chunkedPrefillEnabled());
+    EXPECT_FALSE(all_probs_stream->hasError());
 
     auto non_chunked_force_batch_stream = builder.createChunkedContextStream(input_ids,
                                                                              RoleType::PREFILL,

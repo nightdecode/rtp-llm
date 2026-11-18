@@ -82,5 +82,6 @@ def init_fifo_scheduler_group_args(parser, fifo_scheduler_config):
         "多返回序列时，若预算小于 num_return_sequences×seq_size_per_block，"
         "且缓存复用后的剩余输入大于预算//num_return_sequences，请求将在调度时以 INVALID_PARAMS 拒绝。"
         "请增大 prefill_chunk_size 或减小 num_return_sequences；预算建议至少为最大返回序列数×seq_size_per_block。"
-        "使用 force_batch、beam、logits、loss、hidden_states、all_probs 或多模态输入的请求将被拒绝。",
+        "使用 force_batch、beam、logits、loss、hidden_states 或多模态输入的请求将被拒绝；"
+        "all_probs（逐步 top-k logprobs）不受影响，它只挂在生成出来的 token 上。",
     )

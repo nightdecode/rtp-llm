@@ -31,6 +31,17 @@ def init_server_group_args(parser, server_config, distribute_config):
         help="服务启动端口",
     )
     server_group.add_argument(
+        "--local_ip",
+        env_name="LOCAL_IP",
+        bind_to=(server_config, "ip"),
+        type=str,
+        default="",
+        help="本机对外可达的 IP，用于 world_info 与 PD 分离时通告给对端的 cache store 地址。"
+        "留空时回退到 socket.gethostbyname(socket.gethostname())；"
+        "容器把主机名写成 127.0.0.1 时必须显式指定，否则对端会连到自己的回环地址，"
+        "表现为取 KV 超时（PD_CACHE_KEY_READ_FAILED）。",
+    )
+    server_group.add_argument(
         "--timeout_keep_alive",
         env_name="TIMEOUT_KEEP_ALIVE",
         bind_to=(server_config, "timeout_keep_alive"),

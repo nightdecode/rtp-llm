@@ -139,17 +139,23 @@ GenerateStream::GenerateStream(const shared_ptr<GenerateInput>& input,
     if (!input->fake_query && chunk_size > 0
         && (resource_context.role_type == RoleType::PREFILL || resource_context.role_type == RoleType::PDFUSION)) {
         const auto& config = *generateConfig();
-        const char* reason = isGroup()                                       ? "force_batch" :
-                             hasNumBeams()                                   ? "num_beams" :
-                             returnLogits()                                  ? "return_logits" :
-                             returnPromptLogits()                            ? "return_prompt_logits" :
-                             calculateLoss()                                 ? "calculate_loss" :
-                             config.return_hidden_states                     ? "return_hidden_states" :
-                             config.return_all_hidden_states                 ? "return_all_hidden_states" :
-                             getReturnAllProbs() != ReturnAllProbsMode::NONE ? "return_all_probs" :
-                             input->custom_output_token_position >= 0        ? "custom_output" :
-                             multimodalFeaturesLength() != 0                 ? "multimodal" :
-                                                                               nullptr;
+        // return_all_probs is deliberately NOT rejected here. Everything else in
+        // this list needs per-prompt-position output, which a middle chunk cannot
+        // produce; all_probs is a sampler output attached to generated tokens.
+        // A middle chunk never samples (NormalSamplerInputGatherer.cc:197) and
+        // never publishes an update (prepareUpdateWithoutLock below returns false
+        // for it), so the only stream update that carries all_probs is the one
+        // after the last chunk — exactly as in the unchunked path.
+        const char* reason = isGroup()                                ? "force_batch" :
+                             hasNumBeams()                            ? "num_beams" :
+                             returnLogits()                           ? "return_logits" :
+                             returnPromptLogits()                     ? "return_prompt_logits" :
+                             calculateLoss()                          ? "calculate_loss" :
+                             config.return_hidden_states              ? "return_hidden_states" :
+                             config.return_all_hidden_states          ? "return_all_hidden_states" :
+                             input->custom_output_token_position >= 0 ? "custom_output" :
+                             multimodalFeaturesLength() != 0          ? "multimodal" :
+                                                                        nullptr;
         if (reason != nullptr) {
             reportEvent(
                 StreamEvents::Error, ErrorCode::INVALID_PARAMS, "chunked prefill incompatible: " + std::string(reason));
