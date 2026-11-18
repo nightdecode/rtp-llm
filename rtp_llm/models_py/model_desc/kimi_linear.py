@@ -92,11 +92,15 @@ class KimiLinearKDABase(nn.Module):
         linear_attn_config: LinearAttentionConfig,
         parallelism_config: ParallelismConfig,
         weights: Dict[str, torch.Tensor],
+        gate_lower_bound: Optional[float] = None,
     ):
         super().__init__()
         self.linear_attn_config = linear_attn_config
         self.parallelism_config = parallelism_config
         self.weights = weights
+        # Optional decay lower bound (GLM-5.3 KDA uses -5.0; None keeps the
+        # default -exp(A_log) * softplus(g + dt_bias) gate).
+        self.gate_lower_bound = gate_lower_bound
         # params
         self.head_k_dim: int = linear_attn_config.linear_key_head_dim
         self.head_v_dim: int = linear_attn_config.linear_value_head_dim
@@ -168,8 +172,14 @@ class KimiLinearKDAPrefill(KimiLinearKDABase):
         linear_attn_config: LinearAttentionConfig,
         parallelism_config: ParallelismConfig,
         weights: Dict[str, torch.Tensor],
+        gate_lower_bound: Optional[float] = None,
     ):
-        super().__init__(linear_attn_config, parallelism_config, weights)
+        super().__init__(
+            linear_attn_config,
+            parallelism_config,
+            weights,
+            gate_lower_bound=gate_lower_bound,
+        )
 
     def _conv1d(
         self,
@@ -274,6 +284,7 @@ class KimiLinearKDAPrefill(KimiLinearKDABase):
             return_intermediate_states=True,
             A_log=self.alog,
             dt_bias=self.dt_bias,
+            lower_bound=self.gate_lower_bound,
         )
         h_from_chunk = h
 
@@ -429,6 +440,7 @@ class KimiLinearKDADecode(KimiLinearKDABase):
             inplace_final_state=True,
             use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=True,
+            lower_bound=self.gate_lower_bound,
             block_map=attn_inputs.kv_cache_kernel_block_id_device,
             seq_size_per_block=seq_size_per_block,
             sequence_lengths=attn_inputs.sequence_lengths_plus_1_device,
@@ -520,6 +532,7 @@ class KimiLinearKDA(nn.Module):
         layernorm_eps: float,
         quant_config: Optional[object] = None,
         hw_kernel_config: Optional["HWKernelConfig"] = None,
+        gate_lower_bound: Optional[float] = None,
     ):
         super().__init__()
         self.linear_attn_config = linear_attn_config
@@ -584,10 +597,16 @@ class KimiLinearKDA(nn.Module):
         )
 
         self.prefill_kda = KimiLinearKDAPrefill(
-            linear_attn_config, parallelism_config, weights
+            linear_attn_config,
+            parallelism_config,
+            weights,
+            gate_lower_bound=gate_lower_bound,
         )
         self.decode_kda = KimiLinearKDADecode(
-            linear_attn_config, parallelism_config, weights
+            linear_attn_config,
+            parallelism_config,
+            weights,
+            gate_lower_bound=gate_lower_bound,
         )
         # o_norm with sigmoid activation (not SwiGLU)
         self.norm = RmsNormGated(

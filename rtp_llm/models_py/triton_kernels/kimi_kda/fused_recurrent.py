@@ -22,6 +22,7 @@ def cal_block_idx(x, seq_size_per_block):
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
         "IS_CONTINUOUS_BATCHING": lambda args: args["block_map"] is not None,
         "HAS_DT_BIAS": lambda args: args["dt_bias"] is not None,
+        "USE_LOWER_BOUND": lambda args: args["lower_bound"] is not None,
     }
 )
 @triton.jit(do_not_specialize=["N", "T"])
@@ -39,6 +40,7 @@ def fused_recurrent_kda_fwd_kernel(
     cu_seqlens,
     block_map,
     sequence_lengths,
+    lower_bound,
     max_block_size: tl.int32,
     scale,
     N,
@@ -61,6 +63,7 @@ def fused_recurrent_kda_fwd_kernel(
     SEQ_SIZE_PER_BLOCK: tl.constexpr,
     USE_GATE_IN_KERNEL: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -136,7 +139,10 @@ def fused_recurrent_kda_fwd_kernel(
                     tl.float32
                 )
                 b_g = b_g + b_bias
-            b_gk = -exp(b_A) * softplus(b_g)
+            if USE_LOWER_BOUND:
+                b_gk = lower_bound * tl.sigmoid(exp(b_A) * b_g)
+            else:
+                b_gk = -exp(b_A) * softplus(b_g)
         else:
             b_gk = b_g
 
@@ -192,6 +198,7 @@ def fused_recurrent_kda_fwd(
     sequence_lengths: Optional[torch.Tensor] = None,
     use_qk_l2norm_in_kernel: bool = False,
     use_gate_in_kernel: bool = False,
+    lower_bound: Optional[float] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
@@ -232,6 +239,7 @@ def fused_recurrent_kda_fwd(
         cu_seqlens=cu_seqlens,
         block_map=block_map,
         sequence_lengths=sequence_lengths,
+        lower_bound=lower_bound,
         max_block_size=max_block_size,
         scale=scale,
         N=N,
@@ -274,6 +282,7 @@ def fused_recurrent_kda(
     block_map: Optional[torch.Tensor] = None,
     seq_size_per_block: int = 1,
     sequence_lengths: Optional[torch.Tensor] = None,
+    lower_bound: Optional[float] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if scale is None:
         scale = k.shape[-1] ** -0.5
@@ -296,5 +305,6 @@ def fused_recurrent_kda(
         sequence_lengths=sequence_lengths,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         use_gate_in_kernel=use_gate_in_kernel,
+        lower_bound=lower_bound,
     )
     return o, final_state

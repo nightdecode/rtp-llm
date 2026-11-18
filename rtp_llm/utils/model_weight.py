@@ -1301,6 +1301,19 @@ class W:
     mla_indexer_weights_proj_w = (
         "self_attention_weights.mla.indexer.weights_proj.kernel"
     )
+    # glm5_next indexer kpool compression (per-layer, bf16)
+    mla_indexer_kpool_ape = "self_attention_weights.mla.indexer.kpool_compress_ape"
+    mla_indexer_kpool_gate = "self_attention_weights.mla.indexer.kpool_compress_gate"
+
+    # glm5_next MHC (multi-hyper-connection) residual mixing, per-layer fp32.
+    # hc_*_fn: [hc_mult * (hc_mult + 2), hc_mult * hidden], hc_*_base:
+    # [hc_mult * (hc_mult + 2)], hc_*_scale: [3].
+    hc_attn_base = "mhc.attn_base"
+    hc_attn_scale = "mhc.attn_scale"
+    hc_attn_fn = "mhc.attn_fn"
+    hc_ffn_base = "mhc.ffn_base"
+    hc_ffn_scale = "mhc.ffn_scale"
+    hc_ffn_fn = "mhc.ffn_fn"
     # cross attn
     cross_attn_pre_ln_gamma = "cross_attention_weights_pre_layernorm.gamma"
     cross_attn_pre_ln_beta = "cross_attention_weights_pre_layernorm.beta"

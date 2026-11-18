@@ -33,6 +33,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         use_gate_in_kernel: bool = False,
         cu_seqlens: torch.LongTensor | None = None,
         return_intermediate_states: bool = False,
+        lower_bound: float | None = None,
     ):
         chunk_size = 64
 
@@ -62,7 +63,7 @@ class ChunkKDAFunction(torch.autograd.Function):
                 cu_seqlens=cu_seqlens,
                 chunk_indices=chunk_indices,
                 safe_gate=False,
-                lower_bound=None,
+                lower_bound=lower_bound,
                 use_gate_in_kernel=use_gate_in_kernel,
                 A_log=A_log,
                 dt_bias=dt_bias,
@@ -91,6 +92,7 @@ def chunk_kda(
     use_gate_in_kernel: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
     return_intermediate_states: bool = False,
+    lower_bound: float | None = None,
     **kwargs,
 ):
     r"""
@@ -110,6 +112,8 @@ def chunk_kda(
             If True, kwargs must contain `A_log` and optionally `dt_bias`.
         cu_seqlens (torch.LongTensor): Cumulative sequence lengths `[N+1]`.
         return_intermediate_states (bool): Return intermediate states for inference.
+        lower_bound (Optional[float]): Gate lower bound for the in-kernel decay
+            (glm5_next uses -5.0; None keeps the default softplus gate).
 
     Returns:
         (o, final_state) or (o, final_state, h) if return_intermediate_states=True.
@@ -160,4 +164,5 @@ def chunk_kda(
         use_gate_in_kernel,
         cu_seqlens,
         return_intermediate_states,
+        lower_bound,
     )

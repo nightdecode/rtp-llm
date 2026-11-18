@@ -23,6 +23,7 @@ _CLASS_TO_MODULE: Dict[str, str] = {
     "GPTNeox": "rtp_llm.models.gpt_neox",
     "Glm4Moe": "rtp_llm.models.glm4_moe",
     "Glm4MoeLite": "rtp_llm.models.glm4_moe_lite",
+    "Glm5Next": "rtp_llm.models.glm5_next",
     "JinaBert": "rtp_llm.models.jina_bert.jina_bert",
     "KimiK25": "rtp_llm.models.kimi_k25.kimi_k25",
     "KimiLinear": "rtp_llm.models.kimi_linear.kimi_linear",

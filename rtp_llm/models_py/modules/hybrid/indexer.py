@@ -132,7 +132,14 @@ class Indexer(nn.Module):
             and not self.weights_proj.weight.is_contiguous()
         ):
             self.weights_proj.weight = self.weights_proj.weight.contiguous()
-        self.cos_sin_cache = global_weights[W.rope_cos_sin_cache]
+        # NoPE models (e.g. glm5_next with qk_rope_head_dim=0) ship no rotary
+        # cos/sin cache; the indexer then skips RoPE and keeps only the
+        # Hadamard rotation in IndexerOp.
+        self.cos_sin_cache = (
+            global_weights.get(W.rope_cos_sin_cache)
+            if global_weights is not None
+            else None
+        )
 
         # Fused RoPE kernels use equal rotary/non-rotary halves and power-of-2
         # tiles. Other supported indexer geometries retain the unfused path.

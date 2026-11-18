@@ -47,6 +47,22 @@ py_test(
 )
 
 py_test(
+    name = "glm5_next_test",
+    srcs = ["glm5_next_test.py"],
+    deps = py_test_deps + [
+        "//rtp_llm:config",
+        "//rtp_llm:testlib",
+        "//rtp_llm/models_py:models",
+    ],
+    env = {"GPU_COUNT": "1"},
+    exec_properties = {
+        "gpu": "L20_CU13",
+        "gpu_count": "1",
+    },
+    tags = ["L20_CU13"],
+)
+
+py_test(
     name = "hidden_state_capture_test",
     srcs = ["hidden_state_capture_test.py"],
     deps = py_test_deps + [
