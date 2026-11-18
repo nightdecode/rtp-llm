@@ -55,7 +55,17 @@ struct AttentionConfigs {
     bool is_sparse        = false;
     int  indexer_head_dim = 0;
     int  indexer_head_num = 0;
+    // Number of candidates the indexer selects. Without compression this counts
+    // raw tokens; with KPool compression (GLM-5.3-Flash) it counts pools.
     int  indexer_topk     = 0;
+    // KPool: how many consecutive raw tokens share one indexer cache entry.
+    // 1 means no compression (every model except GLM-5.3-Flash so far).
+    int  indexer_compress_ratio = 1;
+    // Width of the index list handed to the sparse attention kernel, in raw
+    // tokens. 0 means "same as indexer_topk" (the uncompressed case). With
+    // KPool it is indexer_topk * ratio + (ratio - 1): the expanded complete
+    // pools plus the still-incomplete tail.
+    int  sparse_attention_topk = 0;
 
     // DeepSeek-V4 specific
     // Per-layer attention type schedule. Length == num_layers (+1 for MTP).

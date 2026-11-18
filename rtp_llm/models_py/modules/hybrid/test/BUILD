@@ -9,6 +9,12 @@ cuda13_sm100_py_test(
 )
 
 py_test(
+    name = "kpool_test",
+    srcs = ["kpool_test.py"],
+    deps = ["//rtp_llm/models_py/standalone:py_standalone_testlib"],
+)
+
+py_test(
     name = "dense_mlp_parallelism_test",
     tags = ["L20_CU13"],
     exec_properties = {"gpu": "L20_CU13"},

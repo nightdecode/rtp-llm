@@ -89,6 +89,8 @@ class AttentionConfigs:
     indexer_head_dim: int
     indexer_head_num: int
     indexer_topk: int
+    indexer_compress_ratio: int
+    sparse_attention_topk: int
     is_causal: bool
     is_sparse: bool
     kv_cache_dtype: KvCacheDataType

@@ -27,9 +27,18 @@ def _mtp_indexer_share_active(
 ) -> bool:
     cp_config = getattr(parallelism_config, "prefill_cp_config", None)
     context_parallel_enabled = bool(cp_config is not None and cp_config.is_enabled())
+    # With a compressed indexer (GLM-5.3-Flash KPool) `indexer_topk` counts
+    # pools, while the indices the sparse kernel consumes are raw tokens and
+    # `sparse_attention_topk` wide. The share buffers here are sized by
+    # `indexer_topk`, so the two no longer line up; turn the reuse off rather
+    # than hand the kernel a short buffer.
+    compressed_indexer = (
+        int(getattr(model_config.attn_config, "indexer_compress_ratio", 1) or 1) > 1
+    )
     return bool(
         getattr(model_config, "index_share_for_mtp_iteration", False)
         and not context_parallel_enabled
+        and not compressed_indexer
         and layer_num == 1
         and topk > 0
     )

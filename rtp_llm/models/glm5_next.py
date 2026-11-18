@@ -568,7 +568,35 @@ class Glm5Next(BaseModel):
             config.attn_config.is_sparse = True
             config.attn_config.indexer_head_dim = text["index_head_dim"]
             config.attn_config.indexer_head_num = text["index_n_heads"]
-            config.attn_config.indexer_topk = text["index_topk"]
+            # GLM-5.3-Flash compresses the indexer cache: every `index_kpool`
+            # consecutive tokens share one pooled key, the indexer scores pools
+            # instead of raw tokens, and the selected pools are expanded back to
+            # raw token ids before sparse attention. index_topk stays the budget
+            # measured in *raw tokens*, so the pool budget is index_topk // kpool
+            # and the expanded index list is index_topk + (kpool - 1): every
+            # complete pool plus the still-incomplete tail, which is always kept.
+            # Semantics: official glm5_next_modeling_glm5_next.py:937-1062.
+            # Checkpoints without `index_kpool` (ratio 1) keep the per-token
+            # indexer; GLM-5.3-Flash ships index_kpool=4.
+            kpool = int(text.get("index_kpool", 1) or 1)
+            if kpool < 1:
+                raise ValueError(f"index_kpool must be >= 1, got {kpool}")
+            if text["index_topk"] % kpool:
+                raise ValueError(
+                    f"index_topk {text['index_topk']} must divide by index_kpool {kpool}"
+                )
+            config.attn_config.indexer_compress_ratio = kpool
+            config.attn_config.indexer_topk = text["index_topk"] // kpool
+            config.attn_config.sparse_attention_topk = (
+                text["index_topk"] + kpool - 1 if kpool > 1 else 0
+            )
+            # ckpt 的 index_kpool_always_select_tail 实测是 True，也就是未满一池的
+            # 尾部 token 永远入选；这一点已经体现在 sparse_attention_topk 里
+            # （预留 kpool-1 列给尾部），不再单独存一个字段。
+            if not text.get("index_kpool_always_select_tail", True):
+                raise NotImplementedError(
+                    "index_kpool_always_select_tail=False is not implemented"
+                )
             config.index_topk_freq = int(text.get("index_topk_freq", 1))
             config.index_skip_topk_offset = text.get("index_skip_topk_offset", None)
             config.index_topk_pattern = text.get("index_topk_pattern", None)
@@ -632,15 +660,33 @@ class Glm5Next(BaseModel):
         linear_desc.tag = "linear"
         linear_desc.cache_type = KVCacheSpecType.LINEAR
 
+        # KPool（GLM-5.3-Flash）：indexer 不再对单个 token 打分，而是把每 ratio 个
+        # 连续 token 的 key 用门控加权平均成一个「池」key 再打分。
+        # 池 key 需要每个 token 的 **key 和门控分数** 两样东西，而门控分数是 hidden
+        # 的线性投影、不在任何现有 cache 里，所以这里把 indexer 的 entry 从
+        # 「FP8 key + FP32 scale」（132 字节）换成「BF16 key + BF16 门控分数」
+        # （2 * head_dim 个 BF16 = 512 字节），池 key 每次前向现算。
+        #
+        # 这样做的理由：entry 仍是**每 token 一条**，compression_ratio 保持 1，
+        # 于是这一组现成的 slot mapping、block table、跨机传输全部不用动；
+        # 而且池化用的是精确 BF16 值，与 reference 同精度，不会把量化误差叠进
+        # 本来就要对齐的数值里。代价是 indexer cache 大 3.9 倍、每步重算池 key，
+        # 这两点写进验收报告，优化留给性能阶段（对方分支的做法是把池 key 量化成
+        # FP8 存进压缩 cache，每池 132 字节，未满一池的尾部存 FP32 环）。
+        ratio = int(getattr(model_config.attn_config, "indexer_compress_ratio", 1) or 1)
         indexer_desc = KVCacheSpecDesc()
         indexer_desc.tag = "indexer_kv"
         indexer_desc.cache_type = KVCacheSpecType.OPAQUE_KV
-        indexer_desc.entry_dtype = DataType.TYPE_UINT8
-        indexer_desc.entry_elems = indexer_head_dim + indexer_head_dim // 128 * 4
         indexer_desc.entry_count_mode = (
             OpaqueBlockEntryCountMode.KERNEL_BLOCK_COMPRESSED
         )
         indexer_desc.compression_ratio = 1
+        if ratio > 1:
+            indexer_desc.entry_dtype = DataType.TYPE_BF16
+            indexer_desc.entry_elems = 2 * indexer_head_dim
+        else:
+            indexer_desc.entry_dtype = DataType.TYPE_UINT8
+            indexer_desc.entry_elems = indexer_head_dim + indexer_head_dim // 128 * 4
 
         descs = []
         for layer_type in model_config.hybrid_attention_config.hybrid_attention_types:

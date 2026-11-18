@@ -1631,6 +1631,16 @@ class W:
         mla_indexer_weights_proj_w: sp_id,
         mla_indexer_qb_w: sp_id,
         mla_indexer_k_w: sp_id,
+        # glm5_next: indexer kpool and MHC mixing act on full (unsharded)
+        # tensors on every TP rank, so they are replicated like the indexer.
+        mla_indexer_kpool_ape: sp_id,
+        mla_indexer_kpool_gate: sp_id,
+        hc_attn_base: sp_id,
+        hc_attn_scale: sp_id,
+        hc_attn_fn: sp_id,
+        hc_ffn_base: sp_id,
+        hc_ffn_scale: sp_id,
+        hc_ffn_fn: sp_id,
         # ---- DSv4 (TP=1 today; all sp_id placeholders) ----
         v4_attn_norm: sp_id,
         v4_attn_q_norm: sp_id,
