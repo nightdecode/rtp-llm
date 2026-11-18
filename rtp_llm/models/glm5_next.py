@@ -676,3 +676,223 @@ class Glm5Next(BaseModel):
 
 
 register_model("glm5_next", Glm5Next, ["Glm5NextForConditionalGeneration"])
+
+
+def _swap_wrapped_with(
+    layer_weights: List[WeightModule], originals: Dict[str, WeightModule]
+) -> None:
+    """Replace FP8-wrapped descriptors whose kernel name has a BF16 original."""
+    for pos, weight in enumerate(layer_weights):
+        kernel = getattr(weight, "kernel", None)
+        name = getattr(kernel, "name", None) or getattr(weight, "name", None)
+        original = originals.get(name)
+        if original is not None and weight is not original:
+            layer_weights[pos] = original
+
+
+class Glm5NextMtpWeight(Glm5MtpWeight):
+    """GLM-5.3 MTP (NextN) draft-layer weight loading.
+
+    The MTP draft layer sits at ``model.language_model.layers.<num_hidden_layers>``
+    in the full GLM-5.3 checkpoint: it is a sparse-MLA + MoE layer with the DSA
+    indexer (including kpool parameters) and no MHC parameters.  Layout follows
+    Glm5MtpWeight (full-checkpoint layout B); this class adds the VL text
+    prefix, the kpool descriptors, and the BF16 restore for the checkpoint's
+    selectively-unquantized kv_b/indexer tensors.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._prefix = _VL_TEXT_PREFIX
+        self._kv_b_fp8 = True
+        self._indexer_fp8 = True
+
+    def _mtp_layer_idx(self) -> int:
+        return int(getattr(self.model_config, "mtp_layer_offset", 0) or 0)
+
+    def _process_meta(self, meta_dict, weight_keys):
+        mtp_idx = self._mtp_layer_idx()
+        suffix = f"layers.{mtp_idx}.eh_proj.weight"
+        for key in weight_keys:
+            if key.endswith(suffix):
+                self._prefix = key[: -len(suffix)]
+                break
+        self.q_use_lora = True
+        self.has_e_score_correction_bias = (
+            f"{self._prefix}layers.{mtp_idx}.mlp.gate.e_score_correction_bias"
+            in weight_keys
+        )
+        self._kv_b_fp8 = (
+            f"{self._prefix}layers.{mtp_idx}.self_attn.kv_b_proj.weight_scale_inv"
+            in weight_keys
+        )
+        self._indexer_fp8 = (
+            f"{self._prefix}layers.{mtp_idx}.self_attn.indexer.wq_b.weight_scale_inv"
+            in weight_keys
+        )
+
+    def _create_rope_w(self) -> Optional[AtomicWeight]:
+        return None
+
+    def _bf16_originals(self) -> Dict[str, WeightModule]:
+        """Fresh unquantized descriptors for the MTP layer's BF16 tensors."""
+        mtp_idx = self._mtp_layer_idx()
+        prefix = f"{self._prefix}layers.{mtp_idx}.self_attn"
+        attn_config = MlaConfig(
+            head_num=self._head_num,
+            nope_head_dim=self.nope_head_dim,
+            rope_head_dim=self.rope_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            ope_head_dim=self.nope_head_dim,
+            v_head_dim=self.v_head_dim,
+            use_mla=self.model_config.attn_config.use_mla,
+            q_use_lora=self.q_use_lora,
+        )
+        kv_b_name = f"{prefix}.kv_b_proj.weight"
+        originals: Dict[str, WeightModule] = {}
+        if not self._kv_b_fp8:
+            originals[W.mla_kv_b_w] = MlaAttnAtomicWeight(
+                W.mla_kv_b_w,
+                [CkptWeightInfo(kv_b_name, identity)],
+                transpose,
+                config=attn_config,
+            )
+            originals[W.mla_kc] = MlaAttnAtomicWeight(
+                W.mla_kc,
+                [CkptWeightInfo(kv_b_name, identity)],
+                functools.partial(
+                    transpose_slice_k,
+                    head_num=self._head_num,
+                    nope_head_dim=self.nope_head_dim,
+                    v_head_dim=self.v_head_dim,
+                    lora_rank=self.kv_lora_rank,
+                ),
+                config=attn_config,
+            )
+            originals[W.mla_vc] = MlaAttnAtomicWeight(
+                W.mla_vc,
+                [CkptWeightInfo(kv_b_name, identity)],
+                functools.partial(
+                    transpose_slice_v,
+                    head_num=self._head_num,
+                    nope_head_dim=self.nope_head_dim,
+                    v_head_dim=self.v_head_dim,
+                    lora_rank=self.kv_lora_rank,
+                ),
+                config=attn_config,
+            )
+        if not self._indexer_fp8:
+            originals[W.mla_indexer_qb_w] = MlaAttnAtomicWeight(
+                W.mla_indexer_qb_w,
+                [CkptWeightInfo(f"{prefix}.indexer.wq_b.weight", identity)],
+                transpose,
+            )
+            originals[W.mla_indexer_k_w] = MlaAttnAtomicWeight(
+                W.mla_indexer_k_w,
+                [CkptWeightInfo(f"{prefix}.indexer.wk.weight", identity)],
+                transpose,
+            )
+        return originals
+
+    def _remap_to_prefix(self, weight_modules: List[WeightModule]) -> None:
+        if self._prefix == _CKPT_BASE:
+            return
+        for wm in weight_modules:
+            for comp in wm.get_components():
+                ckpt_list = getattr(comp, "weights", None)
+                if not ckpt_list:
+                    continue
+                for ckpt in ckpt_list:
+                    if hasattr(ckpt, "name") and ckpt.name.startswith(_CKPT_BASE):
+                        ckpt.name = self._prefix + ckpt.name[len(_CKPT_BASE) :]
+
+    def _get_weight_info(self):
+        weight_info = super()._get_weight_info()
+        # The MTP layer is a full sparse-MLA layer: add the kpool descriptors
+        # (literal layer index, matching Glm5MtpWeight's pre-substitution).
+        mtp_idx = self._mtp_layer_idx()
+        for layer_weights in weight_info.layer_weights:
+            layer_weights.extend(
+                [
+                    AtomicWeight(
+                        W.mla_indexer_kpool_ape,
+                        [
+                            CkptWeightInfo(
+                                f"{_CKPT_BASE}layers.{mtp_idx}.self_attn.indexer.index_kpool_compress_ape",
+                                identity,
+                            )
+                        ],
+                        identity,
+                        data_type=torch.float32,
+                    ),
+                    AtomicWeight(
+                        W.mla_indexer_kpool_gate,
+                        [
+                            CkptWeightInfo(
+                                f"{_CKPT_BASE}layers.{mtp_idx}.self_attn.indexer.index_kpool_compress_gate",
+                                identity,
+                            )
+                        ],
+                        identity,
+                    ),
+                ]
+            )
+        self._remap_to_prefix(weight_info.weights)
+        for layer_weights in weight_info.layer_weights:
+            self._remap_to_prefix(layer_weights)
+        return weight_info
+
+    def get_weight_info(self, database=None) -> ModelWeightInfo:
+        weight_info = super().get_weight_info(database)
+        originals = self._bf16_originals()
+        if not originals:
+            return weight_info
+        if self._quant_algo is None or not self._quant_algo.isQuant():
+            return weight_info
+        for layer_weights in weight_info.layer_weights:
+            if isinstance(layer_weights, list):
+                _swap_wrapped_with(layer_weights, originals)
+        return weight_info
+
+
+class Glm5NextMtp(Glm5Mtp):
+    """GLM-5.3 MTP draft model: single sparse-MLA + MoE NextN layer.
+
+    Reuses GenericMoeMTPModel; the draft layer has no KDA and no MHC, so the
+    hybrid config is collapsed to one full-attention layer and hc_mult to 1.
+    """
+
+    @classmethod
+    def _create_config(cls, ckpt_path: str):
+        config = Glm5Next._create_config(ckpt_path)
+        num_main_layers = config.num_layers
+        num_mtp_layers = 1
+        config_path = os.path.join(ckpt_path, "config.json")
+        if os.path.exists(config_path):
+            with open(config_path) as reader:
+                config_json = json.loads(reader.read())
+            text = config_json.get("text_config", config_json)
+            num_main_layers = int(text.get("num_hidden_layers", num_main_layers))
+            num_mtp_layers = int(text.get("num_nextn_predict_layers", 1)) or 1
+        # Layout B (full checkpoint): the draft layer is at num_hidden_layers.
+        config.mtp_layer_offset = num_main_layers if num_main_layers > 1 else 0
+        config.num_layers = num_mtp_layers
+        config.moe_layer_index = [i for i in range(config.num_layers)]
+        config.is_mtp = True
+        config.hybrid_attention_config.hybrid_attention_types = [
+            HybridAttentionType.NONE
+        ] * num_mtp_layers
+        # The MTP draft layer has no MHC parameters.
+        config.hc_mult = 1
+        config.hc_sinkhorn_iters = 0
+        return config
+
+    @staticmethod
+    def get_weight_cls():
+        return Glm5NextMtpWeight
+
+
+register_model(
+    "glm5_next_mtp", Glm5NextMtp, ["Glm5NextForConditionalGenerationNextN"]
+)
+
