@@ -61,3 +61,9 @@ py_test(
         "//conditions:default": {"gpu": "SM100_ARM_CU13", "gpu_count": "1"},
     }),
 )
+
+py_test(
+    name = "vision_bert_test",
+    srcs = ["vision_bert_test.py"],
+    deps = ["//rtp_llm:testlib"],
+)
