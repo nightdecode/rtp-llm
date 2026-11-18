@@ -28,9 +28,8 @@ struct MLAKVCacheSpec: public KVCacheSpec {
         RTP_LLM_CHECK_WITH_INFO(attn.kv_lora_rank > 0,
                                 "MLA KVCacheSpecDesc tag=%s requires positive attn_config.kv_lora_rank",
                                 desc.tag.c_str());
-        RTP_LLM_CHECK_WITH_INFO(attn.rope_head_dim > 0,
-                                "MLA KVCacheSpecDesc tag=%s requires positive attn_config.rope_head_dim",
-                                desc.tag.c_str());
+        // rope_head_dim == 0 is legal: NoPE MLA models (GLM-5.3-Flash sets qk_rope_head_dim = 0)
+        // keep only the kv_lora_rank latent in the KV cache, so rope_per_token is simply 0 below.
 
         const auto seq    = ctx.seq_size_per_block == 0 ? 1 : ctx.seq_size_per_block;
         const auto kernel = SpecBuilder::kernelSeqSizePerBlock(desc, ctx, seq);

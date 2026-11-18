@@ -57,6 +57,15 @@ def concat_and_cache_mla_fp8(ckv, kpe, cache, slots):
     # real rows, matching the native concat_and_cache_mla contract.
     if slots.numel() == 0:
         return
+    # The 656-byte row layout is 512 FP8 latent + 4 FP32 scales + 64 BF16 rope,
+    # and the kernel writes the rope tile with a hardcoded width of 64. A NoPE
+    # model (GLM-5.3-Flash, qk_rope_head_dim = 0) would write past kpe here, so
+    # fail loudly instead. GLM-5.3-Flash keeps a BF16 KV cache for this reason.
+    if kpe.shape[-1] != 64:
+        raise ValueError(
+            "PPU FP8 MLA cache packing is fixed at rope_head_dim=64, got "
+            f"{kpe.shape[-1]}"
+        )
     if cache.dtype != torch.uint8:
         cache = cache.view(torch.uint8)
     _write_mla_fp8[(slots.numel(), 5)](

@@ -95,7 +95,10 @@ def strided_slice_copy_(
     T, H, R = src.shape
     assert dst.shape[0] == T and dst.shape[1] == H
     assert dst_col_offset + R <= dst.shape[2]
-    if T == 0:
+    # R == 0 is a no-op slice. NoPE MLA models (GLM-5.3-Flash sets
+    # qk_rope_head_dim = 0) hand us an empty q_pe here; triton.next_power_of_2(0)
+    # and tl.arange(0, 0) are both invalid, so return before building the grid.
+    if T == 0 or R == 0:
         return
 
     # The flattening (t, h) -> i = t*H + h must respect each tensor's strides.
