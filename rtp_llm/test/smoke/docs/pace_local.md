@@ -78,3 +78,71 @@ the test finishes, startup fails, or SIGTERM unwinds the test. `stop_server()` i
 only KVCM for the existing `kill_remote` fault case; `close()` releases the
 complete test environment. Meta/data service logs are saved under
 `kvcm_logs/pace_logs` in the test's undeclared outputs.
+
+## TCP, RDMA and GDR
+
+`scripts/start_pace_smoke_stack.sh` starts the three PACE roles and runs the
+test from the same Linux environment. It isolates Provider networking and
+shared memory, then runs the service binaries and test as the supplied
+non-root `UID:GID`. Run the launcher as root with permission to create mount
+and network namespaces. In a container, grant `SYS_ADMIN` and `NET_ADMIN` and
+set `--ulimit memlock=-1`. The launcher needs ports 24910–24917 and subnet
+`198.18.78.0/30`. Keep the runtime libraries available to the binaries.
+
+For x86_64 CUDA13, build `//3rdparty/pace_test_runtime:runtime` to extract the
+pinned PACE binaries or point `bin` at an existing binary directory. Set
+`test_user` to the test user's `UID:GID`. The launcher defaults to TENT TCP.
+For RDMA or GDR, pass `rdma` or `gdr` with the active HCA, and optionally its
+port and GID index (defaults 1 and 0). The CUDA SDK also needs a GPU for
+CPU-buffer tests. The GDR mode needs a GPUDirect-capable GPU and HCA.
+
+```bash
+scripts="$PWD/rtp_llm/test/smoke/scripts"
+bin="$PWD/bazel-bin/3rdparty/pace_test_runtime"
+mode=tcp
+transport=("$mode")  # For example, mode=gdr and transport=("$mode" mlx5_2).
+bazel_rc=()
+source_config=()
+run="/tmp/pace-smoke-$(date +%s)-$$"
+
+bash "$scripts/start_pace_smoke_stack.sh" "$test_user" "$bin" "$run" \
+  "${transport[@]}" -- \
+  bazel --batch "${bazel_rc[@]}" test \
+  --config=cuda13 --config=remote_kv_cache "${source_config[@]}" \
+  --define=pace_test_runtime=external --test_strategy=standalone \
+  --run_under=//rtp_llm/test/utils:gpu_lock \
+  --test_env=KVCM_PACE_FIXTURE --test_env=LD_LIBRARY_PATH \
+  --test_env=NO_PROXY --test_env=no_proxy --nocache_test_results --test_output=all \
+  --test_arg="--transport=$mode" //rtp_llm/test/smoke:remote_cache_pace_contract
+```
+
+The contract checks payload contents and the Consumer's transport counters.
+For GDR, the native RDMA and GDR byte deltas must match in both directions.
+
+### Build from three commits
+
+Provide Git URLs or local paths for the private repositories and full commit
+SHAs. Git uses the developer's existing repository access. Build PACE in a
+CMake environment with libibverbs headers and KVCM in its CUDA build
+environment with Bazelisk and `rpmbuild`.
+
+```bash
+pins=(
+  --kvcm-public-commit "$KVCM_PUBLIC_SHA"
+  --kvcm-internal-repo "$KVCM_INTERNAL_REPO"
+  --kvcm-internal-commit "$KVCM_INTERNAL_SHA"
+  --mempool-repo "$MEMPOOL_REPO"
+  --mempool-commit "$MEMPOOL_SHA"
+  --cuda-archs "$CUDA_ARCHS"
+)
+python3 "$scripts/build_pace_smoke.py" "${pins[@]}" --component=pace \
+  --cmake-arg=-DTENT_ENABLE_AFT=OFF --output "$artifacts/pace"
+python3 "$scripts/build_pace_smoke.py" "${pins[@]}" --component=kvcm \
+  --bazel-arg=--config=py310 --output "$artifacts/kvcm"
+```
+
+Use `bin="$artifacts/pace/pace/bin"`,
+`bazel_rc=(--bazelrc="$artifacts/kvcm/rtp-smoke.bazelrc")`, and
+`source_config=(--config=pace_source)` in the launcher command. Keep the
+artifacts at the same paths when running the test so Bazel can resolve the
+KVCM Manager and SDK overrides.
