@@ -52,6 +52,10 @@ load("//3rdparty/xgrammar:repositories.bzl", "xgrammar_deps")
 
 xgrammar_deps()
 
+load("//3rdparty/pace_test_runtime:repositories.bzl", "pace_test_deps")
+
+pace_test_deps()
+
 load("@io_opentelemetry_cpp//bazel:repository.bzl", "opentelemetry_cpp_deps")
 
 opentelemetry_cpp_deps()

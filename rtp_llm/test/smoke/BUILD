@@ -1,6 +1,7 @@
 load(":defs.bzl", "custom_smoke_test", "smoke_test")
 load(":suites_timeout_recovery.bzl", "timeout_recovery_suites")
 load("@arch_config//:arch_select.bzl", "cuda13_x86_test_gpu")
+load("@bazel_skylib//lib:selects.bzl", "selects")
 package(default_visibility = ["//visibility:public"])
 
 # Native cache-stack smoke: real disk/SDK transfers, RPC deadlines and the
@@ -118,7 +119,13 @@ cc_binary(
         "@havenask//aios/alog:alog",
         "@havenask//aios/autil:lock_free",
         "@havenask//aios/autil:string_helper",
-    ],
+    ] + selects.with_or({
+        ("//:using_cuda13_x86", "//:using_cuda13_arm"): [
+            "@local_config_cuda//cuda:cuda_headers",
+            "@local_config_cuda//cuda:cudart",
+        ],
+        "//conditions:default": [],
+    }),
 )
 
 py_library(
@@ -156,7 +163,6 @@ py_test(
     deps = [":pace_smoke_fixture"],
     data = _PACE_SMOKE_DATA,
     args = ["--sdk", "$(location :pace_sdk_smoke)"],
-    # The contract uses CPU buffers with either a CPU-only or CUDA SDK.
     tags = ["manual", "smoke_case", "no-remote", "requires-pace", "exclusive"],
     timeout = "long",
     legacy_create_init = 0,

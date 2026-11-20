@@ -15,7 +15,8 @@ local DRAM device. Readiness includes Meta's asynchronous virtual segment assign
 ## Runtime and artifacts
 
 The automatic runtime uses the pinned PACE Meta/Server RPMs in
-`deps/http.bzl`. `//3rdparty/pace_test_runtime:runtime` extracts the binaries and
+`3rdparty/pace_test_runtime/repositories.bzl`.
+`//3rdparty/pace_test_runtime:runtime` extracts the binaries and
 `libtent_shared.so.5` into test runfiles for both x86_64 and aarch64.
 The test environment must provide their
 ELF dependencies (including the compatible glibc, Boost, Prometheus, glog,

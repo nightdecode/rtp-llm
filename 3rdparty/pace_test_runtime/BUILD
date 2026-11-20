@@ -2,6 +2,11 @@ load("//bazel:defs.bzl", "runfiles_alias")
 
 package(default_visibility = ["//visibility:public"])
 
+config_setting(
+    name = "external_pace_fixture",
+    define_values = {"pace_test_runtime": "external"},
+)
+
 # Service binaries only: the KVCM SDK remains the branch's existing dependency.
 genrule(
     name = "meta_binary",
@@ -74,5 +79,8 @@ filegroup(
     name = "runtime",
     testonly = True,
     tags = ["manual"],
-    srcs = [":meta_binary", ":server_binary"],
+    srcs = select({
+        ":external_pace_fixture": [],
+        "//conditions:default": [":meta_binary", ":server_binary"],
+    }),
 )

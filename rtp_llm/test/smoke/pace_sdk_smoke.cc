@@ -16,6 +16,10 @@
 #include "kvcm_client/HostCacheStateCompat.h"
 #include "kvcm_client/transfer_client.h"
 
+#if defined(USING_CUDA13)
+#include <cuda_runtime_api.h>
+#endif
+
 namespace {
 using namespace kv_cache_manager;
 
@@ -28,6 +32,59 @@ void require(bool ok, const std::string& message) {
 void check(ClientErrorCode code, const std::string& operation) {
     require(code == ER_OK, operation + " failed: " + std::to_string(code));
 }
+
+#if defined(USING_CUDA13)
+void checkCuda(cudaError_t code, const char* operation) {
+    require(code == cudaSuccess, std::string(operation) + ": " + cudaGetErrorString(code));
+}
+
+constexpr size_t gpu_pool_bytes = 2 * 1024 * 1024;
+#endif
+
+class GpuPool {
+public:
+    explicit GpuPool(bool enabled) {
+        if (!enabled) {
+            return;
+        }
+#if defined(USING_CUDA13)
+        void* buffer = nullptr;
+        checkCuda(cudaMalloc(&buffer, gpu_pool_bytes), "cudaMalloc");
+        base_.reset(static_cast<uint8_t*>(buffer));
+#else
+        throw std::runtime_error("GDR requires a CUDA 13 build");
+#endif
+    }
+
+    std::unique_ptr<TransferClient> createClient(const std::string& config, const InitParams& params) const {
+#if defined(USING_CUDA13)
+        if (base_) {
+            int device_id = 0;
+            checkCuda(cudaGetDevice(&device_id), "cudaGetDevice");
+            ClientMemoryRegistrations registrations;
+            registrations.gpu.push_back({base_.get(), gpu_pool_bytes, device_id});
+            return TransferClient::Create(config, params, registrations);
+        }
+#endif
+        return TransferClient::Create(config, params);
+    }
+
+    uint8_t* base() const {
+        return base_.get();
+    }
+
+private:
+    struct Deleter {
+        void operator()(uint8_t* buffer) const {
+#if defined(USING_CUDA13)
+            cudaFree(buffer);
+#else
+            (void)buffer;
+#endif
+        }
+    };
+    std::unique_ptr<uint8_t, Deleter> base_;
+};
 
 bool present(const Location& location) {
     return std::any_of(location.begin(), location.end(), [](const auto& spec) { return !spec.uri.empty(); });
@@ -51,19 +108,22 @@ Locations waitForMatch(MetaClient& meta, const std::string& trace, const std::ve
     throw std::runtime_error("Asynchronous RemoveCache did not become visible");
 }
 
-BlockBuffers buffers(std::vector<std::vector<uint8_t>>& data) {
+BlockBuffers buffers(std::vector<std::vector<uint8_t>>& data, uint8_t* gpu) {
     BlockBuffers result;
+    size_t offset = 0;
     for (auto& block : data) {
         // Deliberately split across an odd boundary to catch ordering/truncation.
-        const size_t split = block.size() / 3 + 1;
-        result.push_back({{{MemoryType::CPU, block.data(), split},
-                           {MemoryType::CPU, block.data() + split, block.size() - split}}});
+        const size_t split = gpu ? block.size() / 2 : block.size() / 3 + 1;
+        const auto type = gpu ? MemoryType::GPU : MemoryType::CPU;
+        auto* base = gpu ? gpu + offset : block.data();
+        result.push_back({{{type, base, split}, {type, base + split, block.size() - split}}});
+        offset += block.size();
     }
     return result;
 }
 
 void verifyPool(TransferClient& transfer, WriteLocation& write, const std::string& spec_name, size_t bytes,
-                bool save = true) {
+                const GpuPool& pool, bool save = true) {
     UriStrVec uris;
     std::vector<LocationSpecUnit*> specs;
     for (auto& location : write.locations) {
@@ -84,8 +144,21 @@ void verifyPool(TransferClient& transfer, WriteLocation& write, const std::strin
     }
     auto source = expected;
     auto actual = uris;
+    auto* gpu = pool.base();
+#if defined(USING_CUDA13)
+    require(!gpu || uris.size() <= gpu_pool_bytes / bytes, "GPU smoke pool is too small");
+#endif
     if (save) {
-        auto saved = transfer.SaveKvCaches(uris, buffers(source));
+#if defined(USING_CUDA13)
+        if (gpu) {
+            for (size_t block = 0; block < source.size(); ++block) {
+                checkCuda(cudaMemcpy(gpu + block * bytes, source[block].data(), bytes, cudaMemcpyHostToDevice),
+                          "initialize GPU source");
+            }
+            checkCuda(cudaDeviceSynchronize(), "synchronize GPU source before PACE write");
+        }
+#endif
+        auto saved = transfer.SaveKvCaches(uris, buffers(source, gpu));
         check(saved.first, "SaveKvCaches " + spec_name);
         actual = std::move(saved.second);
     }
@@ -96,7 +169,21 @@ void verifyPool(TransferClient& transfer, WriteLocation& write, const std::strin
         std::fill(source[i].begin(), source[i].end(), 0);
     }
     std::vector<std::vector<uint8_t>> loaded(actual.size(), std::vector<uint8_t>(bytes, 0xA5));
-    check(transfer.LoadKvCaches(actual, buffers(loaded)), "LoadKvCaches " + spec_name);
+#if defined(USING_CUDA13)
+    if (gpu) {
+        checkCuda(cudaMemset(gpu, 0xA5, actual.size() * bytes), "initialize GPU destination");
+        checkCuda(cudaDeviceSynchronize(), "synchronize GPU destination before PACE read");
+    }
+#endif
+    check(transfer.LoadKvCaches(actual, buffers(loaded, gpu)), "LoadKvCaches " + spec_name);
+#if defined(USING_CUDA13)
+    if (gpu) {
+        for (size_t block = 0; block < loaded.size(); ++block) {
+            checkCuda(cudaMemcpy(loaded[block].data(), gpu + block * bytes, bytes, cudaMemcpyDeviceToHost),
+                      "verify GPU readback");
+        }
+    }
+#endif
     require(loaded == expected, "Byte mismatch in " + spec_name);
     // URI/buffer count mismatches must be rejected before submitting I/O.
     require(transfer.LoadKvCaches(actual, {}) != ER_OK, "Invalid buffer count accepted");
@@ -107,7 +194,9 @@ void verifyPool(TransferClient& transfer, WriteLocation& write, const std::strin
 int main(int argc, char** argv) {
     using namespace kv_cache_manager;
     try {
-        require(argc == 3, "Expected config path and backend type");
+        require(argc == 3 || (argc == 4 && std::string(argv[3]) == "--gdr"),
+                "Expected config path, backend type, and optional --gdr");
+        const bool use_gpu = argc == 4;
         std::ifstream input(argv[1]);
         require(input.good(), "Cannot read SDK config");
         const std::string config((std::istreambuf_iterator<char>(input)), {});
@@ -115,9 +204,11 @@ int main(int argc, char** argv) {
         auto meta = MetaClient::Create(config, params);
         require(meta != nullptr, "MetaClient::Create failed");
         params.storage_configs = meta->GetStorageConfig();
-        auto full = TransferClient::Create(config, params);
+        GpuPool full_pool(use_gpu);
+        GpuPool state_pool(use_gpu);
+        auto full = full_pool.createClient(config, params);
         params.self_location_spec_name = "state";
-        auto state = TransferClient::Create(config, params);
+        auto state = state_pool.createClient(config, params);
         require(full != nullptr && state != nullptr, "TransferClient::Create failed");
         const auto backend = static_cast<StorageType>(std::stoi(argv[2]));
         const int64_t nonce = std::chrono::system_clock::now().time_since_epoch().count();
@@ -131,8 +222,8 @@ int main(int argc, char** argv) {
         auto [pending_code, pending] = meta->MatchLocation(trace, QueryType::QT_BATCH_GET, keys, {}, BlockMaskOffset{0}, 0, {});
         check(pending_code, "Pending match");
         require(count(pending) == 0, "Uncommitted writes became visible");
-        verifyPool(*full, write, "full", 262144);
-        verifyPool(*state, write, "state", 65536);
+        verifyPool(*full, write, "full", 262144, full_pool);
+        verifyPool(*state, write, "state", 65536, state_pool);
         check(meta->FinishWrite(trace, write.write_session_id, BlockMaskOffset{keys.size()}, write.locations), "FinishWrite");
 
         for (const auto query : {QueryType::QT_BATCH_GET, QueryType::QT_PREFIX_MATCH}) {
@@ -145,8 +236,8 @@ int main(int argc, char** argv) {
         check(read_code, "Read published URIs");
         WriteLocation published;
         published.locations = std::move(read_locations);
-        verifyPool(*full, published, "full", 262144, false);
-        verifyPool(*state, published, "state", 65536, false);
+        verifyPool(*full, published, "full", 262144, full_pool, false);
+        verifyPool(*state, published, "state", 65536, state_pool, false);
 
         auto [offset_code, offset_match] = meta->MatchLocation(
             trace, QueryType::QT_BATCH_GET, keys, {}, BlockMaskOffset{1}, 0, {});
@@ -185,8 +276,8 @@ int main(int argc, char** argv) {
         auto [replica_code, replica] = meta->StartWrite(trace, keys, {}, {"Ffull", "Ffull", "FfullLstate"}, 60, 2);
         check(replica_code, "Allocate second replica");
         require(count(replica.locations) == 3, "min_replica_count=2 was ignored");
-        verifyPool(*full, replica, "full", 262144);
-        verifyPool(*state, replica, "state", 65536);
+        verifyPool(*full, replica, "full", 262144, full_pool);
+        verifyPool(*state, replica, "state", 65536, state_pool);
         check(meta->FinishWrite(trace, replica.write_session_id, BlockMaskOffset{keys.size()}, replica.locations), "Publish second replica");
         auto [two_code, two] = meta->StartWrite(trace, keys, {}, {"Ffull", "Ffull", "FfullLstate"}, 60, 2);
         check(two_code, "Reuse two replicas");
@@ -225,7 +316,7 @@ int main(int argc, char** argv) {
         const std::vector<int64_t> partial_keys{nonce + 6, nonce + 7, nonce + 8};
         auto [partial_code, partial] = meta->StartWrite(trace, partial_keys, {}, {"Ffull", "Ffull", "Ffull"}, 60, 1);
         check(partial_code, "Partial allocation");
-        verifyPool(*full, partial, "full", 262144);
+        verifyPool(*full, partial, "full", 262144, full_pool);
         check(meta->FinishWrite(trace, partial.write_session_id, BlockMaskVector{true, false, true}, partial.locations), "Partial finish");
         auto [partial_match_code, partial_match] = meta->MatchLocation(trace, QueryType::QT_BATCH_GET, partial_keys, {}, BlockMaskOffset{0}, 0, {});
         check(partial_match_code, "Partial match");
