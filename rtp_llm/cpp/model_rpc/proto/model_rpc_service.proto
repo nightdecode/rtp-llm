@@ -168,6 +168,9 @@ message GenerateConfigPB {
     bool prefill_only = 76;
     bool frontend_metric_streaming = 77;
     google.protobuf.Int32Value logits_index = 78;
+    // SP clients set the legacy probability fields to NONE for old-backend safety.
+    // 0=unset, 2=DEFAULT, 3=ORIGINAL; uses the same offset as return_all_probs_mode.
+    int32 speculative_return_all_probs_mode = 79;
 }
 
 message MMPreprocessConfigPB {

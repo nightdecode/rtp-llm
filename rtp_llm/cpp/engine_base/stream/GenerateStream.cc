@@ -150,7 +150,6 @@ GenerateStream::GenerateStream(const shared_ptr<GenerateInput>& input,
                              calculateLoss()                          ? "calculate_loss" :
                              config.return_hidden_states              ? "return_hidden_states" :
                              config.return_all_hidden_states          ? "return_all_hidden_states" :
-                             getReturnAllProbs() != ReturnAllProbsMode::NONE ? "return_all_probs" :
                              input->custom_output_token_position >= 0 ? "custom_output" :
                                                                         nullptr;
         if (reason != nullptr) {
@@ -1562,6 +1561,30 @@ void GenerateStream::matchStopWordsList(int batch_id) {
     }
 }
 
+int GenerateStream::speculativeTokenCount(const torch::Tensor& new_tokens, int num_new_tokens) const {
+    const int token_begin   = seqLength();
+    num_new_tokens          = std::min(num_new_tokens, static_cast<int>(maxTokenNum()) - token_begin);
+    const auto& config      = *generateConfig();
+    const int   first_count = std::max(1, inputLength() + config.min_new_tokens - token_begin);
+    for (int count = first_count; count <= num_new_tokens; ++count) {
+        for (int batch = 0; batch < new_tokens.size(0); ++batch) {
+            const auto* tokens = new_tokens[batch].data_ptr<int>();
+            if (!config.ignore_eos && tokens[count - 1] == special_tokens_.eos_token_id) {
+                return count;
+            }
+            for (const auto& stop : config.stop_words_list) {
+                if (config.ignore_eos && stop.size() == 1 && stop[0] == special_tokens_.eos_token_id) {
+                    continue;
+                }
+                if (complete_token_ids_->matchesStopWordsAt(batch, stop, token_begin + count, tokens)) {
+                    return count;
+                }
+            }
+        }
+    }
+    return num_new_tokens;
+}
+
 void GenerateStream::specUpdate(const StreamSpecUpdateInfo& update_info,
                                 bool                        update_processor,
                                 RecordedTokenTiming*        timings,
@@ -1583,7 +1606,21 @@ void GenerateStream::specUpdate(const StreamSpecUpdateInfo& update_info,
     }
 
     auto num_new_tokens = update_info.num_new_tokens;
-    int  cur_cached_len = seqLength() - 1;
+    const int  token_begin     = seqLength();
+    const bool per_token_probs = generateConfig()->return_all_probs != ReturnAllProbsMode::NONE
+                                 && update_info.all_probs.defined() && update_info.all_probs.dim() == 3;
+    if (per_token_probs) {
+        num_new_tokens = speculativeTokenCount(new_tokens, num_new_tokens);
+        if (num_new_tokens <= 0) {
+            if (needFinish()) {
+                fillSubGenerateStatus(StreamState::FINISHED);
+                reportEventWithoutLock(StreamEvents::GenerateDone);
+            }
+            return;
+        }
+        new_tokens = new_tokens.narrow(1, 0, num_new_tokens).contiguous();
+    }
+    int cur_cached_len = token_begin - 1;
 
     int error_token_id = 0;
     if (!complete_token_ids_->update(new_tokens,
@@ -1599,6 +1636,12 @@ void GenerateStream::specUpdate(const StreamSpecUpdateInfo& update_info,
                                "output token id:" + std::to_string(error_token_id)
                                    + " out of vocab size: " + std::to_string(vocab_size_));
         return;
+    }
+
+    if (per_token_probs) {
+        // The prefix was checked above; final finish checks must not rescan an
+        // EOS that occurred before min_new_tokens became effective.
+        complete_token_ids_->setSeqLength(seqLength());
     }
 
     int nxt_cached_len   = seqLength() - 1;
@@ -1732,12 +1775,13 @@ void GenerateStream::specUpdate(const StreamSpecUpdateInfo& update_info,
                                  torch::Tensor(),
                                  torch::Tensor(),
                                  torch::Tensor(),
-                                 torch::Tensor(),
+                                 update_info.all_probs,
                                  torch::Tensor(),
                                  torch::Tensor(),
                                  torch::Tensor(),
                                  update_info.update_remote_generate,
                                  update_info.force_update_info};
+    output_info.speculative_token_begin = per_token_probs ? token_begin : -1;
     updateOutput(output_info);
     // The scheduler will reclaim committed history before its next allocation.
     stream_cache_resource_->reclaimLinearHistory(nxt_cached_len);

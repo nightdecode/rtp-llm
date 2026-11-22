@@ -59,6 +59,8 @@ struct StreamUpdateInfo {
         GenerationPrefillCudaGraphStatus::NOT_REQUESTED};
     // Appended to preserve existing aggregate initializers. CPU context rows.
     const torch::Tensor custom_output{};
+    // Absolute start of per-token MTP probabilities [batch, tokens, vocab].
+    int64_t speculative_token_begin = -1;
 };
 
 struct StreamSpecUpdateInfo {
@@ -83,6 +85,9 @@ struct StreamSpecUpdateInfo {
     // updates leave speculative_propose_step at zero and are not counted.
     int speculative_propose_step = 0;
     int accepted_draft_tokens    = 0;
+    // Per-accepted-token target distributions [stream_batch, accepted, vocab].
+    // Never populated from draft_token_probs.
+    torch::Tensor all_probs;
 };
 
 struct SpeculativeExecutorStreamOutput {
@@ -1018,6 +1023,7 @@ protected:
     // same mutex to commit accepted tokens/cache swaps. Reserve under that
     // mutex; return false if the caller must join outside it before proceeding.
     bool prepareMtpCacheForNextStep();
+    int  speculativeTokenCount(const torch::Tensor& new_tokens, int num_new_tokens) const;
 
     void                               notifyLocalCleanupProgress();
     std::mutex                         cleanup_observers_mutex_;

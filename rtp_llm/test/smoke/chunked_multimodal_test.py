@@ -2,6 +2,7 @@
 
 import base64
 import json
+import math
 import os
 import re
 import unittest
@@ -109,7 +110,11 @@ class ChunkedMultimodalTest(unittest.TestCase):
             "temperature": 0.0,
             "top_p": 1.0,
             "stream": streaming,
+            "logprobs": True,
+            "top_logprobs": 5,
+            "logprobs_mode": "original",
             "extra_configs": {
+                "return_all_probs": 2,
                 "do_sample": False,
                 "min_new_tokens": OUTPUT_TOKENS,
                 "reuse_cache": True,
@@ -157,7 +162,7 @@ class ChunkedMultimodalTest(unittest.TestCase):
             else:
                 events = [response.json()]
         self.save(artifact_prefix + ".http.json", events)
-        text, usages, metadata = [], [], []
+        rows, text, usages, metadata = [], [], [], []
         for event in events:
             self.assertNotIn("error", event, event)
             if event.get("usage"):
@@ -166,10 +171,12 @@ class ChunkedMultimodalTest(unittest.TestCase):
                 metadata.append(event["aux_info"])
             for choice in event.get("choices", []):
                 self.assertEqual(choice["index"], 0)
+                rows.extend((choice.get("logprobs") or {}).get("content") or [])
                 text.append(
                     (choice.get("delta") or choice.get("message") or {}).get("content")
                     or ""
                 )
+        self.assertEqual(len(rows), OUTPUT_TOKENS)
         self.assertTrue(usages, "missing token usage")
         usage = usages[-1]
         self.assertEqual(usage["completion_tokens"], OUTPUT_TOKENS)
@@ -178,6 +185,14 @@ class ChunkedMultimodalTest(unittest.TestCase):
         # start inside its visual tokens regardless of the text-prefix length.
         self.assertGreater(image_tokens, image_count * 2 * CHUNK_SIZE)
         self.assertGreater(usage["prompt_tokens"], image_tokens)
+        self.assertEqual("".join(text), "".join(row["token"] for row in rows))
+        for row in rows:
+            self.assertTrue(math.isfinite(row["logprob"]))
+            self.assertLessEqual(row["logprob"], 1e-6)
+            self.assertEqual(len(row["top_logprobs"]), 5)
+            for candidate in row["top_logprobs"]:
+                self.assertTrue(math.isfinite(candidate["logprob"]))
+                self.assertLessEqual(candidate["logprob"], 1e-6)
         self.assertTrue(metadata, "missing execution metadata")
         self.assertEqual(metadata[-1]["reuse_len"], 0)
         with self.server_log.open("rb") as log:
@@ -200,11 +215,48 @@ class ChunkedMultimodalTest(unittest.TestCase):
             self.assertIn(2 * CHUNK_SIZE, prefixes, "second intermediate chunk missing")
         else:
             self.assertEqual(prefixes, [0], "reference unexpectedly used chunking")
-        return {"text": "".join(text), "usage": usage}
+        return {"rows": rows, "text": "".join(text), "usage": usage}
 
     def compare(self, reference, actual):
         self.assertEqual(actual["usage"], reference["usage"])
         self.assertEqual(actual["text"], reference["text"])
+        for step, (expected, observed) in enumerate(
+            zip(reference["rows"], actual["rows"])
+        ):
+            self.assertEqual(observed["bytes"], expected["bytes"], f"token {step}")
+            # BF16 covers image chunking and exact greedy output. FP16 also
+            # checks scores; BF16 scores are more sensitive to the prefill shape.
+            if self.act_type == "FP16":
+                self.assertAlmostEqual(
+                    observed["logprob"],
+                    expected["logprob"],
+                    delta=0.03,
+                    msg=f"sampled token {step}",
+                )
+                expected_top = {
+                    tuple(candidate["bytes"]): candidate["logprob"]
+                    for candidate in expected["top_logprobs"]
+                }
+                observed_top = {
+                    tuple(candidate["bytes"]): candidate["logprob"]
+                    for candidate in observed["top_logprobs"]
+                }
+                # Candidates near the fifth-place boundary can swap after rounding.
+                self.assertGreaterEqual(
+                    len(expected_top.keys() & observed_top.keys()), 4
+                )
+                for token in expected_top.keys() & observed_top.keys():
+                    # A log-space delta amplifies tiny tail-probability changes
+                    # between FP16 prefill shapes and norm implementations.
+                    self.assertTrue(
+                        math.isclose(
+                            math.exp(observed_top[token]),
+                            math.exp(expected_top[token]),
+                            rel_tol=0.03,
+                            abs_tol=1e-4,
+                        ),
+                        msg=f"candidate at token {step}",
+                    )
 
     def test_image_crosses_chunks_with_mrope_and_deepstack(self):
         describe = {"type": "text", "text": "Describe this image briefly."}
