@@ -3,7 +3,7 @@ from __future__ import annotations
 import libth_transformer_config
 import torch
 import typing
-__all__: list[str] = ['EmbeddingCppOutput', 'MultimodalInput', 'RtpEmbeddingOp', 'RtpLLMOp', 'TypedOutput', 'build_xgrammar_tokenizer_info_json', 'resume_kmonitor_after_scr']
+__all__: list[str] = ['EmbeddingCppOutput', 'MultimodalInput', 'RtpEmbeddingOp', 'RtpLLMOp', 'TypedOutput', 'build_xgrammar_tokenizer_info_json', 'refresh_logger_after_scr', 'resume_kmonitor_after_scr']
 class EmbeddingCppOutput:
     output: TypedOutput
     def __init__(self) -> None:
@@ -32,6 +32,10 @@ class RtpLLMOp:
         ...
     def stop(self) -> None:
         ...
+    def gpu_cache_tensors(self) -> list[torch.Tensor]:
+        ...
+    def update_runtime_endpoints(self, runtime_config: typing.Any) -> None:
+        ...
 class TypedOutput:
     isTensor: bool
     def __init__(self) -> None:
@@ -50,6 +54,8 @@ class TypedOutput:
         ...
 
 def get_multimodal_feature_hash(arg0: torch.Tensor) -> torch.Tensor:
+    ...
+def refresh_logger_after_scr(pod_ip: str) -> None:
     ...
 def resume_kmonitor_after_scr() -> bool:
     ...
