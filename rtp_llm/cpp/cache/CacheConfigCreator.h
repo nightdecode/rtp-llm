@@ -28,8 +28,8 @@ struct KVCacheBlockBudget {
     size_t                     explicit_pool_reserve_bytes = 0;
     size_t                     paged_block_bytes           = 0;
     size_t                     swa_block_bytes             = 0;
-    std::vector<ProjectedPool> projected_pools;
-    uint32_t                   max_baseline_block_num = std::numeric_limits<uint32_t>::max();
+    uint32_t                   max_baseline_block_num      = std::numeric_limits<uint32_t>::max();
+    std::vector<ProjectedPool> projected_pools{};
 };
 
 // Returns the largest global block count whose independent-pool backing fits
