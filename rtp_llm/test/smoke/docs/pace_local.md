@@ -113,11 +113,15 @@ bash "$scripts/start_pace_smoke_stack.sh" "$test_user" "$bin" "$run" \
   --run_under=//rtp_llm/test/utils:gpu_lock \
   --test_env=KVCM_PACE_FIXTURE --test_env=LD_LIBRARY_PATH \
   --test_env=NO_PROXY --test_env=no_proxy --nocache_test_results --test_output=all \
-  --test_arg="--transport=$mode" //rtp_llm/test/smoke:remote_cache_pace_contract
+  //rtp_llm/test/smoke:remote_cache_pace_contract
 ```
 
-The contract checks payload contents and the Consumer's transport counters.
-For GDR, the native RDMA and GDR byte deltas must match in both directions.
+The launcher records the selected `transport` in the Consumer fixture. The
+contract checks payload contents and uses that mode to select the transport
+counters. For GDR, it uses GPU buffers and requires matching native RDMA and
+GDR byte deltas in both directions. An explicit `--test_arg=--transport=...`
+must agree with the fixture. Use this argument to set the mode for older
+fixtures without the field.
 
 ### Build from three commits
 

@@ -36,12 +36,13 @@ def start(args, parser):
     if not 1024 <= args.port_base <= 65532:
         parser.error("--port-base must be between 1024 and 65532")
     data_role = args.role in ("consumer", "provider")
+    tent_transport = "rdma" if args.transport == "gdr" else args.transport
     if data_role:
         if not all((args.meta_url, args.interface)):
             parser.error("a data service requires --meta-url and --interface")
         if args.role == "consumer" and not args.provider_status_url:
             parser.error("consumer requires --provider-status-url for the smoke fixture")
-        if args.transport == "rdma":
+        if tent_transport == "rdma":
             if not args.rdma_device:
                 parser.error("RDMA requires --rdma-device")
             check_rdma(args.rdma_device, args.rdma_port)
@@ -70,19 +71,19 @@ def start(args, parser):
         env.setdefault("TAIR_MEMPOOL_PROVIDER_HTTP_THREADS", "4")
         tent_config = work_dir / "tent.json"
         transports = {
-            name: {"enable": name == args.transport}
+            name: {"enable": name == tent_transport}
             for name in ("rdma", "aft", "barex", "tcp", "uring", "shm", "gds", "mnnvl")
         }
         profile = {
             "transports": transports,
-            "policy": [{"name": args.transport, "segment_type": "memory", "transports": [args.transport]}],
+            "policy": [{"name": tent_transport, "segment_type": "memory", "transports": [tent_transport]}],
         }
-        if args.transport == "rdma":
+        if tent_transport == "rdma":
             transports["rdma"]["device"] = {"port": args.rdma_port, "gid_index": args.gid_index}
             profile["topology"] = {"rdma_whitelist": [args.rdma_device]}
         tent_config.write_text(json.dumps(profile, indent=2) + "\n")
 
-        zero_copy = "1" if args.transport == "rdma" else "0"
+        zero_copy = "1" if tent_transport == "rdma" else "0"
         client_env = {
             "MC_TENT_CONF": str(tent_config),
             "TAIR_MEMPOOL_SOCK": str(work_dir / "mp.sock"),
@@ -98,6 +99,7 @@ def start(args, parser):
         if args.role == "consumer":
             (work_dir / "fixture.json").write_text(json.dumps({
                 "domain": args.meta_url,
+                "transport": args.transport,
                 "provider_status_urls": [args.provider_status_url],
                 "consumer_metrics_url": f"http://127.0.0.1:{args.port_base + 3}/pace/metrics",
                 "client_env": client_env,
@@ -123,7 +125,7 @@ def main():
     parser.add_argument("--meta-url")
     parser.add_argument("--provider-status-url")
     parser.add_argument("--interface")
-    parser.add_argument("--transport", choices=("rdma", "tcp"), default="rdma")
+    parser.add_argument("--transport", choices=("rdma", "tcp", "gdr"), default="rdma")
     parser.add_argument("--rdma-device")
     parser.add_argument("--rdma-port", type=int, default=1)
     parser.add_argument("--gid-index", type=int, default=0)

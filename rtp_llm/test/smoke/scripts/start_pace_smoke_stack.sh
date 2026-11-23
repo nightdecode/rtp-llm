@@ -46,7 +46,7 @@ case "$transport" in
         ;;
     rdma|gdr)
         if [[ -z ${options[4]:-} ]]; then usage >&2; exit 2; fi
-        transport_args=(--transport rdma --rdma-device "${options[4]}"
+        transport_args=(--transport "$transport" --rdma-device "${options[4]}"
                         --rdma-port "${options[5]:-1}" --gid-index "${options[6]:-0}")
         ;;
     *) usage >&2; exit 2 ;;

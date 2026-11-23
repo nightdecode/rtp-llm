@@ -67,16 +67,21 @@ def check_transport(url, before, transport):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sdk", required=True)
-    parser.add_argument(
-        "--transport", choices=("local", "tcp", "rdma", "gdr"), default="local"
-    )
+    transports = ("local", *_TRANSPORT_COUNTERS)
+    parser.add_argument("--transport", choices=transports)
     args = parser.parse_args()
+    fixture_path = os.environ.get("KVCM_PACE_FIXTURE")
+    fixture_config = PaceFixture(fixture_path).config if fixture_path else {}
+    transport = fixture_config.get("transport", args.transport or "local")
+    if transport not in transports:
+        parser.error(f"invalid PACE fixture transport {transport!r}")
+    if args.transport is not None and args.transport != transport:
+        parser.error(f"--transport={args.transport} conflicts with PACE fixture transport {transport!r}")
     metrics_url = None
-    if args.transport != "local":
-        fixture_path = os.environ.get("KVCM_PACE_FIXTURE")
+    if transport != "local":
         if not fixture_path:
             parser.error("--transport requires KVCM_PACE_FIXTURE for an isolated Consumer and Provider")
-        metrics_url = PaceFixture(fixture_path).config.get("consumer_metrics_url")
+        metrics_url = fixture_config.get("consumer_metrics_url")
         if not metrics_url:
             parser.error("the PACE fixture needs consumer_metrics_url for transport verification")
     server_path = runfile(
@@ -98,12 +103,12 @@ def main():
             config_path = Path(directory) / "client.json"
             config_path.write_text(json.dumps(config), encoding="utf-8")
             command = [args.sdk, str(config_path), str(server.pace_fixture.storage_type)]
-            if args.transport == "gdr":
+            if transport == "gdr":
                 command.append("--gdr")
             before = read_counters(metrics_url) if metrics_url else None
             subprocess.run(command, env=env, check=True, timeout=120)
             if before is not None:
-                check_transport(metrics_url, before, args.transport)
+                check_transport(metrics_url, before, transport)
         finally:
             try:
                 server.close()
