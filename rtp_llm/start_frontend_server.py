@@ -88,8 +88,16 @@ def start_frontend_server(
         app = FrontendApp(py_env_configs, separated_frontend)
 
         def on_prebind() -> None:
-            if scr_manifest is None or not is_scr_template_phase_active():
+            if not is_scr_template_phase_active():
                 return
+            if scr_manifest is None:
+                # A template phase without a manifest means the launcher did
+                # not enroll this process; binding anyway would serve during
+                # the snapshot and leave the quorum incomplete.
+                raise RuntimeError(
+                    "SCR template phase is active but the frontend participant "
+                    "manifest is missing"
+                )
             worker_id = scr_manifest.worker_id("frontend", f"{world_rank}:{server_id}")
             result = arrive_scr_template_barrier(
                 worker_id=worker_id,

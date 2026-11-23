@@ -88,8 +88,16 @@ def start_dash_sc_server(
         app = DashScApp(py_env_configs)
 
         def on_prebind() -> None:
-            if scr_manifest is None or not is_scr_template_phase_active():
+            if not is_scr_template_phase_active():
                 return
+            if scr_manifest is None:
+                # A template phase without a manifest means the launcher did
+                # not enroll this process; binding anyway would serve during
+                # the snapshot and leave the quorum incomplete.
+                raise RuntimeError(
+                    "SCR template phase is active but the dash_sc participant "
+                    "manifest is missing"
+                )
             worker_id = scr_manifest.worker_id("dash_sc", f"{world_rank}:{server_id}")
             result = arrive_scr_template_barrier(
                 worker_id=worker_id,
