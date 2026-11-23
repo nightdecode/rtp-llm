@@ -223,24 +223,28 @@ class KVCacheConfigPickleTest(TestCase):
                 )
                 self.assertFalse(restored.enable_linear_cache_reclaim)
 
-    def test_version_nine_retains_independent_pools_during_upgrade(self):
+    def test_legacy_glm_states_retain_pool_budgets_and_shared_policy(self):
         source = KVCacheConfig()
-        source.shared_hybrid_cache = 1
         source.reuse_cache_tail_blocks = 13
         source.linear_pool_blocks = 31
         source.swa_pool_blocks = 17
         source.enable_crc = False
-        state = source.__getstate__()
-        previous = (state[0], 9, *state[2:72])
-        original = tuple(list(previous))
-        restored = KVCacheConfig.__new__(KVCacheConfig)
-        restored.__setstate__(previous)
-        self.assertEqual(previous, original)
-        self.assertEqual(restored.shared_hybrid_cache, 0)
-        self.assertEqual(restored.reuse_cache_tail_blocks, 13)
-        self.assertEqual(restored.linear_pool_blocks, 31)
-        self.assertEqual(restored.swa_pool_blocks, 17)
-        self.assertFalse(restored.enable_crc)
+        state = _version_twenty_two_state(source)
+        prefix = state[2:72]
+        for previous, shared_policy in (
+            ((state[0], 9, *prefix), 0),
+            ((state[0], 10, *prefix, 1), 1),
+        ):
+            with self.subTest(version=previous[1]):
+                original = tuple(list(previous))
+                restored = KVCacheConfig.__new__(KVCacheConfig)
+                restored.__setstate__(previous)
+                self.assertEqual(previous, original)
+                self.assertEqual(restored.shared_hybrid_cache, shared_policy)
+                self.assertEqual(restored.reuse_cache_tail_blocks, 13)
+                self.assertEqual(restored.linear_pool_blocks, 31)
+                self.assertEqual(restored.swa_pool_blocks, 17)
+                self.assertFalse(restored.enable_crc)
 
     def test_invalid_shared_policies_are_rejected(self):
         state = KVCacheConfig().__getstate__()
@@ -319,7 +323,7 @@ class KVCacheConfigPickleTest(TestCase):
                 restored = KVCacheConfig.__new__(KVCacheConfig)
                 restored.__setstate__(previous)
                 self.assertEqual(previous, original)
-                self.assertEqual(restored.__getstate__(), state)
+                self.assertEqual(restored.__getstate__(), (*state[:-1], 0))
                 self.assertFalse(
                     hasattr(restored, "block_pool_frozen_abort_lower_ratio")
                 )
@@ -337,7 +341,7 @@ class KVCacheConfigPickleTest(TestCase):
 
         restored = KVCacheConfig.__new__(KVCacheConfig)
         restored.__setstate__(_version_twenty_two_state(config))
-        self.assertEqual(restored.__getstate__(), config.__getstate__())
+        self.assertEqual(restored.__getstate__(), (*config.__getstate__()[:-1], 0))
 
     def test_disk_timeout_defaults_and_overrides_survive_worker_round_trips(self):
         self.assertEqual(KVCacheConfig().disk_cache_sync_timeout_ms, 3000)
@@ -445,8 +449,7 @@ class KVCacheConfigPickleTest(TestCase):
                 for _ in range(2):
                     config = pickle.loads(pickle.dumps(config))
                     self.assertEqual(getattr(config, name), timeout)
-                    # v25 keeps frozen timeout at index 78; the v24/v25 tail
-                    # flags follow it.
+                    # Newer versions append their fields after the frozen timeout.
                     self.assertEqual(config.__getstate__()[78], timeout)
                     self.assertIn(f"{name}: {timeout}\n", config.to_string())
         for timeout in (-1, 2**31):
@@ -455,7 +458,7 @@ class KVCacheConfigPickleTest(TestCase):
             ):
                 state = KVCacheConfig().__getstate__()
                 restored = KVCacheConfig.__new__(KVCacheConfig)
-                restored.__setstate__((*state[:78], timeout, state[79], state[80]))
+                restored.__setstate__((*state[:78], timeout, *state[79:]))
 
     def test_previous_versions_use_default_frozen_force_release_timeout(self):
         source = KVCacheConfig()

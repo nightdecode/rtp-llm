@@ -293,18 +293,19 @@ bool BlockTreeCache::ensureSharedDeviceSlots(const std::shared_ptr<SharedBlockAr
     while (!ready() && progress) {
         progress = false;
         for (size_t id = 0; id < tree_->groupSets().size(); ++id) {
-            const auto& group  = tree_->groupSets()[id];
-            const bool  shares = std::any_of(
-                group->devicePools().begin(), group->devicePools().end(), [&arena](const DeviceBlockPoolPtr& pool) {
-                    return pool && pool->config().shared_arena == arena;
-                });
-            if (shares && evictor_.dropLocked(id, Tier::DEVICE, true)) {
-                progress = true;
-                metrics_reporter_->reportEvictionTriggered(Tier::DEVICE, group->groupType(), true);
-                if (ready()) {
-                    return true;
-                }
+            const auto& pools  = tree_->groupSets()[id]->devicePools();
+            const auto  member = std::find_if(pools.begin(), pools.end(), [&arena](const DeviceBlockPoolPtr& pool) {
+                return pool && pool->config().shared_arena == arena;
+            });
+            if (member == pools.end()) {
+                continue;
             }
+            const size_t reclaimed =
+                evictor_.reclaimDeviceBlocksLocked(id, static_cast<size_t>(member - pools.begin()), 1);
+            if (ready()) {
+                return true;
+            }
+            progress |= reclaimed > 0;
         }
     }
     return ready();
