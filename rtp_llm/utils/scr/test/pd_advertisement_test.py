@@ -13,10 +13,10 @@ from rtp_llm.distribute.distributed_server import (
 )
 from rtp_llm.distribute.worker_info import WorkerInfo
 from rtp_llm.utils.gang_info import GangInfoReader
+from rtp_llm.utils.scr import network
 from rtp_llm.utils.scr import runtime_fixup as fixup
 from rtp_llm.utils.scr import template_utils as scr
 from rtp_llm.utils.scr.lifecycle import CallbackHook, TemplateLifecycle
-from rtp_llm.utils.scr.restore_context import RestoreContext
 
 
 class ScrPdAdvertisementTest(unittest.TestCase):
@@ -59,7 +59,7 @@ class ScrPdAdvertisementTest(unittest.TestCase):
         with patch.dict(os.environ, {"SCR_PHASE": "checkpoint"}), patch(
             "socket.gethostbyname", return_value="192.0.2.20"
         ):
-            local_world = RestoreContext("192.0.2.20").resolve_world_info(
+            local_world = network.resolve_world_info(
                 current, self.pc, GangInfoReader("/unused/annotations")
             )
             update_worker_addrs(runtime, self.pc, local_world)

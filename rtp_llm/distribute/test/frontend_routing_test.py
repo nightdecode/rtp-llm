@@ -12,7 +12,6 @@ from rtp_llm.config.server_config_setup import set_parallelism_config
 from rtp_llm.distribute import distributed_server as ds
 from rtp_llm.distribute.distributed_server import get_dp_rpc_addresses
 from rtp_llm.utils.scr import network
-from rtp_llm.utils.scr.restore_context import RestoreContext
 from rtp_llm.utils.gang_info import GangInfoReader
 
 
@@ -285,7 +284,7 @@ class FrontendRoutingTest(unittest.TestCase):
             store.reset_mock()
             with patch.dict(os.environ, {"SCR_PHASE": "restore"}):
                 for ip in ("10.1.0.3", "10.2.0.3"):
-                    restored = RestoreContext(ip).resolve_world_info(world, pc, gang)
+                    restored = network.resolve_world_info(world, pc, gang)
                     self.assertEqual(
                         ds.get_dp_addrs_from_world_info(restored, pc),
                         ["22.0.1.2:23001"],
@@ -295,7 +294,7 @@ class FrontendRoutingTest(unittest.TestCase):
                 network, "topology", return_value={0: "22.0.1.9", 1: "22.0.1.3"}
             ):
                 with self.assertRaisesRegex(RuntimeError, "cannot change"):
-                    RestoreContext("10.3.0.3").resolve_world_info(world, pc, gang)
+                    network.resolve_world_info(world, pc, gang)
 
 
 if __name__ == "__main__":

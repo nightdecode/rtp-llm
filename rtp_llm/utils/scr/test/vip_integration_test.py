@@ -16,7 +16,6 @@ from rtp_llm.distribute.distributed_server import (
 )
 from rtp_llm.utils.scr import network
 from rtp_llm.utils.gang_info import GangInfoReader
-from rtp_llm.utils.scr.restore_context import RestoreContext
 
 
 class ScrVipIntegrationTest(unittest.TestCase):
@@ -166,14 +165,14 @@ class ScrVipIntegrationTest(unittest.TestCase):
                         [m.ip for m in world.members],
                         [f"22.0.1.{2 + rank // 2}"] * 2,
                     )
-                    restored = RestoreContext("10.1.0.3").resolve_world_info(
+                    restored = network.resolve_world_info(
                         world, pc, GangInfoReader.from_config(configs.distribute_config)
                     )
                     self.assertEqual(restored.self.ip, world.self.ip)
                     self.assertEqual(restored.self.server_port, world.self.server_port)
                     world.members[0].ip = "21.0.0.1"
                     with self.assertRaisesRegex(RuntimeError, "cannot change"):
-                        RestoreContext("10.1.0.3").resolve_world_info(
+                        network.resolve_world_info(
                             world,
                             pc,
                             GangInfoReader.from_config(configs.distribute_config),

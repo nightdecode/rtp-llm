@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from rtp_llm.utils.gang_info import GangInfoReader
-from rtp_llm.utils.scr.restore_context import RestoreContext
+from rtp_llm.utils.scr import network
 
 
 class RestoreContextTest(unittest.TestCase):
@@ -17,7 +17,7 @@ class RestoreContextTest(unittest.TestCase):
         world = WorldInfo([member], member, member, 1, True)
         pc = SimpleNamespace(world_size=1, local_world_size=1)
         with patch.dict(os.environ, {"RTPLLM_ENABLE_SCR": "1", "SCR_PHASE": "restore"}):
-            restored = RestoreContext("192.0.2.20").resolve_world_info(
+            restored = network.resolve_world_info(
                 world, pc, GangInfoReader("/unused/annotations")
             )
         self.assertEqual(restored.self.ip, "127.0.0.1")

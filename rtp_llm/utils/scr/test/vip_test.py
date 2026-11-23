@@ -68,7 +68,7 @@ class ScrVipTest(unittest.TestCase):
             patch.object(network.time, "sleep", side_effect=publish_map) as sleep,
             patch.object(network, "validate_device") as device,
         ):
-            restored = RestoreContext("10.0.0.3").resolve_world_info(
+            restored = network.resolve_world_info(
                 world, self.pc, self.reader
             )
         sleep.assert_called_once_with(0.5)
@@ -91,7 +91,7 @@ class ScrVipTest(unittest.TestCase):
             patch.object(network, "validate_device"),
         ):
             with self.assertRaisesRegex(RuntimeError, "cannot change"):
-                RestoreContext("10.0.0.3").resolve_world_info(
+                network.resolve_world_info(
                     world, self.pc, self.reader
                 )
         self.assertEqual(world.members[0].ip, "22.0.1.2")
@@ -108,7 +108,7 @@ class ScrVipTest(unittest.TestCase):
                 side_effect=[RuntimeError("not ready"), None],
             ),
         ):
-            world = RestoreContext("10.0.0.3").resolve_world_info(
+            world = network.resolve_world_info(
                 self._world(), self.pc, self.reader
             )
         self.assertEqual(world.self.ip, "22.0.1.3")

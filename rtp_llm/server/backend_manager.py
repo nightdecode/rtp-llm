@@ -236,7 +236,7 @@ class BackendManager(object):
             self.py_env_configs.parallelism_config,
             distributed_server=self._distributed_server,
         )
-        world_info = context.resolve_world_info(
+        world_info = network.resolve_world_info(
             current,
             self.py_env_configs.parallelism_config,
             self._distributed_server.gang_info,
