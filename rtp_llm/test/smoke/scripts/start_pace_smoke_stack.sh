@@ -53,6 +53,10 @@ case "$transport" in
 esac
 
 bin_dir=$(realpath -e -- "${options[1]}")
+consumer_bin_dir="$bin_dir"
+if [[ -d "$bin_dir/consumer" ]]; then
+    consumer_bin_dir="$bin_dir/consumer"
+fi
 work_dir=$(realpath -m -- "${options[2]}")
 launcher="$(dirname "$(realpath -e -- "$0")")/start_pace_smoke.py"
 if ! user_home=$(getent passwd "$uid" | cut -d: -f6) || [[ -z "$user_home" ]]; then
@@ -160,7 +164,7 @@ wait_http "$meta_pid" "$meta_url/v1/api/healthy"
 touch "$work_dir/provider.start"
 wait_http "$provider_pid" "$provider_status_url"
 "${as_user[@]}" python3 "$launcher" consumer \
-    --bin-dir "$bin_dir" --work-dir "$work_dir/services/consumer" --port-base 24914 \
+    --bin-dir "$consumer_bin_dir" --work-dir "$work_dir/services/consumer" --port-base 24914 \
     --meta-url "$meta_url" --provider-status-url "$provider_status_url" \
     --interface pace-consumer "${transport_args[@]}" \
     > "$work_dir/consumer.log" 2>&1 &

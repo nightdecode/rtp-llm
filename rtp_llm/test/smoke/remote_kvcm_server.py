@@ -15,7 +15,6 @@ import requests
 
 from rtp_llm.test.utils.port_util import PortManager
 from rtp_llm.test.smoke.pace_fixture import PaceFixture, require_ok
-from rtp_llm.test.smoke.local_pace_server import LocalPaceServer
 
 
 def str_to_bool(s: str):
@@ -45,12 +44,15 @@ class RemoteKVCMServer:
         self._enable_debug_service = False
         self._server_process = None
         self.pace_fixture = None
-        self._local_pace = None
         pace_required = str_to_bool(kvcm_config.get("PACE_REQUIRED", "false"))
         if pace_required:
             fixture_path = os.environ.get("KVCM_PACE_FIXTURE", "")
-            if fixture_path:
-                self.pace_fixture = PaceFixture(fixture_path)
+            if not fixture_path:
+                raise RuntimeError(
+                    "PACE smoke requires KVCM_PACE_FIXTURE. "
+                    "Run start_pace_smoke_stack.sh or pass an existing fixture with --test_env."
+                )
+            self.pace_fixture = PaceFixture(fixture_path)
         logging.info(
             f"kvcm_server_path:{server_path}\nblock_path:{self._block_path}\nbin_path:{self._bin_path}\nkvcm_src_logs_path:{kvcm_src_logs_path}\nkvcm_dst_logs_path:{kvcm_dst_logs_path}"
         )
@@ -69,8 +71,6 @@ class RemoteKVCMServer:
             self._work_dir = tempfile.mkdtemp(prefix="pace-kvcm-", dir=os.environ.get("TEST_TMPDIR"))
             self._kvcm_src_logs_path = os.path.join(self._work_dir, "logs")
             os.makedirs(self._kvcm_src_logs_path)
-            if self.pace_fixture is None:
-                self._local_pace = LocalPaceServer(self._work_dir)
 
     def copy_logs(self):
         if self.pace_fixture is not None and self._work_dir is None:
@@ -80,16 +80,7 @@ class RemoteKVCMServer:
                 logging.warning(f"path [{self._kvcm_src_logs_path}] not exist")
                 return
             shutil.copytree(self._kvcm_src_logs_path, self._kvcm_dst_logs_path, dirs_exist_ok=True)
-            if self._work_dir is not None:
-                pace_logs = os.path.join(self._work_dir, "pace_logs")
-                if os.path.isdir(pace_logs):
-                    shutil.copytree(
-                        pace_logs, os.path.join(self._kvcm_dst_logs_path, "pace_logs"),
-                        dirs_exist_ok=True,
-                    )
-            # Keep diagnostics until the manager has stopped and logs are saved.
-            if (self._work_dir is not None and self._server_process is None
-                    and self._local_pace is None):
+            if self._work_dir is not None and self._server_process is None:
                 shutil.rmtree(self._work_dir)
                 self._work_dir = None
         except Exception:
@@ -110,8 +101,6 @@ class RemoteKVCMServer:
         return self._address
 
     def start_server(self, timeout: int = 120) -> bool:
-        if self._local_pace is not None:
-            self.pace_fixture = self._local_pace.start(timeout)
         if self.pace_fixture is not None:
             self.pace_fixture.check_services()
         os.environ["RECO_SERVER_ADDRESS"] = f"127.0.0.1:{self._rpc_port}"
@@ -273,23 +262,14 @@ class RemoteKVCMServer:
         self._fault_trigger = False
 
     def close(self):
-        """Release test-owned services; stop_server alone still only kills KVCM."""
         failed = sys.exc_info()[0] is not None
-        local_pace = self._local_pace
         try:
             try:
                 self.stop_server()
             finally:
-                try:
-                    if self._local_pace is not None:
-                        self._local_pace.close()
-                        self._local_pace = None
-                finally:
-                    for lock in self._locks:
-                        lock.__exit__(None, None, None)
-                    self._locks = []
-            if local_pace is not None and self._server_process is not None:
-                raise RuntimeError("Failed to stop the local PACE test's KVCM process")
+                for lock in self._locks:
+                    lock.__exit__(None, None, None)
+                self._locks = []
         except Exception:
             logging.exception("Failed to close the KVCM test environment")
             if not failed:

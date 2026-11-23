@@ -147,8 +147,7 @@ def build_kvcm(args, public, mempool, output):
     (output / "rtp-smoke.bazelrc").write_text(
         f"build:pace_source {shlex.quote(f'--override_repository={sdk_repo}={sdk.parent}')}\n"
         f"build:pace_source {shlex.quote(f'--override_repository={manager_repo}={manager}')}\n"
-        "build:pace_source --define=pace_test_runtime=external\n"
-        "test:pace_source --test_env=KVCM_PACE_FIXTURE --test_env=KVCM_PACE_BIN_DIR\n"
+        "test:pace_source --test_env=KVCM_PACE_FIXTURE\n"
     )
 
 

@@ -130,9 +130,7 @@ cc_binary(
 
 py_library(
     name = "pace_smoke_fixture",
-    srcs = [
-        "pace_fixture.py", "remote_kvcm_server.py", "local_pace_server.py",
-    ],
+    srcs = ["pace_fixture.py", "remote_kvcm_server.py"],
     deps = ["//rtp_llm:psutil", "//rtp_llm:requests", "//rtp_llm/test/utils:test_util"],
 )
 
@@ -143,17 +141,9 @@ py_test(
     legacy_create_init = 0,
 )
 
-py_test(
-    name = "local_pace_server_test",
-    srcs = ["local_pace_server_test.py"],
-    deps = [":pace_smoke_fixture"],
-    legacy_create_init = 0,
-)
-
 _PACE_SMOKE_DATA = [
     ":pace_sdk_smoke",
     "//3rdparty/remote_kv_cache_manager:remote_kv_cache_manager_server_bin",
-    "//3rdparty/pace_test_runtime:runtime",
 ]
 
 py_test(

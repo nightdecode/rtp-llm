@@ -10,7 +10,7 @@ from decimal import Decimal
 from pathlib import Path
 from urllib.request import urlopen
 
-from rtp_llm.test.smoke.pace_fixture import PaceFixture, runfile
+from rtp_llm.test.smoke.pace_fixture import runfile
 from rtp_llm.test.smoke.remote_kvcm_server import RemoteKVCMServer
 
 
@@ -70,20 +70,6 @@ def main():
     transports = ("local", *_TRANSPORT_COUNTERS)
     parser.add_argument("--transport", choices=transports)
     args = parser.parse_args()
-    fixture_path = os.environ.get("KVCM_PACE_FIXTURE")
-    fixture_config = PaceFixture(fixture_path).config if fixture_path else {}
-    transport = fixture_config.get("transport", args.transport or "local")
-    if transport not in transports:
-        parser.error(f"invalid PACE fixture transport {transport!r}")
-    if args.transport is not None and args.transport != transport:
-        parser.error(f"--transport={args.transport} conflicts with PACE fixture transport {transport!r}")
-    metrics_url = None
-    if transport != "local":
-        if not fixture_path:
-            parser.error("--transport requires KVCM_PACE_FIXTURE for an isolated Consumer and Provider")
-        metrics_url = fixture_config.get("consumer_metrics_url")
-        if not metrics_url:
-            parser.error("the PACE fixture needs consumer_metrics_url for transport verification")
     server_path = runfile(
         os.environ["TEST_WORKSPACE"],
         "3rdparty/remote_kv_cache_manager/bin/kv_cache_manager_bin",
@@ -94,6 +80,18 @@ def main():
             "PACE_REQUIRED": "true",
         }, str(Path(directory) / "logs"), str(output / "kvcm_logs"))
         try:
+            fixture_config = server.pace_fixture.config
+            transport = fixture_config.get("transport", args.transport or "local")
+            if transport not in transports:
+                parser.error(f"invalid PACE fixture transport {transport!r}")
+            if args.transport is not None and args.transport != transport:
+                parser.error(
+                    f"--transport={args.transport} conflicts with PACE fixture transport {transport!r}"
+                )
+            metrics_url = fixture_config.get("consumer_metrics_url") if transport != "local" else None
+            if transport != "local" and not metrics_url:
+                parser.error("the PACE fixture needs consumer_metrics_url for transport verification")
+
             if not server.start_server():
                 raise RuntimeError("KVCM manager did not start")
             env = os.environ.copy()

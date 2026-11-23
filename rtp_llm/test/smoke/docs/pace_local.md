@@ -1,120 +1,101 @@
-# Automatic local PACE smoke
+# Local PACE smoke
 
-PACE-specific tests (`PACE_REQUIRED=true`) start a private memory-backed Meta
-and one foreground `consumer|provider` data process when `KVCM_PACE_FIXTURE` is
-unset. The existing KVCM fixture then configures PACE storage and starts KVCM;
-the SDK contract and model smoke use the same client environment.
-
-This tests local DRAM payload read/write through the real PACE backend. It does
-not verify cross-node TCP, RDMA, GDR, or SSD. No extra Docker service, network
-namespace, or PACE source change is needed. Do not separately start a Consumer
-sidecar in this local mode.
-The SDK maps the combined server's shared memory and copies payload through its
-local DRAM device. Readiness includes Meta's asynchronous virtual segment assignment.
+`scripts/start_pace_smoke_stack.sh` starts a memory-backed Meta, a Provider and
+a Consumer once for the test command. Each PACE smoke case receives the same
+`KVCM_PACE_FIXTURE`, starts its own KVCM Manager and configures PACE storage.
+The launcher stops PACE when the whole command exits.
 
 ## Runtime and artifacts
 
-The automatic runtime uses the pinned PACE Meta/Server RPMs in
+The prebuilt smoke configuration pins its artifacts in
 `3rdparty/pace_test_runtime/repositories.bzl`.
-`//3rdparty/pace_test_runtime:runtime` extracts the binaries and
-`libtent_shared.so.5` into test runfiles for both x86_64 and aarch64.
-The test environment must provide their
-ELF dependencies (including the compatible glibc, Boost, Prometheus, glog,
-OpenSSL, hiredis, MySQL client and jemalloc libraries), `rpm2cpio`, and `cpio`.
-The Meta and Server RPMs are downloaded from `rtp-maga/pace/server/`.
-The Meta and Server RPMs use the TH endpoint first, with the standard OSS
-endpoint as an alternative.
-Already-downloaded release RPMs can also be supplied with Bazel's
-`--distdir=/path/to/release-rpms` for offline builds.
-The CUDA13 SDK RPMs use `2026_10_25_15_21` for x86_64 and aarch64. The KVCM
-server archives come from CI run `83066354`, built from internal commit
-`99e071b0` and external commit `a297b3f9`. Each architecture uses the original
-server tarball extracted from its corresponding production image, mirrored to
-`rtp-maga/kv_cache_manager/server/ci-83066354/` with a pinned SHA256.
-Both Manager binaries require glibc 2.32 or newer, libstdc++ with
-`GLIBCXX_3.4.26`, `libibverbs.so.1`, and `librdmacm.so.1` in the test environment.
-That CUDA SDK initializes a CUDA device even for the CPU-buffer contract, so
-run it in the normal GPU test environment.
 
-The Meta RPMs come from CI run `79257320`, source commit `b4fb6b6b`: x86_64 uses
-`3.1.21_2026_10_13_15_39`, and aarch64 uses `3.1.21_2026_10_13_15_45`.
-Both PACE Server architectures use the CSSDV Server RPMs from CI run
-`83025525`, source commit `26b89c97`, mirrored to
-`rtp-maga/pace/server/ci-83025525/` with pinned SHA256 checksums.
-The Manager archives provide x86_64 and aarch64 binaries from the same CI run.
-Meta, PACE Server, and KVCM Server are selected for the configured architecture.
+- PACE Meta and CSSDV Provider use `452ba5b` from 2026-11-18, CI runs
+  `91125106` and `91125037`. These are the RPMs from the corresponding
+  `v3.1.21_2026_11_18_16_14_452ba5b` image builds.
+- PACE Consumer (`f14290c5f767`) and the CUDA13 KVCM SDK
+  (`2026_11_20_16_05`) match RTP internal branch
+  `feature/dsv41-dev-main-202161013` at `8cf717a43c`, for x86_64 and aarch64.
+- `--config=pace_prebuilt` selects that SDK and the Manager archive from
+  `isearch/kv_cache_manager_prod_dashllm:2026_11_07_00_14_a48396c_13e2046`
+  on x86_64 or the matching `_arm64` tag on aarch64.
 
-The runtime allocates a 2 GiB pool including 1 GiB of shared metadata. Its
-`/dev/shm` must have enough capacity, with a suitable memlock limit. Only one
-local PACE fixture may own the fixed PACE SHM filenames in that environment.
-PACE cases use Bazel's `exclusive` tag to run serially. Independently launched
-local fixtures fail explicitly on contention, and existing SHM is not overwritten.
-Use a dedicated development/test environment for automatic mode.
+`//3rdparty/pace_test_runtime:runtime` extracts Meta and Provider under
+`bazel-bin/3rdparty/pace_test_runtime` and Consumer in its `consumer/`
+subdirectory. Provider and Consumer each use the `libtent_shared.so.5` from
+their own package. A binary directory from the source build contains one
+server binary used for both roles.
 
-For a manually supplied runtime, set `--test_env=KVCM_PACE_BIN_DIR=/path/to/bin`.
-That directory must contain both service binaries and their corresponding
-private shared libraries. No installation or compilation happens inside a test.
-
-## Run
-
-Use the repository build configuration matching the SDK and test machine:
+For authenticated artifacts, use `--distdir` with the pinned files. Save each
+RPM using its URL's filename. Save the Manager image's `COPY` layer under its
+`sha256:…` blob filename as declared in `repositories.bzl`. Bazel checks the
+hashes and extracts the Manager archive inside that layer. This command uses
+the x86_64 digest. For aarch64, use the ARM digest from `repositories.bzl`.
 
 ```bash
-unset KVCM_PACE_FIXTURE
-bazel test --config=cuda13 --config=remote_kv_cache --test_strategy=standalone \
-  //rtp_llm/test/smoke:remote_cache_pace_contract
-
-# Requires the model files and GPU expected by this existing smoke case.
-bazel test --config=cuda13 --config=remote_kv_cache --test_strategy=standalone \
-  //rtp_llm/test/smoke:remote_cache_pace_basic
+layer=sha256:a8332a4e6e44110cd4d299071c3c5320a90f736b141454733777f900062c6277
+crane blob "hub.docker.alibaba-inc.com/isearch/kv_cache_manager_prod_dashllm@$layer" \
+  > "$distfiles/$layer"
 ```
 
-Keep `--test_env=KVCM_PACE_FIXTURE=/path/to/fixture.json` to attach an existing
-PACE environment instead. Its processes remain caller-owned; their topology
-and transport are described by that supplied fixture.
+The test environment must provide compatible ELF dependencies (including
+glibc, libstdc++, libibverbs, librdmacm, Boost, Prometheus, glog, OpenSSL, hiredis,
+MySQL client and jemalloc), `rpm2cpio`, and `cpio`. The CUDA13 SDK initializes a
+CUDA device even for the CPU-buffer contract.
 
-Local processes use test-owned process groups and stop in reverse order when
-the test finishes, startup fails, or SIGTERM unwinds the test. `stop_server()` intentionally still stops
-only KVCM for the existing `kill_remote` fault case; `close()` releases the
-complete test environment. Meta/data service logs are saved under
-`kvcm_logs/pace_logs` in the test's undeclared outputs.
+## Run a group of tests
 
-## TCP, RDMA and GDR
+The launcher isolates Provider networking and shared memory on the Linux test
+machine. Run it as root with permission to create mount and network namespaces.
+It runs the binaries and tests as the supplied non-root `UID:GID`. In a container,
+grant `SYS_ADMIN` and `NET_ADMIN` and set `--ulimit memlock=-1`. The launcher needs
+ports 24910–24917 and subnet `198.18.78.0/30`.
 
-`scripts/start_pace_smoke_stack.sh` starts the three PACE roles and runs the
-test from the same Linux environment. It isolates Provider networking and
-shared memory, then runs the service binaries and test as the supplied
-non-root `UID:GID`. Run the launcher as root with permission to create mount
-and network namespaces. In a container, grant `SYS_ADMIN` and `NET_ADMIN` and
-set `--ulimit memlock=-1`. The launcher needs ports 24910–24917 and subnet
-`198.18.78.0/30`. Keep the runtime libraries available to the binaries.
+Use `rtp_config=cuda13` on x86_64 or `rtp_config=cuda13_arm` on aarch64.
+Set `distfiles` to the directory containing the authenticated downloads for
+that architecture.
 
-For x86_64 CUDA13, build `//3rdparty/pace_test_runtime:runtime` to extract the
-pinned PACE binaries or point `bin` at an existing binary directory. Set
-`test_user` to the test user's `UID:GID`. The launcher defaults to TENT TCP.
-For RDMA or GDR, pass `rdma` or `gdr` with the active HCA, and optionally its
-port and GID index (defaults 1 and 0). The CUDA SDK also needs a GPU for
-CPU-buffer tests. The GDR mode needs a GPUDirect-capable GPU and HCA.
+```bash
+rtp_config=cuda13
+bazel build --config="$rtp_config" --distdir="$distfiles" \
+  //3rdparty/pace_test_runtime:runtime
+```
+
+Set `test_user` to the test user's non-root `UID:GID`. Omit the transport
+arguments to use TENT TCP. For RDMA or GDR, supply the mode and active HCA,
+optionally followed by its port and GID index (defaults 1 and 0). GDR requires
+a GPUDirect-capable GPU and HCA. Pass all test targets that should share
+PACE to the same command. The example includes one SDK contract and one
+model smoke. The model smoke requires its configured model files and GPU.
 
 ```bash
 scripts="$PWD/rtp_llm/test/smoke/scripts"
 bin="$PWD/bazel-bin/3rdparty/pace_test_runtime"
-mode=tcp
-transport=("$mode")  # For example, mode=gdr and transport=("$mode" mlx5_2).
+transport=()  # For RDMA or GDR, use (rdma mlx5_2) or (gdr mlx5_2).
 bazel_rc=()
-source_config=()
+artifact_config=(--config=pace_prebuilt --distdir="$distfiles")
 run="/tmp/pace-smoke-$(date +%s)-$$"
 
 bash "$scripts/start_pace_smoke_stack.sh" "$test_user" "$bin" "$run" \
   "${transport[@]}" -- \
   bazel --batch "${bazel_rc[@]}" test \
-  --config=cuda13 --config=remote_kv_cache "${source_config[@]}" \
-  --define=pace_test_runtime=external --test_strategy=standalone \
+  --config="$rtp_config" --config=remote_kv_cache "${artifact_config[@]}" \
+  --test_strategy=standalone \
   --run_under=//rtp_llm/test/utils:gpu_lock \
   --test_env=KVCM_PACE_FIXTURE --test_env=LD_LIBRARY_PATH \
   --test_env=NO_PROXY --test_env=no_proxy --nocache_test_results --test_output=all \
-  //rtp_llm/test/smoke:remote_cache_pace_contract
+  //rtp_llm/test/smoke:remote_cache_pace_contract \
+  //rtp_llm/test/smoke:remote_cache_pace_basic
 ```
+
+The cases run serially and PACE state persists between them. The existing
+`kill_remote` fault case stops its own KVCM Manager. The launcher keeps
+`meta.log`, `provider.log` and `consumer.log` under `run`. KVCM logs are saved
+under `kvcm_logs` in each test's undeclared outputs.
+
+To attach an already running PACE environment, pass
+`--test_env=KVCM_PACE_FIXTURE=/path/to/fixture.json` to `bazel test`. The caller
+owns the PACE processes.
 
 The launcher records the selected `transport` in the Consumer fixture. The
 contract checks payload contents and uses that mode to select the transport
@@ -147,6 +128,6 @@ python3 "$scripts/build_pace_smoke.py" "${pins[@]}" --component=kvcm \
 
 Use `bin="$artifacts/pace/pace/bin"`,
 `bazel_rc=(--bazelrc="$artifacts/kvcm/rtp-smoke.bazelrc")`, and
-`source_config=(--config=pace_source)` in the launcher command. Keep the
+`artifact_config=(--config=pace_source)` in the launcher command. Keep the
 artifacts at the same paths when running the test so Bazel can resolve the
 KVCM Manager and SDK overrides.
