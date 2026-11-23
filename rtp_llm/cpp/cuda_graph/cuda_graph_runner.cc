@@ -824,6 +824,14 @@ bool CudaGraphRunner::tryGetRealGraphDecodeBatchSize(const PyModelInputs& inputs
         state.seq_len_sum        = inferTotalTokensNoSync(inputs);
         adaptiveVerifyReplayShape(
             static_cast<int>(max_bs_), num_tokens_per_bs_, state.current_batch_size, state.seq_len_sum);
+        // MTP contributes one to num_tokens_per_bs_ rows per request. The
+        // maximum batch and maximum total therefore require uniform lengths.
+        if (uniform_verify_graph_key_ > 0 && state.current_batch_size == static_cast<int>(max_bs_)
+            && state.seq_len_sum == max_num_token_) {
+            state.current_real_graph_bs = state.current_batch_size;
+            state.decode_graph_key      = uniform_verify_graph_key_;
+            return true;
+        }
         const auto bucket = std::lower_bound(capture_range_.begin(), capture_range_.end(), state.seq_len_sum);
         RTP_LLM_CHECK_WITH_INFO(bucket != capture_range_.end(), "adaptive verification exceeds captured row buckets");
         const auto shape            = adaptiveVerifyGraphShape(static_cast<int>(max_bs_), num_tokens_per_bs_, *bucket);

@@ -55,11 +55,39 @@ void CudaGraphRunner::captureDecodeOneBatchSize(int bs, bool needs_distributed_w
     captureOneGraphInstance(bs, "batch size", needs_distributed_warmup);
 }
 
+void CudaGraphRunner::prepareUniformDecodeCapture(int key, int batch_size, bool native_target_layout) {
+    const int     rows = batch_size * num_tokens_per_bs_;
+    PyModelInputs inputs;
+    prepareCaptureInputs(inputs, batch_size, rows);
+    inputs.attention_inputs.uniform_target_verify_layout = native_target_layout;
+    const int max_input_len                              = inputs.attention_inputs.input_lengths.max().item<int>();
+    int       max_prefix_len                             = 0;
+    if (inputs.attention_inputs.prefix_lengths.defined() && inputs.attention_inputs.prefix_lengths.numel() > 0) {
+        max_prefix_len = inputs.attention_inputs.prefix_lengths.max().item<int>();
+    }
+    inputs.attention_inputs.context_total_kv_length = batch_size * (max_input_len + max_prefix_len);
+    auto& memory                                    = graph_instances_[key].mem_hold_;
+    memory                                          = createCaptureMemoryHold(inputs, rows);
+    memory.attn_pyobj_                              = py_attn_pyobj_method_(memory.py_model_inputs_, true);
+}
+
 void CudaGraphRunner::captureDecode() {
     RTP_LLM_LOG_INFO("Capture Decode Start");
     RTP_LLM_CHECK_WITH_INFO(!adaptive_verification_ || (is_target_verify_ && num_tokens_per_bs_ > 1),
                             "adaptive verification graphs require a multi-token target model");
     if (adaptive_verification_) {
+        if (adaptive_native_full_width_) {
+            // prepareCaptureInputs returns views. Capture the uniform graph
+            // before any adaptive bucket rewrites their lengths and offsets.
+            uniform_verify_graph_key_ = max_num_token_ + 1;
+            graph_instances_.try_emplace(uniform_verify_graph_key_, enable_cuda_graph_debug_mode_);
+            prepareUniformDecodeCapture(uniform_verify_graph_key_, static_cast<int>(max_bs_), true);
+            captureOneGraphInstance(uniform_verify_graph_key_, "native full width", /*needs_distributed_warmup=*/true);
+            replayAndSyncCheck(uniform_verify_graph_key_, "native full width");
+            profileAdaptiveGraph(uniform_verify_graph_key_, max_num_token_);
+            RTP_LLM_LOG_INFO(
+                "capture native adaptive full width rows=%d key=%d", max_num_token_, uniform_verify_graph_key_);
+        }
         // Largest first retains shared-pool reuse and the single distributed warmup.
         for (int rows : capture_range_) {
             graph_instances_.try_emplace(rows, enable_cuda_graph_debug_mode_);
@@ -83,73 +111,46 @@ void CudaGraphRunner::captureDecode() {
             graph_instances_[shape.rows].mem_hold_          = createCaptureMemoryHold(inputs, shape.rows);
             graph_instances_[shape.rows].mem_hold_.attn_pyobj_ =
                 py_attn_pyobj_method_(graph_instances_[shape.rows].mem_hold_.py_model_inputs_, true);
-            captureDecodeOneBatchSize(shape.rows, it == capture_range_.rbegin());
+            captureDecodeOneBatchSize(shape.rows, uniform_verify_graph_key_ == 0 && it == capture_range_.rbegin());
             replayAndSyncCheck(shape.rows, "adaptive verify rows");
-            profileAdaptiveGraph(shape.rows, shape.rows);
+            if (uniform_verify_graph_key_ == 0 || shape.rows != max_num_token_) {
+                profileAdaptiveGraph(shape.rows, shape.rows);
+            }
             RTP_LLM_LOG_INFO("capture adaptive verify rows=%d batch_capacity=%d", shape.rows, bs);
         }
-        RTP_LLM_LOG_INFO("Capture adaptive Decode End: %zu sparse token-bucket graphs", graph_instances_.size());
+        RTP_LLM_LOG_INFO("Capture adaptive Decode End: %zu sparse token-bucket graphs", capture_range_.size());
         return;
     }
-    // Pre-initialize all graph instances with keep_graph based on debug mode
-    const int min_tokens = adaptive_verification_ ? 1 : num_tokens_per_bs_;
-    for (int tokens = num_tokens_per_bs_; tokens >= min_tokens; --tokens) {
-        for (int bs : capture_range_) {
-            graph_instances_.try_emplace(decodeGraphKey(bs, tokens), enable_cuda_graph_debug_mode_);
-        }
+    for (int bs : capture_range_) {
+        graph_instances_.try_emplace(decodeGraphKey(bs, num_tokens_per_bs_), enable_cuda_graph_debug_mode_);
     }
-    int capture_range_size = capture_range_.size();
-    for (int i = capture_range_size - 1; i >= 0; i--) {
-        int bs = capture_range_[i];
-        for (int tokens = num_tokens_per_bs_; tokens >= min_tokens; --tokens) {
-            const int     key = decodeGraphKey(bs, tokens);
-            PyModelInputs inputs;
-            // Prepare common inputs using shared function
-            prepareCaptureInputs(inputs, bs, bs * tokens);
-            if (adaptive_verification_) {
-                inputs.attention_inputs.input_lengths.fill_(tokens);
-                inputs.attention_inputs.prefix_lengths.fill_(max_seq_len_ - tokens);
-                auto offsets = torch::arange(bs + 1, options_cpu_int32_);
-                inputs.attention_inputs.cu_seqlens_host.copy_(offsets * tokens);
-                inputs.attention_inputs.cu_seqlens.copy_(offsets * tokens);
-                inputs.attention_inputs.cu_kv_seqlens.copy_(offsets * max_seq_len_);
-            }
-
-            // calculate context_total_kv_length
-            int max_input_len  = inputs.attention_inputs.input_lengths.max().item<int>();
-            int max_prefix_len = 0;
-            if (inputs.attention_inputs.prefix_lengths.defined()
-                && inputs.attention_inputs.prefix_lengths.numel() > 0) {
-                max_prefix_len = inputs.attention_inputs.prefix_lengths.max().item<int>();
-            }
-            inputs.attention_inputs.context_total_kv_length = bs * (max_input_len + max_prefix_len);
-
-            graph_instances_[key].mem_hold_ = createCaptureMemoryHold(inputs, bs * tokens);
-            graph_instances_[key].mem_hold_.attn_pyobj_ =
-                py_attn_pyobj_method_(graph_instances_[key].mem_hold_.py_model_inputs_, true);
-            try {
-                // The largest graph is captured first. Fold the one distributed
-                // Warmup forward into its first existing warmup execution so
-                // multi-rank MegaMoE still synchronizes before its first JIT/
-                // kernel launch without restoring a standalone full forward.
-                captureDecodeOneBatchSize(key, i == capture_range_size - 1 && tokens == num_tokens_per_bs_);
-                replayAndSyncCheck(key, "batch size");
-                profileAdaptiveGraph(key, bs);
-                RTP_LLM_LOG_INFO(
-                    "capture success for batch size: %d, tokens per request: %d, key: %d", bs, tokens, key);
-            } catch (const std::exception& e) {
-                RTP_LLM_LOG_ERROR("CUDA graph capture failed for decode batch size %d: %s", bs, e.what());
+    const int capture_range_size = capture_range_.size();
+    for (int i = capture_range_size - 1; i >= 0; --i) {
+        const int bs  = capture_range_[i];
+        const int key = decodeGraphKey(bs, num_tokens_per_bs_);
+        prepareUniformDecodeCapture(key, bs);
+        try {
+            // The largest graph is captured first. Fold the one distributed
+            // Warmup forward into its first existing warmup execution so
+            // multi-rank MegaMoE still synchronizes before its first JIT/
+            // kernel launch without restoring a standalone full forward.
+            captureDecodeOneBatchSize(key, i == capture_range_size - 1);
+            replayAndSyncCheck(key, "batch size");
+            profileAdaptiveGraph(key, bs);
+            RTP_LLM_LOG_INFO(
+                "capture success for batch size: %d, tokens per request: %d, key: %d", bs, num_tokens_per_bs_, key);
+        } catch (const std::exception& e) {
+            RTP_LLM_LOG_ERROR("CUDA graph capture failed for decode batch size %d: %s", bs, e.what());
 #if USING_CUDA
+            cudaGetLastError();
+            auto sync_err = cudaDeviceSynchronize();
+            if (sync_err != cudaSuccess) {
+                RTP_LLM_LOG_ERROR("cudaDeviceSynchronize after capture failure returned: %s",
+                                  cudaGetErrorString(sync_err));
                 cudaGetLastError();
-                auto sync_err = cudaDeviceSynchronize();
-                if (sync_err != cudaSuccess) {
-                    RTP_LLM_LOG_ERROR("cudaDeviceSynchronize after capture failure returned: %s",
-                                      cudaGetErrorString(sync_err));
-                    cudaGetLastError();
-                }
-#endif
-                throw;
             }
+#endif
+            throw;
         }
     }
     RTP_LLM_LOG_INFO("Capture Decode End");

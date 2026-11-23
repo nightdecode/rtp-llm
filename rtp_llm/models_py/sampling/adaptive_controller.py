@@ -50,6 +50,9 @@ class AdaptiveDraftController:
             tuple[tuple[int, ...], torch.dtype],
             tuple[torch.Tensor, torch.cuda.Event, torch.cuda.Stream],
         ] = OrderedDict()
+        self._explicit_host_plans: OrderedDict[
+            tuple[int, ...], tuple[np.ndarray, tuple[int, int], tuple[int, ...]]
+        ] = OrderedDict()
 
     def _device_indices(
         self, values: Sequence[int], dtype: torch.dtype = torch.int64
@@ -231,6 +234,8 @@ class AdaptiveDraftController:
         verify_cost_ms: np.ndarray,
         fixed_cap: int | None = None,
         fixed_budget: int | None = None,
+        grouped_tail_cut: bool = False,
+        explicit_caps: tuple[int, ...] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, int]:
         """Plan from completed prior-round feedback, never read the GPU here.
 
@@ -241,6 +246,22 @@ class AdaptiveDraftController:
         """
         slots = self._slots(request_ids)
         batch = len(slots)
+        if explicit_caps is not None:
+            if (
+                fixed_budget is not None
+                or fixed_cap is not None
+                or confidence is not None
+                or grouped_tail_cut
+                or len(explicit_caps) != batch
+                or any(
+                    type(cap) is not int or not 0 <= cap <= self.num_steps
+                    for cap in explicit_caps
+                )
+            ):
+                raise AdaptiveBudgetInputError(
+                    "explicit_caps", "expected one valid prefix cap per request"
+                )
+            return self._prepare_explicit_host_caps(explicit_caps)
         scheduled = np.full(batch, self.num_steps, dtype=np.int32)
         if fixed_budget is not None:
             if (
@@ -251,11 +272,27 @@ class AdaptiveDraftController:
                 raise AdaptiveBudgetInputError(
                     "fixed_budget", "invalid or conflicts with fixed_cap"
                 )
-            # Balanced prefixes visit any legal execution bucket, including
-            # buckets unreachable by a uniform per-request cap.
-            scheduled.fill(fixed_budget // batch if batch else 0)
-            if batch:
-                scheduled[: fixed_budget % batch] += 1
+            if grouped_tail_cut:
+                cut = batch * self.num_steps - fixed_budget
+                if self.num_steps != 5 or not 0 < cut <= batch:
+                    raise AdaptiveBudgetInputError(
+                        "fixed_budget", "invalid grouped MTP5 tail cut"
+                    )
+                weakest = np.arange(batch)
+                if confidence is not None:
+                    survival = np.cumprod(confidence.astype(np.float64), axis=1)
+                    weakest = np.argsort(survival[:, -2:].sum(axis=1), kind="stable")
+                pairs, leftover = divmod(cut, 2)
+                scheduled[weakest[:pairs]] -= 2
+                if leftover:
+                    scheduled[weakest[pairs]] -= 1
+            elif confidence is not None and 0 < fixed_budget < batch * self.num_steps:
+                scheduled = self._assign_host_budget(confidence, fixed_budget, batch)
+            else:
+                # Balanced prefixes can visit buckets unreachable by a uniform cap.
+                scheduled.fill(fixed_budget // batch if batch else 0)
+                if batch:
+                    scheduled[: fixed_budget % batch] += 1
         elif fixed_cap is not None:
             if type(fixed_cap) is not int or not 0 <= fixed_cap <= self.num_steps:
                 raise AdaptiveBudgetInputError(
@@ -271,13 +308,8 @@ class AdaptiveDraftController:
                 num_non_draft_tokens=batch,
                 num_sampling_requests=batch,
             )
-            # Stable ties keep earlier positions before later positions of the
-            # same request, so every selected set remains a valid prefix.
-            survival = np.cumprod(confidence.astype(np.float64), axis=1)
-            chosen = np.argsort(-survival.reshape(-1), kind="stable")[:budget]
-            scheduled = np.bincount(chosen // self.num_steps, minlength=batch).astype(
-                np.int32
-            )
+            scheduled = self._assign_host_budget(confidence, budget, batch)
+        self.host_capacities = scheduled
         self.host_cap_counts = (
             int(np.count_nonzero(scheduled == 0)),
             int(np.count_nonzero(scheduled == self.num_steps)),
@@ -290,6 +322,45 @@ class AdaptiveDraftController:
             self._device_indices(rows, torch.int64),
             len(rows),
         )
+
+    def _prepare_explicit_host_caps(
+        self, caps: tuple[int, ...]
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        # The ordered cap vector determines both the packed indices and the
+        # feedback bounds. Cache that immutable host plan, never request IDs.
+        key = tuple(caps)
+        if key not in self._explicit_host_plans:
+            scheduled = np.asarray(key, dtype=np.int32)
+            scheduled.setflags(write=False)
+            width = self.num_steps + 1
+            rows = tuple(
+                row
+                for index, cap in enumerate(key)
+                for row in range(index * width, index * width + cap + 1)
+            )
+            counts = (key.count(0), key.count(self.num_steps))
+            self._explicit_host_plans[key] = scheduled, counts, rows
+            if len(self._explicit_host_plans) > 32:
+                self._explicit_host_plans.popitem(last=False)
+        self._explicit_host_plans.move_to_end(key)
+        self.host_capacities, self.host_cap_counts, rows = self._explicit_host_plans[
+            key
+        ]
+        # Keep the existing device cache's event and stream ownership checks.
+        return (
+            self._device_indices(key, torch.int32),
+            self._device_indices(rows, torch.int64),
+            len(rows),
+        )
+
+    def _assign_host_budget(
+        self, confidence: np.ndarray, budget: int, batch: int
+    ) -> np.ndarray:
+        # Stable ties keep earlier positions before later positions of the
+        # same request, so every selected set remains a valid prefix.
+        survival = np.cumprod(confidence.astype(np.float64), axis=1)
+        chosen = np.argsort(-survival.reshape(-1), kind="stable")[:budget]
+        return np.bincount(chosen // self.num_steps, minlength=batch).astype(np.int32)
 
     def reallocate_current(self, request_ids: Sequence[int], total_tokens: int):
         """Use current draft confidences for a host-sized budget, without D2H.
@@ -348,6 +419,57 @@ class AdaptiveDraftController:
             tuple(request_ids), slots, capacities, known
         )
 
+    def _validate_observation(
+        self, batch: int, accepted_drafts: torch.Tensor, forced: Sequence[bool]
+    ) -> None:
+        if accepted_drafts.shape != (batch,) or accepted_drafts.dtype not in (
+            torch.int32,
+            torch.int64,
+        ):
+            raise AdaptiveBudgetInputError("accepted_drafts", "invalid integer counts")
+        if accepted_drafts.device != self.device:
+            raise AdaptiveBudgetInputError("accepted_drafts", "device mismatch")
+        if len(forced) != batch or any(
+            type(value) not in (bool, np.bool_) for value in forced
+        ):
+            raise AdaptiveBudgetInputError("forced", "expected one boolean per request")
+
+    def _validate_effective_capacities(
+        self, batch: int, effective_capacities: torch.Tensor
+    ) -> None:
+        if (
+            effective_capacities.shape != (batch,)
+            or effective_capacities.device != self.device
+            or effective_capacities.dtype not in (torch.int32, torch.int64)
+        ):
+            raise AdaptiveBudgetInputError(
+                "effective_capacities", "invalid shape, device or dtype"
+            )
+
+    def consume_measured_plan(
+        self,
+        request_ids: Sequence[int],
+        accepted_drafts: torch.Tensor,
+        forced: Sequence[bool],
+        effective_capacities: torch.Tensor | None,
+    ) -> np.ndarray:
+        """Consume a host-sized plan without preparing GPU estimator feedback."""
+        pending = self._pending
+        if (
+            pending is None
+            or pending.request_ids != tuple(request_ids)
+            or any(pending.trainable)
+        ):
+            raise AdaptiveBudgetInputError(
+                "request_ids", "must match an ordered, untrained host plan"
+            )
+        self._validate_observation(len(request_ids), accepted_drafts, forced)
+        if effective_capacities is not None:
+            self._validate_effective_capacities(len(request_ids), effective_capacities)
+        self._ready[list(pending.slots)] = False
+        self._pending = None
+        return self.host_capacities
+
     def observe(
         self,
         request_ids: Sequence[int],
@@ -358,17 +480,7 @@ class AdaptiveDraftController:
         effective_capacities: torch.Tensor | None = None,
     ) -> None:
         slots = self._slots(request_ids)
-        if accepted_drafts.shape != (len(slots),) or accepted_drafts.dtype not in (
-            torch.int32,
-            torch.int64,
-        ):
-            raise AdaptiveBudgetInputError("accepted_drafts", "invalid integer counts")
-        if accepted_drafts.device != self.device:
-            raise AdaptiveBudgetInputError("accepted_drafts", "device mismatch")
-        if len(forced) != len(slots) or any(
-            type(value) not in (bool, np.bool_) for value in forced
-        ):
-            raise AdaptiveBudgetInputError("forced", "expected one boolean per request")
+        self._validate_observation(len(slots), accepted_drafts, forced)
         if not slots:
             if self._pending is not None and self._pending.request_ids:
                 raise AdaptiveBudgetInputError(
@@ -386,14 +498,7 @@ class AdaptiveDraftController:
         admitted = pending.capacities.index_select(0, self._device_indices(order))
         planned = admitted
         if effective_capacities is not None:
-            if (
-                effective_capacities.shape != (len(slots),)
-                or effective_capacities.device != self.device
-                or effective_capacities.dtype not in (torch.int32, torch.int64)
-            ):
-                raise AdaptiveBudgetInputError(
-                    "effective_capacities", "invalid shape, device or dtype"
-                )
+            self._validate_effective_capacities(len(slots), effective_capacities)
             # Grammar can censor a planned suffix. It is not a rejection label.
             # The supplied caps follow request_ids order, like accepted_drafts.
             admitted = effective_capacities

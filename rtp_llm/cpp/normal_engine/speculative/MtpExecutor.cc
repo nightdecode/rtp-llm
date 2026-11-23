@@ -34,6 +34,7 @@
 #include "rtp_llm/cpp/utils/MtpFusion.h"
 #include <algorithm>
 #include <exception>
+#include <array>
 #include <limits>
 #include <cstdlib>
 #include <memory>
@@ -1002,7 +1003,7 @@ std::vector<int64_t> MtpExecutor::adaptiveRequestIds(const StreamGroups& groups)
 }
 
 void MtpExecutor::adaptivePredict(const StreamGroups& groups, int step, const torch::Tensor& logits) {
-    if (!adaptive_session_ || warm_up_ || groups.allStreams().empty()) {
+    if (!adaptive_prediction_enabled_ || warm_up_ || groups.allStreams().empty()) {
         return;
     }
     for (const auto& stream : groups.allStreams()) {
@@ -1569,8 +1570,14 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
                 configuredAdaptiveVerifyCaptureRows(params.concurrency_config.concurrency_limit, propose_step_ + 1) :
                 std::vector<int>{};
         auto session = py::module_::import("rtp_llm.models_py.sampling.adaptive_session")
-                           .attr("create_session")(
-                               params.concurrency_config.concurrency_limit, propose_step_, "cuda", capture_rows);
+                           .attr("create_session")(params.concurrency_config.concurrency_limit,
+                                                   propose_step_,
+                                                   "cuda",
+                                                   capture_rows,
+                                                   params.parallelism_config.ep_size,
+                                                   glm5_target_ && parallelism_config_.tp_size == 1
+                                                       && role_type_ == RoleType::DECODE);
+        adaptive_prediction_enabled_ = session.attr("needs_prediction")().cast<bool>();
         adaptive_session_ = std::shared_ptr<py::object>(new py::object(std::move(session)), [](py::object* value) {
             py::gil_scoped_acquire gil;
             delete value;
@@ -2481,24 +2488,62 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
     verification.dense_rows        = batch_size * (propose_step_ + 1);
     verification.target_rows       = verification.dense_rows;
     verification.full_cap_requests = batch_size;
-    torch::Tensor adaptive_caps;
-    torch::Tensor adaptive_rows;
-    bool          refresh_adaptive_allocation = false;
-    const bool    packed_verify               = adaptive_verification_ && !warm_up_ && !model_input.is_fake_stream;
+    torch::Tensor                              adaptive_caps;
+    torch::Tensor                              adaptive_rows;
+    bool                                       refresh_adaptive_allocation = false;
+    bool                                       adaptive_plan_committed     = false;
+    std::vector<std::weak_ptr<GenerateStream>> settled_dense_cohort;
+    const bool  adaptive_candidate = adaptive_verification_ && !warm_up_ && !model_input.is_fake_stream;
+    const auto& verify_streams     = stream_groups.decodeStreams();
+    const bool  cacheable_cohort =
+        adaptive_candidate && parallelism_config_.tp_size == 1 && stream_groups.contextStreams().empty();
+    // A settled full-width EP decision is valid until the cohort changes.
+    // Only TP1 may skip the Python plan and its TP broadcast protocol.
+    const bool reuse_dense_fallback =
+        cacheable_cohort && !adaptive_dense_fallback_streams_.empty()
+        && batch_size == adaptive_dense_fallback_streams_.size()
+        && verify_streams.size() == adaptive_dense_fallback_streams_.size()
+        && std::equal(verify_streams.begin(),
+                      verify_streams.end(),
+                      adaptive_dense_fallback_streams_.begin(),
+                      [](const auto& stream, const auto& cached) { return stream == cached.lock(); });
+    if (reuse_dense_fallback) {
+        verification.adaptive_enabled = true;
+        verification.decision_mode    = 3;
+    } else if (adaptive_candidate) {
+        adaptive_dense_fallback_streams_.clear();
+    }
+    const bool    packed_verify = adaptive_candidate && !reuse_dense_fallback;
+    torch::Tensor draft_probabilities_for_plan;
+    bool          use_margin_for_plan = false;
     if (packed_verify) {
         // Historical confidence determines the host row count before draft.
         // Learned partial budgets re-rank requests after current draft logits.
         auto row_count = torch::empty({2}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
         if (isTpRank0()) {
             py::gil_scoped_acquire gil;
-            adaptive_session_->attr("begin")(adaptiveRequestIds(stream_groups));
-            auto plan                        = adaptive_session_->attr("prepared_plan")().cast<py::tuple>();
+            auto                   prepared =
+                adaptive_session_->attr("begin_for_executor")(adaptiveRequestIds(stream_groups)).cast<py::tuple>();
+            if (cacheable_cohort && batch_size == verify_streams.size() && prepared[1].cast<bool>()) {
+                settled_dense_cohort.assign(verify_streams.begin(), verify_streams.end());
+            }
+            auto plan                        = prepared[0].cast<py::tuple>();
             adaptive_caps                    = plan[0].cast<torch::Tensor>();
             adaptive_rows                    = plan[1].cast<torch::Tensor>();
             row_count.data_ptr<int64_t>()[0] = plan[2].cast<int64_t>();
-            row_count.data_ptr<int64_t>()[1] = adaptive_session_->attr("needs_current_allocation")().cast<bool>();
+            row_count.data_ptr<int64_t>()[1] = prepared[2].cast<bool>();
+            adaptive_plan_committed          = prepared[5].cast<bool>();
+            use_margin_for_plan              = prepared[6].cast<bool>();
+            if (row_count.data_ptr<int64_t>()[1] && prepared[3].cast<bool>()) {
+                const auto options = model_input.combo_tokens.options().dtype(torch::kFloat32);
+                const auto sizes =
+                    std::array<int64_t, 2>{static_cast<int64_t>(propose_step_ - 1), static_cast<int64_t>(batch_size)};
+                draft_probabilities_for_plan =
+                    use_margin_for_plan ? torch::full(sizes, std::numeric_limits<float>::quiet_NaN(), options) :
+                                          torch::empty(sizes, options);
+            }
             // Host-only telemetry; never copy capacities back from the GPU.
-            auto telemetry                 = adaptive_session_->attr("metrics_snapshot")().cast<py::tuple>();
+            auto telemetry                 = prepared[4].cast<py::tuple>();
             verification.adaptive_enabled  = true;
             verification.target_rows       = row_count.data_ptr<int64_t>()[0];
             verification.decision_mode     = telemetry[0].cast<int64_t>();
@@ -2550,7 +2595,13 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         }
         model_input.kv_cache_layer_to_group = draft_kv_cache_layer_to_group;
         RTP_LLM_LOG_DEBUG("[MTP decode] draftModelDecode start");
-        draftModelDecode(model_input, stream_groups, draft_probs_list, draft_token_ids_t, model_forward_us);
+        draftModelDecode(model_input,
+                         stream_groups,
+                         draft_probs_list,
+                         draft_token_ids_t,
+                         model_forward_us,
+                         draft_probabilities_for_plan,
+                         use_margin_for_plan);
         RTP_LLM_LOG_DEBUG("[MTP decode] draftModelDecode end");
     }
     if (useAsyncPrepare() && !refresh_adaptive_allocation) {
@@ -2562,14 +2613,19 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
     auto draft_tokens_ready_event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
     draft_tokens_ready_event->record(cuda_graph::graphGetCurrentStream());
 
-    if (packed_verify && isTpRank0()) {
-        // Freeze training eligibility only after this round's draft predictions.
+    if (packed_verify && isTpRank0() && !adaptive_plan_committed) {
+        // Prediction-based policies freeze training eligibility after Draft.
         py::gil_scoped_acquire gil;
-        auto                   plan = adaptive_session_->attr("plan")().cast<py::tuple>();
+        auto                   plan = draft_probabilities_for_plan.defined() ?
+                                          adaptive_session_->attr("plan")(draft_probabilities_for_plan).cast<py::tuple>() :
+                                          adaptive_session_->attr("plan")().cast<py::tuple>();
         if (refresh_adaptive_allocation) {
             adaptive_caps = plan[0].cast<torch::Tensor>();
             adaptive_rows = plan[1].cast<torch::Tensor>();
         }
+        // Margin planning returns the same monotonically ordered dense row
+        // indexes as the committed host-prefix path, including its fallback.
+        adaptive_plan_committed = use_margin_for_plan;
     }
     if (refresh_adaptive_allocation) {
         if (parallelism_config_.tp_size > 1) {
@@ -2610,14 +2666,29 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         if (!isCpContextRequest(parallelism_config_, model_input)) {
             maybeOverrideLastHiddenWithMtpBuffer(model_output, *model_);
         }
-        const auto restore = [&](torch::Tensor& value) {
-            if (value.defined() && value.numel() > 0 && value.size(0) == adaptive_rows.numel()) {
-                auto shape = value.sizes().vec();
-                shape[0]   = batch_size * (propose_step_ + 1);
-                auto dense = torch::zeros(shape, value.options());
-                dense.index_copy_(0, adaptive_rows, value);
-                value = std::move(dense);
+        const int64_t dense_rows = batch_size * (propose_step_ + 1);
+        const auto    restore    = [&](torch::Tensor& value) {
+            if (!value.defined() || value.numel() == 0 || value.size(0) != adaptive_rows.numel()) {
+                return;
             }
+#if USING_CUDA
+            static const bool fuse_restore = autil::EnvUtil::getEnv("RTP_LLM_ADAPTIVE_VERIFY_FUSED_RESTORE", false);
+            // Early commitment is only used for explicit host plans; their
+            // retained rows have a known increasing order.
+            if (fuse_restore && adaptive_plan_committed) {
+                auto restored = tryMtpRestoreAdaptiveRows(
+                    value, adaptive_rows, dense_rows, cuda_graph::graphGetCurrentStream().stream());
+                if (restored.defined()) {
+                    value = std::move(restored);
+                    return;
+                }
+            }
+#endif
+            auto shape = value.sizes().vec();
+            shape[0]   = dense_rows;
+            auto dense = torch::zeros(shape, value.options());
+            dense.index_copy_(0, adaptive_rows, value);
+            value = std::move(dense);
         };
         restore(model_output.logits);
         restore(model_output.hidden_states);
@@ -2781,18 +2852,22 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
                                      /*allow_deferred_sampling=*/true,
                                      /*allow_inplace_logits=*/glm5_target_ && !target_logprobs.defined()));
             holdSamplerInputHostBuffers(buffer_holder_, sampler_input);
-            if (packed_verify) {
+            if (compacted_verify) {
+                // A full-width plan needs no adaptive cap. Keep the original
+                // grammar cap, if any, and the ordinary dense sampler route.
                 if (sampler_input.spec_mask_ready_event) {
                     sampler_input.spec_mask_ready_event->block(cuda_graph::graphGetCurrentStream());
                 }
                 sampler_input.spec_cap_gpu = sampler_input.spec_cap_gpu.defined() ?
                                                  torch::minimum(sampler_input.spec_cap_gpu, adaptive_caps) :
                                                  adaptive_caps;
-            }
-            if (compacted_verify) {
                 recordSpecTensorUseOnCurrentStream(adaptive_caps);
                 sampler_input.deferred_filter_caps = adaptive_caps;
                 sampler_input.deferred_filter_rows = propose_step_ + 1;
+                if (!target_logprobs.defined()) {
+                    recordSpecTensorUseOnCurrentStream(adaptive_rows);
+                    sampler_input.deferred_filter_active_rows = adaptive_rows;
+                }
             }
             if (sampler_input.defer_token_sampling && draft_sampler_output.draft_point_mass) {
                 // Filtering does not consume RNG. Reserve rejection state after its
@@ -2847,8 +2922,8 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
                     forced.push_back(stream->forceSpAccept());
                 }
                 py::gil_scoped_acquire gil;
-                adaptive_session_->attr("observe")(
-                    speculative_sampler_output.accept_len - 1, forced, sampler_input.spec_cap_gpu);
+                adaptive_session_->attr("observe_emitted_tokens")(
+                    speculative_sampler_output.accept_len, forced, sampler_input.spec_cap_gpu);
             }
         }
 
@@ -3026,6 +3101,10 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         py::gil_scoped_acquire gil;
         adaptive_session_->attr("finish")((autil::TimeUtility::currentTimeInMicroSeconds() - decode_start_time_us)
                                           / 1000.0);
+        if (dispatch_status.ok() && !settled_dense_cohort.empty()
+            && verification.target_rows == verification.dense_rows) {
+            adaptive_dense_fallback_streams_ = std::move(settled_dense_cohort);
+        }
     }
     return dispatch_status;
 }
@@ -3917,7 +3996,9 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
                                    const StreamGroups&         stream_groups,
                                    std::vector<torch::Tensor>& draft_probs_list,
                                    torch::Tensor&              draft_token_ids_t,
-                                   int64_t&                    model_forward_us) {
+                                   int64_t&                    model_forward_us,
+                                   const torch::Tensor&        draft_probabilities_for_plan,
+                                   bool                        use_margin_for_plan) {
     RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.mtp.draft_model_decode(batch_size=%zu)", model_input.combo_tokens.size(0));
     if (shouldSkipFakeStreamForStop(model_input, "draft decode loop")) {
         return;
@@ -4110,6 +4191,14 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
 
         // sample
         speculative::MtpDraftSampleContext sample_context;
+        if (draft_probabilities_for_plan.defined()) {
+            auto score = draft_probabilities_for_plan.select(0, i);
+            if (use_margin_for_plan) {
+                sample_context.selected_logit_margin = score;
+            } else {
+                sample_context.selected_probability = score;
+            }
+        }
         adaptivePredict(stream_groups, i + 1, draft_decode_model_output.logits);
         if (i != propose_step_ - 2)
             sample_context.sequence_lengths = model_input.sequence_lengths;

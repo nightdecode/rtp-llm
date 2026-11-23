@@ -5,6 +5,8 @@ from __future__ import annotations
 import importlib
 import logging
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,6 +22,36 @@ _ENABLE_ENV = "RTP_LLM_GLM5_CMP"
 _DISABLE_ATTENTION_POST_MOE_PRE_ENV = "RTP_LLM_GLM5_DISABLE_ATTENTION_POST_MOE_PRE"
 _SUPPORTED_MODEL_TYPES = frozenset(("glm_5", "glm_5_mtp"))
 logger = logging.getLogger(__name__)
+
+_cmp_physical_indices = ContextVar("cmp_physical_indices", default=None)
+
+
+@contextmanager
+def reuse_adaptive_cmp_physical_indices(attention_inputs: Any):
+    # Consecutive CMP layers can share the physical IDs of one Indexer result.
+    enabled = (
+        os.environ.get("RTP_LLM_ADAPTIVE_VERIFY_REUSE_MLA_INDICES", "0") == "1"
+        and adaptive_target_layout(attention_inputs)
+        and not getattr(attention_inputs, "is_draft_extend", False)
+    )
+    if not enabled and _cmp_physical_indices.get() is None:
+        yield
+        return
+    token = _cmp_physical_indices.set({} if enabled else None)
+    try:
+        yield
+    finally:
+        _cmp_physical_indices.reset(token)
+
+
+def _mapping_input_view(tensor: torch.Tensor) -> tuple:
+    return (
+        tensor.data_ptr(),
+        tensor.device,
+        tensor.dtype,
+        tensor.shape,
+        tensor.stride(),
+    )
 
 
 def _load_ops() -> Any:
@@ -800,6 +832,8 @@ class Glm5Cmp:
                     kv_cache,
                     params,
                     implementation.attn_inputs,
+                    # The MLA factory stores this on its implementation.
+                    is_cuda_graph=implementation.is_cuda_graph,
                 )
                 if working_entry is not None:
                     # Start pin misses on TopK completion, while the CMP query
@@ -831,16 +865,47 @@ class Glm5Cmp:
         working_entry = getattr(implementation, "pinned_mla_groups", {}).get(
             self.layer_idx
         )
+        mapped = _cmp_physical_indices.get()
+        if mapped is not None and self.has_indexer:
+            # Producers can overwrite the same TopK storage across layers.
+            mapped.clear()
         if working_entry is not None:
             working, group_layer = working_entry
             # mla_prologue joins the layer's transfer event before writing KV.
             cache = working.resident[group_layer]
             attention_kwargs["physical_indices"] = working.physical_indices
+        elif mapped is not None:
+            physical = self._cmp_global_indices(
+                implementation.fmha_impl, topk_indices, mapped
+            )
+            if physical is not None:
+                attention_kwargs["physical_indices"] = physical
         if not implementation.fmha_impl.expects_paged_kv:
             cache = cache.view(-1, 1, cache.size(-1))
         return implementation.fmha_impl.forward(
             query, cache, topk_indices, layer_id=self.layer_idx, **attention_kwargs
         )
+
+    @staticmethod
+    def _cmp_global_indices(op: Any, topk: torch.Tensor, mapped: dict):
+        from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.flashmla_sparse_impl import (
+            SparseMlaFp8Op,
+        )
+
+        if type(op) is not SparseMlaFp8Op or not op.use_cuda_graph or not topk.is_cuda:
+            return None
+        assert op.block_table is not None and op.mla_params is not None
+        inputs = (topk, op.block_table, op.mla_params.batch_indice_d)
+        stream = torch.cuda.current_stream(topk.device).cuda_stream
+        key = (stream, op.token_per_block, op.top_k, *map(_mapping_input_view, inputs))
+        cached = mapped.get("latest")
+        if cached is not None and cached[0] == key:
+            return cached[2]
+        physical = op._convert_topk_indices_to_global(topk)
+        # Retain the views to prevent address recycling. A single entry is
+        # sufficient for the consecutive layers that consume one TopK result.
+        mapped["latest"] = (key, inputs, physical)
+        return physical
 
     def mla_post_moe_pre(
         self,

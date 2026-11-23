@@ -6,9 +6,11 @@ import numpy as np
 import torch
 
 from rtp_llm.models_py.sampling.adaptive_verification import (
+    _FOUR_GAP_SURVIVAL_COEFFICIENTS,
     AdaptiveBudgetInputError,
     allocate_draft_token_budget,
     assign_draft_token_budget,
+    pack_ep_margin_rows,
     pack_verification_rows,
     select_draft_token_budget,
 )
@@ -198,6 +200,150 @@ class BudgetSelectionTest(unittest.TestCase):
                 num_non_draft_tokens=1,
                 num_sampling_requests=1,
             )
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+class MarginPrefixPackingTest(unittest.TestCase):
+    def test_exact_prefix_and_fallback_for_padded_rank_shapes(self):
+        batch = 14
+        prior = torch.full((batch, 5), 0.5, device="cuda")
+        gaps = torch.arange(batch, device="cuda", dtype=torch.float32).repeat(4, 1)
+        fallback = torch.tensor([5] * 7 + [2] * 7, device="cuda", dtype=torch.int32)
+        width = batch + 49
+        caps, rows = pack_ep_margin_rows(gaps, prior, fallback, width)
+        actual = caps.tolist()
+        self.assertEqual(sum(actual) + batch, width)
+        self.assertGreater(sum(actual[7:]), sum(actual[:7]))
+        self.assertEqual(
+            rows.tolist(),
+            [req * 6 + hop for req, cap in enumerate(actual) for hop in range(cap + 1)],
+        )
+        self.assertTrue(all(1 <= cap <= 5 for cap in actual))
+        for invalid in (float("inf"), float("nan"), -1.0):
+            bad = gaps.clone()
+            bad[0, 0] = invalid
+            result, retained = pack_ep_margin_rows(bad, prior, fallback, width)
+            self.assertTrue(torch.equal(result, fallback))
+            self.assertEqual(
+                retained.tolist(),
+                [
+                    req * 6 + hop
+                    for req, cap in enumerate(fallback.tolist())
+                    for hop in range(cap + 1)
+                ],
+            )
+
+    def test_one_batch_supports_varying_runtime_widths(self):
+        batch = 14
+        prior = torch.full((batch, 5), 0.5, device="cuda")
+        gaps = torch.arange(batch, device="cuda", dtype=torch.float32).repeat(4, 1)
+        for width in (29, 55, 63, 64, 72, 76, 82):
+            with self.subTest(width=width):
+                head, tail = divmod(width - 2 * batch, 4)
+                fallback = [5] * head + [1 + tail] + [1] * (batch - head - 1)
+                caps, rows = pack_ep_margin_rows(
+                    gaps,
+                    prior,
+                    torch.tensor(fallback, device="cuda", dtype=torch.int32),
+                    width,
+                )
+                actual = caps.tolist()
+                self.assertEqual(sum(actual) + batch, width)
+                self.assertEqual(
+                    rows.tolist(),
+                    [
+                        request * 6 + hop
+                        for request, cap in enumerate(actual)
+                        for hop in range(cap + 1)
+                    ],
+                )
+
+    def test_four_gap_rerank_matches_independent_prefix_scores(self):
+        batch = 14
+        rng = torch.Generator().manual_seed(1212)
+        gaps = torch.rand((4, batch), generator=rng) * 36
+        prior = (
+            (torch.rand((batch, 5), generator=rng) * 0.95 + 0.02)
+            .sort(dim=1, descending=True)
+            .values
+        )
+        ranked = []
+        for req in range(batch):
+            logged_gaps = [math.log1p(min(32, gap)) for gap in gaps[:, req].tolist()]
+            prefix_score = math.inf
+            for depth, (a, b, *c) in enumerate(_FOUR_GAP_SURVIVAL_COEFFICIENTS):
+                p = prior[req, depth].item()
+                prefix_score = min(
+                    prefix_score,
+                    a
+                    + b * math.log(p / (1 - p))
+                    + sum(x * w for x, w in zip(logged_gaps, c)),
+                )
+                if depth:
+                    ranked.append((-prefix_score, req, depth))
+        ranked.sort()
+        device_gaps, device_prior = gaps.cuda(), prior.cuda()
+        for width in (48, 56, 64, 72):
+            with self.subTest(width=width):
+                optional = width - 2 * batch
+                expected = [1] * batch
+                for _, req, _ in ranked[:optional]:
+                    expected[req] += 1
+                head, tail = divmod(optional, 4)
+                fallback = [5] * head + [1 + tail] + [1] * (batch - head - 1)
+                device_fallback = torch.tensor(
+                    fallback, device="cuda", dtype=torch.int32
+                )
+                caps, rows = pack_ep_margin_rows(
+                    device_gaps, device_prior, device_fallback, width, four_gaps=True
+                )
+                self.assertEqual(caps.tolist(), expected)
+                self.assertEqual(
+                    rows.tolist(),
+                    [
+                        req * 6 + hop
+                        for req, cap in enumerate(expected)
+                        for hop in range(cap + 1)
+                    ],
+                )
+                bad_prior = device_prior.clone()
+                bad_prior[-1, -1] = float("nan")
+                result, retained = pack_ep_margin_rows(
+                    device_gaps, bad_prior, device_fallback, width, four_gaps=True
+                )
+                self.assertTrue(torch.equal(result, device_fallback))
+                self.assertEqual(
+                    retained.tolist(),
+                    [
+                        req * 6 + hop
+                        for req, cap in enumerate(fallback)
+                        for hop in range(cap + 1)
+                    ],
+                )
+
+    def test_equal_scores_keep_prefixes_and_are_deterministic(self):
+        prior = torch.full((14, 5), 0.75, device="cuda")
+        gaps = torch.full((4, 14), 5.0, device="cuda")
+        fallback = torch.full((14,), 4, device="cuda", dtype=torch.int32)
+        for use_four in (False, True):
+            with self.subTest(use_four=use_four):
+                first = pack_ep_margin_rows(
+                    gaps, prior, fallback, 70, four_gaps=use_four
+                )
+                second = pack_ep_margin_rows(
+                    gaps, prior, fallback, 70, four_gaps=use_four
+                )
+                self.assertTrue(
+                    all(torch.equal(left, right) for left, right in zip(first, second))
+                )
+                self.assertEqual(
+                    first[1].tolist(),
+                    [
+                        i * 6 + h
+                        for i, c in enumerate(first[0].tolist())
+                        for h in range(c + 1)
+                    ],
+                )
 
 
 class VerificationPackingTest(unittest.TestCase):

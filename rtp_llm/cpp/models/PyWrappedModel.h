@@ -373,6 +373,15 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
         const char* adaptive_env      = std::getenv("RTP_LLM_ADAPTIVE_VERIFICATION");
         graph_params.adaptive_verification =
             is_target_verify_decode && adaptive_env && std::string(adaptive_env) == "1";
+        const char* native_full_width = std::getenv("RTP_LLM_ADAPTIVE_NATIVE_FULL_WIDTH");
+        const auto& parallelism       = params.parallelism_config;
+        graph_params.adaptive_native_full_width =
+            graph_params.adaptive_verification && native_full_width && std::string(native_full_width) == "1"
+            && params.sp_config.model_type == "glm_5_mtp" && params.sp_config.gen_num_per_cycle == 5
+            && params.hc_mult == 1 && description_.attention_conf.use_mla && params.kv_cache_layer_layout.has_value()
+            && params.concurrency_config.concurrency_limit == 14 && parallelism.role_type == RoleType::DECODE
+            && parallelism.tp_size == 1 && parallelism.dp_size == 4 && parallelism.ep_size == 4
+            && parallelism.world_size == 4;
         const char* adaptive_cap = std::getenv("RTP_LLM_ADAPTIVE_VERIFY_CAP");
         graph_params.profile_adaptive_costs =
             adaptive_env && std::string(adaptive_env) == "1" && (!adaptive_cap || std::string(adaptive_cap) == "-1")

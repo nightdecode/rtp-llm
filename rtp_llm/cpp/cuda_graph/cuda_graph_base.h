@@ -44,6 +44,8 @@ struct GraphParams {
     // the DSv4 MTP draft graph captures with the [T, hc*dim] residual shape
     // produced by the target's getMtpTargetHiddenStates accessor.
     int64_t hc_mult = 1;
+    // Opt-in native uniform target capture for an adaptive replay.
+    bool adaptive_native_full_width = false;
 };
 
 class GraphBase {

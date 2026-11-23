@@ -11,8 +11,18 @@ import torch
 
 from rtp_llm.models_py.sampling.adaptive_controller import AdaptiveDraftController
 from rtp_llm.models_py.sampling.adaptive_runtime import create_controller
-from rtp_llm.models_py.sampling.adaptive_session import AdaptiveVerificationSession
-from rtp_llm.models_py.sampling.adaptive_verification import AdaptiveBudgetInputError
+from rtp_llm.models_py.sampling.adaptive_session import (
+    AdaptiveVerificationSession,
+    _MeasuredEpPolicy,
+)
+from rtp_llm.models_py.sampling.adaptive_tail_budget import (
+    RollingAcceptance,
+    TailRiskEpPolicy,
+)
+from rtp_llm.models_py.sampling.adaptive_verification import (
+    AdaptiveBudgetInputError,
+    pack_ep_tail_rows,
+)
 
 
 def ready_controller(request_ids: list[int]) -> AdaptiveDraftController:
@@ -26,6 +36,691 @@ def ready_controller(request_ids: list[int]) -> AdaptiveDraftController:
         )
         controller.predict(request_ids, step, logits)
     return controller
+
+
+class MeasuredEpPolicyTest(unittest.TestCase):
+    def make_policy(self) -> _MeasuredEpPolicy:
+        buckets = [1, 2, 4, 8, 14, 32, 48, 64, 72, 76, 80, 84]
+        execution = np.arange(85)
+        execution[1:] = np.asarray(buckets)[np.searchsorted(buckets, execution[1:])]
+        return _MeasuredEpPolicy(5, execution)
+
+    def run_initial_probes(self, costs, accepted):
+        policy = self.make_policy()
+        ids = list(range(14))
+        observed = []
+        for _ in range(9):
+            rows, mode = policy.begin(ids)
+            self.assertEqual(mode, 1)
+            observed.append(rows)
+            policy.record(
+                policy.epoch, tuple(ids), rows, costs[rows], np.full(14, accepted[rows])
+            )
+        self.assertEqual(observed, [84] * 3 + [76] * 3 + [72] * 3)
+        return policy, ids
+
+    def test_faster_verify_loses_when_it_emits_fewer_tokens(self):
+        policy, ids = self.run_initial_probes(
+            {84: 35.0, 76: 33.0, 72: 31.0}, {84: 4, 76: 3, 72: 3}
+        )
+        self.assertEqual(policy.begin(ids), (84, 3))
+
+    def test_rejected_buckets_are_not_probed_again_in_same_cohort(self):
+        policy, ids = self.run_initial_probes(
+            {84: 35.0, 76: 33.0, 72: 31.0}, {84: 4, 76: 3, 72: 3}
+        )
+        for _ in range(48):
+            self.assertEqual(policy.begin(ids[::-1]), (84, 3))
+        self.assertFalse(policy.needs_measurement())
+        self.assertEqual(policy.begin([*ids[1:], 14]), (84, 1))
+        self.assertTrue(policy.needs_measurement())
+
+    def test_selects_proven_bucket_and_refreshes_full_width(self):
+        policy, ids = self.run_initial_probes(
+            {84: 35.0, 76: 32.0, 72: 31.0}, {84: 4, 76: 4, 72: 3}
+        )
+        for _ in range(7):
+            self.assertEqual(policy.begin(ids[::-1]), (76, 2))
+        self.assertEqual(policy.begin(ids), (84, 1))
+        for _ in range(3):
+            self.assertEqual(policy.begin(ids), (84, 3))
+        policy.record(policy.epoch, tuple(ids), 84, 35.0, np.full(14, 4))
+        self.assertEqual(policy.begin(ids), (76, 2))
+
+    def test_only_settled_ep_full_width_can_skip_rounds(self):
+        session = AdaptiveVerificationSession.__new__(AdaptiveVerificationSession)
+        session._ep_policy = None
+        self.assertFalse(session.can_reuse_dense_fallback())
+        policy, ids = self.run_initial_probes(
+            {84: 35.0, 76: 32.0, 72: 31.0}, {84: 4, 76: 4, 72: 3}
+        )
+        session._ep_policy = policy
+        self.assertEqual(policy.begin(ids), (76, 2))
+        self.assertFalse(session.can_reuse_dense_fallback())
+        policy, _ = self.run_initial_probes(
+            {84: 35.0, 76: 33.0, 72: 31.0}, {84: 4, 76: 3, 72: 3}
+        )
+        session._ep_policy = policy
+        self.assertEqual(policy.begin(ids), (84, 3))
+        self.assertTrue(session.can_reuse_dense_fallback())
+        self.assertEqual(policy.begin([*ids[1:], 14]), (84, 1))
+        self.assertFalse(session.can_reuse_dense_fallback())
+
+    def test_refresh_retires_stale_winner(self):
+        policy, ids = self.run_initial_probes(
+            {84: 35.0, 76: 32.0, 72: 31.0}, {84: 4, 76: 4, 72: 3}
+        )
+        for _ in range(7):
+            self.assertEqual(policy.begin(ids), (76, 2))
+        self.assertEqual(policy.begin(ids), (84, 1))
+        policy.record(policy.epoch, tuple(ids), 84, 20.0, np.full(14, 4))
+        self.assertEqual(policy.begin(ids), (84, 3))
+        self.assertFalse(policy.needs_measurement())
+
+    def test_missing_refresh_retires_winner_and_measurement(self):
+        policy, ids = self.run_initial_probes(
+            {84: 35.0, 76: 32.0, 72: 31.0}, {84: 4, 76: 4, 72: 3}
+        )
+        for _ in range(7):
+            self.assertEqual(policy.begin(ids), (76, 2))
+        self.assertEqual(policy.begin(ids), (84, 1))
+        for _ in range(policy._SAMPLE_GRACE_ROUNDS):
+            self.assertTrue(policy.needs_measurement())
+            self.assertEqual(policy.begin(ids), (84, 3))
+        self.assertFalse(policy.needs_measurement())
+        policy.record(policy.epoch, tuple(ids), 84, 35.0, np.full(14, 4))
+        self.assertEqual(policy.begin(ids), (84, 3))
+        self.assertFalse(policy.needs_measurement())
+
+    def test_dense_only_trains_and_changed_cohort_rejects_late_samples(self):
+        policy = self.make_policy()
+        ids = list(range(14))
+        policy.begin(ids)
+        epoch = policy.epoch
+        accepted = np.arange(14) % 6
+        policy.record(epoch, tuple(ids), 84, 35.0, accepted)
+        before = policy.confidence(ids)
+        policy.record(epoch, tuple(ids), 76, 32.0, np.zeros(14, dtype=np.int32))
+        np.testing.assert_array_equal(policy.confidence(ids), before)
+        self.assertGreater(np.prod(before[5]), np.prod(before[0]))
+        replacement = [*ids[1:], 14]
+        self.assertEqual(policy.begin(replacement), (84, 1))
+        policy.record(epoch, tuple(ids), 84, 35.0, accepted)
+        self.assertIsNone(policy.confidence(replacement))
+
+    def test_probe_waits_for_completed_dense_reference(self):
+        policy = self.make_policy()
+        ids = list(range(14))
+        for _ in range(8):
+            self.assertEqual(policy.begin(ids), (84, 1))
+        for _ in range(3):
+            self.assertEqual(policy.begin(ids), (84, 1))
+            policy.record(policy.epoch, tuple(ids), 84, 35.0, np.full(14, 4))
+        self.assertEqual(policy.begin(ids), (76, 1))
+
+    def test_no_valid_feedback_retires_calibration(self):
+        ids = list(range(14))
+        no_dense = self.make_policy()
+        for _ in range(32):
+            self.assertEqual(no_dense.begin(ids)[0], 84)
+        self.assertFalse(no_dense.needs_measurement())
+
+        missing_probe = self.make_policy()
+        for _ in range(3):
+            missing_probe.begin(ids)
+            missing_probe.record(
+                missing_probe.epoch, tuple(ids), 84, 35.0, np.full(14, 4)
+            )
+        for _ in range(48):
+            missing_probe.begin(ids)
+        self.assertFalse(missing_probe.needs_measurement())
+
+    def test_grammar_caps_are_charged_to_throughput_and_omitted_from_tail(self):
+        policy = self.make_policy()
+        ids = list(range(14))
+        policy.begin(ids)
+        effective_caps = np.full(14, 5)
+        effective_caps[0] = 3
+        policy.record(
+            policy.epoch,
+            tuple(ids),
+            84,
+            35.0,
+            np.full(14, 3),
+            effective_caps,
+        )
+        self.assertEqual(list(policy.samples[84]), [(35.0, 56)])
+        self.assertNotIn(0, policy.accepted)
+        self.assertEqual(policy.accepted[1][3], 1)
+
+    def test_rejoining_same_cohort_still_rejects_prior_epoch(self):
+        policy = self.make_policy()
+        ids = list(range(14))
+        policy.begin(ids)
+        old_epoch = policy.epoch
+        policy.begin(ids[1:])
+        policy.begin(ids)
+        policy.record(old_epoch, tuple(ids), 84, 35.0, np.full(14, 4))
+        self.assertEqual(policy.samples, {})
+        self.assertIsNone(policy.confidence(ids))
+
+    def test_no_probe_if_all_near_full_rows_replay_dense_graph(self):
+        policy = _MeasuredEpPolicy(5, np.array([0] + [12] * 12))
+        self.assertEqual(policy.begin([10, 20]), (12, 3))
+        self.assertEqual(policy.begin([]), (0, 3))
+
+    def test_no_cheaper_bucket_skips_timing_and_device_validation(self):
+        with (
+            patch.dict(os.environ, {"RTP_LLM_ADAPTIVE_VERIFY_CAP": "-1"}),
+            patch.object(torch.cuda, "Stream"),
+            patch.object(torch.cuda, "Event") as event,
+        ):
+            session = AdaptiveVerificationSession(2, 5, "cpu", [1, 2, 4, 12], ep_size=4)
+            with (
+                patch.object(
+                    session.controller,
+                    "_device_indices",
+                    side_effect=lambda values, dtype=torch.int64: torch.tensor(
+                        list(values), dtype=dtype
+                    ),
+                ),
+                patch.object(session.controller, "observe") as legacy_observe,
+                patch.object(session, "_queue_ep_feedback") as queue,
+            ):
+                session.begin([10, 20])
+                caps, _, total = session.plan()
+                self.assertEqual((caps.tolist(), total), ([5, 5], 12))
+                session.observe(torch.tensor([3, 1]), [False, False])
+                session.finish()
+            self.assertIsNone(session.controller._pending)
+            event.assert_not_called()
+            legacy_observe.assert_not_called()
+            queue.assert_not_called()
+
+    def test_feedback_bounds_are_checked_only_after_event_completion(self):
+        session = object.__new__(AdaptiveVerificationSession)
+        session._ep_policy = Mock()
+        session.event_pool = []
+        session._ep_buffers = []
+        events = [Mock(), Mock()]
+        events[1].query.side_effect = [False, True]
+        planned = np.array([3, 5], dtype=np.int32)
+        # Request 10 accepts more than its planned cap. Request 20's grammar
+        # cap exceeds its planned cap even though its accepted count is valid.
+        host = torch.tensor([[4, 2], [3, 6]])
+        session._ep_pending = [(1, (10, 20), 10, events, 35.0, host, planned, False, 0)]
+        with patch("logging.error") as error:
+            session._collect_ep_samples()
+            error.assert_not_called()
+            self.assertEqual(len(session._ep_pending), 1)
+            session._collect_ep_samples()
+            error.assert_called_once()
+        session._ep_policy.record.assert_not_called()
+        self.assertEqual(session._ep_pending, [])
+        self.assertEqual(session._ep_buffers, [host])
+
+
+class TailRiskRowPriceTest(unittest.TestCase):
+    def test_decayed_censored_history_matches_full_recompute(self):
+        decay = 0.5 ** (1 / 8)
+        prior = (0.7, 0.8, 0.9, 0.9, 0.9)
+        history = RollingAcceptance(prior, observations=32, prior_weight=1, decay=decay)
+        outcomes = [(0, 5), (1, 1), (4, 5), (3, 3), (5, 5), (0, 0)] * 20
+        for end, entry in enumerate(outcomes, 1):
+            history.observe(*entry)
+            window = outcomes[max(0, end - 32) : end]
+            expected = 1.0
+            actual_probs = history.survival()
+            for hop, probability in enumerate(prior):
+                chances = successes = 0.0
+                for age, (accepted, cap) in enumerate(reversed(window)):
+                    if hop < min(cap, accepted + 1):
+                        weight = decay**age
+                        chances += weight
+                        if hop < accepted:
+                            successes += weight
+                expected *= (successes + probability) / (chances + 1)
+                self.assertAlmostEqual(expected, actual_probs[hop], places=12)
+
+    def test_price_keeps_long_prefixes_and_only_uses_cheaper_graphs(self):
+        execution = np.array([0] + [9] * 9 + [12] * 3)
+        policy = TailRiskEpPolicy(5, execution, row_price=0.4)
+        ids = [12, 9]
+        self.assertEqual(policy.begin(ids), (12, 1))
+        for _ in range(16):
+            policy.record_acceptance(policy.epoch, ids, 12, [0, 5], [5, 5])
+        self.assertEqual(policy.begin(ids[::-1]), (8, 2))
+        self.assertEqual(policy.capacities, (5, 1))
+        # An unseen request stays full. Do not prune just to pad back to twelve.
+        self.assertEqual(policy.begin([9, 11]), (12, 3))
+        self.assertEqual(policy.capacities, (5, 5))
+        policy.record_acceptance(policy.epoch, [9, 11], 12, [5, 2], [5, 5])
+        self.assertEqual(policy.begin([9, 11]), (12, 3))
+        self.assertEqual(policy.capacities, (5, 5))
+
+    @staticmethod
+    def execution_rows(*buckets):
+        return [0] + [next(b for b in buckets if b >= n) for n in range(1, 85)]
+
+    def test_bucket_bid_fills_selected_graph_with_actual_prefixes(self):
+        execution = self.execution_rows(48, 56, 64, 72, 84)
+        ids = list(range(14))
+        for accepted, width in ((0, 56), (5, 64)):
+            with self.subTest(accepted=accepted):
+                policy = TailRiskEpPolicy(
+                    5, execution, row_price=0.345, bucket_bid_price=0.2
+                )
+                for _ in range(16):
+                    self.assertEqual(policy.begin(ids), (84, 1))
+                    policy.record_acceptance(policy.epoch, ids, 84, [accepted] * 14)
+                self.assertEqual(policy.begin(ids), (width, 2))
+                self.assertEqual(len(ids) + sum(policy.capacities), width)
+                self.assertTrue(all(1 <= cap <= 5 for cap in policy.capacities))
+                self.assertEqual(execution[width], width)
+                self.assertEqual(len(policy.margin_prior), 14)
+                for _ in range(18, 32):
+                    self.assertEqual(policy.begin(ids)[0], width)
+                self.assertEqual(policy.begin(ids), (84, 1))
+                self.assertIsNone(policy.margin_prior)
+
+    def test_bucket_bid_waits_for_new_request_history_and_keeps_ids_in_order(self):
+        policy = TailRiskEpPolicy(
+            5,
+            self.execution_rows(56, 64, 84),
+            row_price=0.345,
+            bucket_bid_price=0.2,
+        )
+        ids = list(range(14))
+        self.assertEqual(policy.begin(ids), (84, 1))
+        for _ in range(16):
+            policy.record_acceptance(policy.epoch, ids, 84, [0] * 7 + [5] * 7)
+        self.assertEqual(policy.begin(ids), (56, 2))
+        ordered = dict(zip(ids, policy.capacities))
+        self.assertGreater(ordered[13], ordered[0])
+        # Different request order is valid. Distinct probabilities keep the two
+        # groups separate while tied bids may distribute caps differently.
+        self.assertEqual(policy.begin(ids[::-1]), (56, 2))
+        self.assertGreater(policy.capacities[0], policy.capacities[-1])
+        stale = policy.epoch
+        changed = ids[1:] + [99]
+        self.assertEqual(policy.begin(changed), (84, 1))
+        for _ in range(16):
+            policy.record_acceptance(stale, changed, 84, [0] * 14)
+        self.assertEqual(policy.begin(changed), (84, 1))
+        self.assertIsNone(policy.margin_prior)
+
+    def test_bucket_bid_falls_back_to_existing_price_without_matching_graphs(self):
+        for buckets, batch in (
+            ((48, 64, 72, 84), 14),
+            ((48, 56, 72, 84), 14),
+            ((48, 56, 64, 72, 80, 84), 13),
+        ):
+            with self.subTest(buckets=buckets, batch=batch):
+                execution = self.execution_rows(*buckets)
+                plain = TailRiskEpPolicy(5, execution, row_price=0.345)
+                opted_in = TailRiskEpPolicy(
+                    5, execution, row_price=0.345, bucket_bid_price=0.2
+                )
+                ids = list(range(batch))
+                dense = batch * 6
+                for _ in range(17):
+                    self.assertEqual(opted_in.begin(ids), plain.begin(ids))
+                    self.assertEqual(opted_in.capacities, plain.capacities)
+                    self.assertEqual(opted_in.margin_prior, plain.margin_prior)
+                    for policy in (plain, opted_in):
+                        policy.record_acceptance(policy.epoch, ids, dense, [0] * batch)
+
+    def test_bucket_bid_requires_valid_row_price(self):
+        execution = self.execution_rows(56, 64, 84)
+        for bid in (0, 1, float("nan"), float("inf")):
+            with (
+                self.subTest(bid=bid),
+                self.assertRaisesRegex(ValueError, "bucket bid"),
+            ):
+                TailRiskEpPolicy(5, execution, row_price=0.345, bucket_bid_price=bid)
+        with self.assertRaisesRegex(ValueError, "bucket bid"):
+            TailRiskEpPolicy(5, execution, bucket_bid_price=0.2)
+
+    def test_bucket_row_quota_charges_dense_references_after_initial_history(self):
+        ids = list(range(14))
+        execution = self.execution_rows(48, 56, 64, 72, 84)
+        policy = TailRiskEpPolicy(
+            5, execution, row_price=0.345, bucket_row_quota=49.125
+        )
+        for _ in range(16):
+            self.assertEqual(policy.begin(ids), (84, 1))
+            self.assertIsNone(policy._bucket_row_debt)
+            policy.record_acceptance(policy.epoch, ids, 84, [0] * 14)
+        completed = 0
+        for phase in range(17, 66):
+            rows, mode = policy.begin(ids)
+            self.assertEqual(rows, len(ids) + sum(policy.capacities))
+            self.assertEqual(execution[rows], rows)
+            self.assertTrue(all(1 <= cap <= 5 for cap in policy.capacities))
+            completed += rows
+            self.assertEqual(policy._bucket_row_debt, completed - (phase - 16) * 49.125)
+            if phase % 32 == 0:
+                self.assertEqual((rows, mode), (84, 1))
+                self.assertIsNone(policy.margin_prior)
+            else:
+                self.assertIn(rows, (48, 56, 64, 72))
+                self.assertEqual(mode, 2)
+                self.assertIsNotNone(policy.margin_prior)
+            policy.record_acceptance(
+                policy.epoch, ids, rows, [0] * 14, policy.capacities
+            )
+        changed_ids = ids[1:] + [99]
+        self.assertEqual(policy.begin(changed_ids), (84, 1))
+        self.assertIsNone(policy._bucket_row_debt)
+
+    def test_bucket_row_quota_falls_back_if_exact_paid_shape_is_missing(self):
+        execution = self.execution_rows(48, 56, 64, 76, 84)
+        ids = list(range(14))
+        plain = TailRiskEpPolicy(5, execution, row_price=0.345)
+        quota = TailRiskEpPolicy(5, execution, row_price=0.345, bucket_row_quota=67.625)
+        for _ in range(17):
+            self.assertEqual(quota.begin(ids), plain.begin(ids))
+            self.assertEqual(quota.capacities, plain.capacities)
+            for policy in (plain, quota):
+                policy.record_acceptance(policy.epoch, ids, 84, [0] * 14)
+        self.assertIsNone(quota._bucket_row_debt)
+
+    def test_bucket_row_quota_requires_valid_price_mode_and_feasible_rows(self):
+        execution = self.execution_rows(48, 56, 64, 72, 84)
+        for options in (
+            {"bucket_row_quota": 67.625},
+            {"row_price": 0.345, "bucket_row_quota": 67.625, "bucket_bid_price": 0.2},
+            {"row_price": 0.345, "bucket_row_quota": 48},
+            {"row_price": 0.345, "bucket_row_quota": 73},
+            {"row_price": 0.345, "bucket_row_quota": float("nan")},
+        ):
+            with (
+                self.subTest(options=options),
+                self.assertRaisesRegex(ValueError, "bucket row quota"),
+            ):
+                TailRiskEpPolicy(5, execution, **options)
+
+
+class TailRiskHostPlanTest(unittest.TestCase):
+    def setup_session(self, *, tail_risk=True):
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "RTP_LLM_ADAPTIVE_EP_TAIL_RISK": str(int(tail_risk)),
+                    "RTP_LLM_ADAPTIVE_EP_TAIL_RISK_NEAR_FULL": "1",
+                    "RTP_LLM_ADAPTIVE_EP_CURRENT_SCORES": "0",
+                    "RTP_LLM_ADAPTIVE_VERIFY_CAP": "-1",
+                },
+            ),
+            patch.object(torch.cuda, "Stream"),
+        ):
+            session = AdaptiveVerificationSession(
+                14,
+                5,
+                "cpu",
+                [1, 14, 82, 84],
+                ep_size=4,
+                allow_ep_current_scores=True,
+            )
+        indices = patch.object(
+            session.controller,
+            "_device_indices",
+            side_effect=lambda values, dtype=torch.int64: torch.tensor(
+                list(values), dtype=dtype
+            ),
+        )
+        indices.start()
+        self.addCleanup(indices.stop)
+        return session
+
+    def test_early_commit_keeps_caps_order_and_feedback(self):
+        old, new = self.setup_session(), self.setup_session()
+        count_narrow = 0
+        with patch.object(torch.cuda, "Event"):
+            for index in range(45):
+                ids = list(range(14))
+                if index % 2:
+                    ids.reverse()
+                accepted = torch.tensor([0 if i < 2 else 5 for i in ids])
+                old.begin(ids)
+                expected = old.plan()
+                plan, _, realloc, scores, _, committed, margin = new.begin_for_executor(
+                    ids
+                )
+                self.assertFalse(margin)
+                self.assertTrue(committed)
+                self.assertFalse(realloc or scores)
+                self.assertEqual(expected[2], plan[2])
+                self.assertTrue(torch.equal(expected[0], plan[0]))
+                self.assertTrue(torch.equal(expected[1], plan[1]))
+                count_narrow += plan[2] == 82
+                for session in (old, new):
+                    # Exercise commit/observe and inject already-completed
+                    # feedback on CPU. Event ordering is covered separately.
+                    session.events = None
+                    if session is old:
+                        session.observe(accepted, [False] * 14)
+                    else:
+                        session.observe_emitted_tokens(accepted + 1, [False] * 14)
+                    session._ep_policy.record_acceptance(
+                        session._ep_policy.epoch,
+                        ids,
+                        plan[2],
+                        accepted.tolist(),
+                        plan[0].tolist(),
+                    )
+        self.assertGreater(count_narrow, 0)
+        self.assertLessEqual(len(new.controller._explicit_host_plans), 3)
+
+    def test_current_prediction_policy_still_commits_at_plan(self):
+        session = self.setup_session(tail_risk=False)
+        with patch.object(torch.cuda, "Event"):
+            plan, _, _, _, _, committed, margin = session.begin_for_executor(
+                list(range(14))
+            )
+            self.assertFalse(margin)
+            self.assertFalse(committed)
+            self.assertIsNone(session.controller._pending)
+            self.assertIs(session.plan()[0], plan[0])
+            self.assertIsNotNone(session.controller._pending)
+
+    def test_unfinished_early_plan_is_discarded(self):
+        session = self.setup_session()
+        with patch.object(torch.cuda, "Event"), patch("logging.warning") as warning:
+            session.begin_for_executor(list(range(14)))
+            session.begin_for_executor(list(range(1, 15)))
+        warning.assert_called_once()
+        self.assertEqual(session.controller._pending.request_ids, tuple(range(1, 15)))
+
+    def test_bucket_bid_env_uses_completed_history_and_preserves_draft_rerank(self):
+        env = {
+            "RTP_LLM_ADAPTIVE_EP_TAIL_RISK": "1",
+            "RTP_LLM_ADAPTIVE_EP_TAIL_RISK_NEAR_FULL": "0",
+            "RTP_LLM_ADAPTIVE_EP_ROW_PRICE": "0.345",
+            "RTP_LLM_ADAPTIVE_EP_ROW_PRICE_PRIOR": "0.7,0.8,0.9,0.9,0.9",
+            "RTP_LLM_ADAPTIVE_EP_BUCKET_BID_PRICE": "0.2",
+            "RTP_LLM_ADAPTIVE_EP_MARGIN_RERANK": "1",
+            "RTP_LLM_ADAPTIVE_VERIFY_CAP": "-1",
+        }
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch.object(torch.cuda, "Stream"),
+        ):
+            session = AdaptiveVerificationSession(
+                14,
+                5,
+                "cpu",
+                [1, 14, 48, 56, 64, 72, 84],
+                ep_size=4,
+                allow_ep_current_scores=True,
+            )
+        self.assertTrue(session._ep_margin_rerank)
+        policy = session._ep_policy
+        ids = list(range(14))
+        self.assertEqual(policy.begin(ids), (84, 1))
+        for _ in range(16):
+            policy.record_acceptance(policy.epoch, ids, 84, [0] * 14)
+        self.assertEqual(policy.begin(ids), (56, 2))
+        self.assertIsNotNone(policy.margin_prior)
+
+    def test_bucket_row_quota_env_uses_actual_distributed_rank(self):
+        env = {
+            "RTP_LLM_ADAPTIVE_EP_TAIL_RISK": "1",
+            "RTP_LLM_ADAPTIVE_EP_ROW_PRICE": "0.345",
+            "RTP_LLM_ADAPTIVE_EP_BUCKET_ROW_QUOTAS": "67.625,67.625,49.125,67.625",
+            "RTP_LLM_ADAPTIVE_EP_MARGIN_RERANK": "1",
+            "WORLD_RANK": "0",  # Launcher metadata is not the source of rank.
+        }
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch.object(torch.cuda, "Stream"),
+            patch.object(torch.distributed, "is_initialized", return_value=True),
+            patch.object(torch.distributed, "get_world_size", return_value=4),
+            patch.object(torch.distributed, "get_rank", return_value=2),
+        ):
+            session = AdaptiveVerificationSession(
+                14,
+                5,
+                "cpu",
+                [1, 14, 48, 56, 64, 72, 84],
+                ep_size=4,
+                allow_ep_current_scores=True,
+            )
+            self.assertEqual(session._ep_policy._bucket_row_quota, 49.125)
+            self.assertTrue(session._ep_margin_rerank)
+            for bad in ("49,67,68,68", "67.625,49.125", "63,63,63,62", "nan,63,63,126"):
+                with (
+                    self.subTest(bad=bad),
+                    patch.dict(
+                        os.environ, {"RTP_LLM_ADAPTIVE_EP_BUCKET_ROW_QUOTAS": bad}
+                    ),
+                    self.assertRaisesRegex(ValueError, "four feasible EP row quotas"),
+                ):
+                    AdaptiveVerificationSession(
+                        14,
+                        5,
+                        "cpu",
+                        [1, 14, 48, 56, 64, 72, 84],
+                        ep_size=4,
+                        allow_ep_current_scores=True,
+                    )
+
+    def test_bucket_row_quota_requires_the_four_rank_group(self):
+        env = {
+            "RTP_LLM_ADAPTIVE_EP_TAIL_RISK": "1",
+            "RTP_LLM_ADAPTIVE_EP_ROW_PRICE": "0.345",
+            "RTP_LLM_ADAPTIVE_EP_BUCKET_ROW_QUOTAS": "49.125,67.625,67.625,67.625",
+        }
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch.object(torch.cuda, "Stream"),
+            patch.object(torch.distributed, "is_initialized", return_value=True),
+            patch.object(torch.distributed, "get_world_size", return_value=8),
+        ):
+            with self.assertRaisesRegex(ValueError, "four-rank TP1 EP group"):
+                AdaptiveVerificationSession(
+                    14,
+                    5,
+                    "cpu",
+                    [1, 14, 48, 56, 64, 72, 84],
+                    ep_size=4,
+                    allow_ep_current_scores=True,
+                )
+            # Fixed verify caps still bypass experimental EP configuration.
+            with patch.dict(os.environ, {"RTP_LLM_ADAPTIVE_VERIFY_CAP": "5"}):
+                session = AdaptiveVerificationSession(
+                    14,
+                    5,
+                    "cpu",
+                    [1, 14, 48, 56, 64, 72, 84],
+                    ep_size=4,
+                    allow_ep_current_scores=True,
+                )
+            self.assertIsNone(session._ep_policy)
+
+    def test_four_gap_flag_selects_model_without_changing_host_paid_shape(self):
+        common = {
+            "RTP_LLM_ADAPTIVE_EP_TAIL_RISK": "1",
+            "RTP_LLM_ADAPTIVE_EP_ROW_PRICE": "0.345",
+            "RTP_LLM_ADAPTIVE_EP_MARGIN_RERANK": "1",
+        }
+        for env, use_four in (
+            (common, False),
+            ({**common, "RTP_LLM_ADAPTIVE_EP_MARGIN_FOUR_GAPS": "1"}, True),
+            (
+                {
+                    **common,
+                    "RTP_LLM_ADAPTIVE_EP_MARGIN_FOUR_GAPS": "1",
+                    "RTP_LLM_ADAPTIVE_EP_MARGIN_RERANK": "0",
+                },
+                False,
+            ),
+        ):
+            with (
+                self.subTest(env=env),
+                patch.dict(os.environ, env, clear=True),
+                patch.object(torch.cuda, "Stream"),
+            ):
+                session = AdaptiveVerificationSession(
+                    14,
+                    5,
+                    "cpu",
+                    [1, 14, 48, 56, 64, 72, 84],
+                    ep_size=4,
+                    allow_ep_current_scores=True,
+                )
+                self.assertEqual(session._ep_margin_four_gaps, use_four)
+                if not session._ep_margin_rerank:
+                    continue
+                ids = list(range(14))
+                session.ids = ids
+                previous_caps = torch.tensor([3] * 14, dtype=torch.int32)
+                previous_rows = torch.arange(56)
+                session._prepared = previous_caps, previous_rows, 56
+                session.total = 56
+                session._calibration = False
+                session._ep_margin_prior = torch.full((14, 5), 0.5)
+                gaps = torch.rand(4, 14)
+                with (
+                    patch.object(session.controller, "commit_prepared") as commit,
+                    patch(
+                        "rtp_llm.models_py.sampling.adaptive_session.pack_ep_margin_rows",
+                        return_value=(previous_caps, previous_rows),
+                    ) as pack,
+                ):
+                    caps, rows, total = session.plan(gaps)
+                pack.assert_called_once_with(
+                    gaps,
+                    session._ep_margin_prior,
+                    previous_caps,
+                    56,
+                    four_gaps=use_four,
+                )
+                commit.assert_called_once_with(ids, previous_caps)
+                self.assertIs(caps, previous_caps)
+                self.assertIs(rows, previous_rows)
+                self.assertEqual(total, 56)
+
+    def test_host_bonus_conversion_waits_for_feedback_event(self):
+        session = self.setup_session()
+        policy = Mock()
+        session._ep_policy = policy
+        events = [None, Mock()]
+        events[1].query.side_effect = [False, True]
+        planned = np.array([3, 5], dtype=np.int32)
+        host = torch.tensor([[4, 2], [3, 5]])
+        session._ep_pending = [(1, (10, 20), 10, events, 0.0, host, planned, False, 1)]
+        session._collect_ep_samples()
+        policy.record_acceptance.assert_not_called()
+        session._collect_ep_samples()
+        np.testing.assert_array_equal(
+            policy.record_acceptance.call_args.args[3], [3, 1]
+        )
+        np.testing.assert_array_equal(
+            policy.record_acceptance.call_args.args[4], [3, 5]
+        )
+        self.assertEqual(host[0].tolist(), [4, 2])
 
 
 class AdaptiveControllerTest(unittest.TestCase):
@@ -1092,6 +1787,116 @@ class AdaptiveControllerTest(unittest.TestCase):
 
         self.assertEqual((caps.tolist(), rows.tolist(), total), ([0], [0], 1))
         torch.testing.assert_close(controller.estimator.counts.cpu(), torch.zeros(3))
+
+
+class EpTailRowsTest(unittest.TestCase):
+    def make_policy(self, upper_bucket: int) -> _MeasuredEpPolicy:
+        execution = np.arange(85)
+        buckets = np.asarray([1, 14, 56, 72, 76, upper_bucket, 84])
+        execution[1:] = buckets[np.searchsorted(buckets, execution[1:])]
+        return _MeasuredEpPolicy(5, execution, grouped_tail_cut=True)
+
+    def test_nearest_smaller_physical_bucket(self) -> None:
+        for upper_bucket in (80, 81):
+            with self.subTest(upper_bucket=upper_bucket):
+                policy = self.make_policy(upper_bucket)
+                policy.begin(list(range(14)))
+                self.assertEqual(policy.candidates, [80])
+                self.assertEqual(policy.execution_rows[80], upper_bucket)
+
+    def test_cost_comparison_excludes_unwarmed_shapes(self) -> None:
+        policy = self.make_policy(81)
+        ids = list(range(14))
+        accepted = np.full(14, 3)
+        dense_costs = [230.0, 68.0, 38.0, 38.0, 38.0]
+        partial_costs = [205.0, 63.0, 36.0, 36.0, 36.0]
+        for rows, costs in ((84, dense_costs), (80, partial_costs)):
+            for ms in costs:
+                self.assertEqual(policy.begin(ids), (rows, 1))
+                policy.record(policy.epoch, tuple(ids), rows, ms, accepted)
+        self.assertEqual(policy.begin(ids), (80, 2))
+        self.assertEqual([ms for ms, _ in policy.samples[84]], dense_costs[-3:])
+        self.assertEqual([ms for ms, _ in policy.samples[80]], partial_costs[-3:])
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_effective_caps_are_checked_against_current_device_plan(self) -> None:
+        ids = list(range(14))
+        with patch.dict(
+            os.environ,
+            {
+                "RTP_LLM_ADAPTIVE_EP_CURRENT_SCORES": "1",
+                "RTP_LLM_ADAPTIVE_VERIFY_CAP": "-1",
+            },
+        ):
+            session = AdaptiveVerificationSession(
+                14, 5, "cuda", [1, 56, 72, 76, 81, 84], 4, allow_ep_current_scores=True
+            )
+            unsupported = AdaptiveVerificationSession(
+                14, 5, "cuda", [1, 56, 72, 76, 81, 84], 4
+            )
+        self.assertFalse(unsupported._ep_current_scores)
+        cuda_i32 = {"dtype": torch.int32, "device": "cuda"}
+        # Requests 12 and 13 are weakest in the old cohort history.
+        historical = torch.tensor([5] * 12 + [0, 0], **cuda_i32)
+        for _ in range(5):
+            session.begin(ids)
+            self.assertEqual(session.plan()[2], 84)
+            session.observe(historical, [False] * 14)
+            session.finish(38.0)
+            torch.cuda.synchronize()
+
+        session.begin(ids)
+        historical_caps, _, total = session.prepared_plan()
+        self.assertEqual(total, 80)
+        self.assertEqual(historical_caps.tolist(), [5] * 12 + [3, 3])
+        scores = (torch.arange(14, device="cuda", dtype=torch.float32) / 14).repeat(
+            4, 1
+        )
+        current_caps, _, total = session.plan(scores)
+        self.assertEqual(total, 80)
+        self.assertEqual(current_caps.tolist(), [3, 3] + [5] * 12)
+        effective = torch.tensor([2, 3] + [5] * 12, **cuda_i32)
+        session.observe(effective, [False] * 14, effective)
+        session.finish(36.0)
+        torch.cuda.synchronize()
+        with patch.object(
+            session._ep_policy, "record", wraps=session._ep_policy.record
+        ) as record:
+            session._collect_ep_samples()
+            self.assertEqual(record.call_count, 1)
+            np.testing.assert_array_equal(record.call_args.args[-1], [2, 3] + [5] * 12)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_grouped_caps_and_stable_rows(self) -> None:
+        scores = (torch.arange(14, dtype=torch.float32, device="cuda") / 14).repeat(
+            4, 1
+        )
+        fallback = torch.tensor([5] * 12 + [3] * 2, dtype=torch.int32, device="cuda")
+        capacities, rows = pack_ep_tail_rows(scores, fallback, 80)
+        expected = [3, 3] + [5] * 12
+        self.assertEqual(capacities.tolist(), expected)
+        self.assertEqual(
+            rows.tolist(),
+            [6 * i + j for i, cap in enumerate(expected) for j in range(cap + 1)],
+        )
+        self.assertEqual(fallback.tolist(), [5] * 12 + [3] * 2)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_odd_cut_and_invalid_score_fallback(self) -> None:
+        scores = torch.full((4, 14), float("nan"), device="cuda")
+        fallback = torch.tensor([5] * 12 + [3, 4], dtype=torch.int32, device="cuda")
+        scores[:, 1] = 0.1
+        capacities, rows = pack_ep_tail_rows(scores, fallback, 81)
+        self.assertEqual(capacities.tolist(), fallback.tolist())
+        self.assertEqual(len(rows), 81)
+        scores[:, 2] = 0.1
+        capacities, rows = pack_ep_tail_rows(scores, fallback, 81)
+        expected = [5, 3, 4] + [5] * 11
+        self.assertEqual(capacities.tolist(), expected)
+        self.assertEqual(
+            rows.tolist(),
+            [6 * i + j for i, cap in enumerate(expected) for j in range(cap + 1)],
+        )
 
 
 if __name__ == "__main__":

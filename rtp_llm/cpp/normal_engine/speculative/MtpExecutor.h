@@ -169,7 +169,9 @@ protected:
                           const StreamGroups&         stream_groups,
                           std::vector<torch::Tensor>& draft_probs_list,
                           torch::Tensor&              draft_token_ids_t,
-                          int64_t&                    model_forward_us);
+                          int64_t&                    model_forward_us,
+                          const torch::Tensor&        draft_probabilities_for_plan,
+                          bool                        use_margin_for_plan);
 
     bool useDeviceInput() const;
     bool checkDeviceInput() const;
@@ -255,13 +257,15 @@ private:
     size_t                                                                                     vocab_size_;
 
     // for mtp
-    DataType                    data_type_;
-    size_t                      hidden_size_;
-    size_t                      propose_step_;
-    size_t                      draft_vocab_size_;
-    bool                        adaptive_verification_ = false;
-    bool                        glm5_target_           = false;
-    std::shared_ptr<py::object> adaptive_session_;
+    DataType                                   data_type_;
+    size_t                                     hidden_size_;
+    size_t                                     propose_step_;
+    size_t                                     draft_vocab_size_;
+    bool                                       adaptive_verification_       = false;
+    bool                                       adaptive_prediction_enabled_ = false;
+    bool                                       glm5_target_                 = false;
+    std::shared_ptr<py::object>                adaptive_session_;
+    std::vector<std::weak_ptr<GenerateStream>> adaptive_dense_fallback_streams_;
     std::map<std::weak_ptr<GenerateStream>, int64_t, std::owner_less<std::weak_ptr<GenerateStream>>>
                                                      adaptive_request_ids_;
     int64_t                                          adaptive_next_request_id_  = 0;

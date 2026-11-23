@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cmath>
 #include <memory>
 #include <limits>
 #include <chrono>
@@ -578,6 +579,41 @@ TEST_F(MtpExecutorTest, testDraftRawLogitsOptimizationIsOptIn) {
     EXPECT_EQ(optimized.forward(logits).token_ids.item<int64_t>(), 1);
 }
 
+TEST_F(MtpExecutorTest, testOptionalDraftTopTwoMarginKeepsGreedyProposal) {
+#if USING_CUDA
+    autil::EnvGuard fuse("RTP_LLM_MTP_OPTIMIZE", "1");
+    const auto      options = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32);
+    auto            mapping = torch::arange(4097, options.dtype(torch::kInt64)).flip({0});
+    auto            logits  = torch::full({4, 4097}, -120.0f, options);
+    logits[0][3].fill_(2.0f);
+    logits[0][4096].fill_(1.0f);
+    logits[1][2047].fill_(3.0f);
+    logits[1][2048].fill_(3.0f);
+    logits[2][4096].fill_(100.0f);
+    logits[3][130].fill_(std::numeric_limits<float>::quiet_NaN());
+    spec::FastTopKSampler       sampler(mapping, /*compact_point_mass=*/true);
+    const auto                  original = sampler.forward(logits);
+    spec::MtpDraftSampleContext context;
+    context.selected_logit_margin = torch::full({4}, std::numeric_limits<float>::quiet_NaN(), options);
+    const auto actual             = sampler.forward(logits, 1, &context);
+    ASSERT_TRUE(actual.token_ids_int32.defined());
+    EXPECT_TRUE(torch::equal(actual.token_ids, original.token_ids));
+    EXPECT_TRUE(torch::equal(actual.token_ids_int32, original.token_ids_int32));
+    EXPECT_FALSE(actual.all_probs.defined());
+    const auto gaps = context.selected_logit_margin.cpu();
+    EXPECT_NEAR(gaps[0].item<float>(), 1.0f, 1.0e-6f);
+    EXPECT_EQ(gaps[1].item<float>(), 0.0f);
+    EXPECT_EQ(gaps[2].item<float>(), 32.0f);
+    EXPECT_TRUE(std::isnan(gaps[3].item<float>()));
+
+    context.selected_logit_margin.fill_(std::numeric_limits<float>::quiet_NaN());
+    const auto bf16_logits = logits.to(torch::kBFloat16);
+    EXPECT_TRUE(
+        torch::equal(sampler.forward(bf16_logits, 1, &context).token_ids, sampler.forward(bf16_logits).token_ids));
+    EXPECT_TRUE(torch::isnan(context.selected_logit_margin).all().item<bool>());
+#endif
+}
+
 TEST_F(MtpExecutorTest, testDeterministicDraftSamplerReportsPointMassProposal) {
     auto identity_map = torch::arange(4, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
     spec::FastTopKSampler sampler(identity_map);
@@ -591,6 +627,24 @@ TEST_F(MtpExecutorTest, testDeterministicDraftSamplerReportsPointMassProposal) {
 }
 
 #if USING_CUDA
+TEST_F(MtpExecutorTest, testGreedyConfidencePreservesProposal) {
+#if USING_CUDA
+    const auto options = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32);
+    auto       logits  = torch::randn({14, 4099}, options);
+    // Tied maxima must keep the original lowest-ID choice.
+    logits[0].zero_();
+    spec::FastTopKSampler       sampler(torch::Tensor(), true);
+    auto                        baseline = sampler.forward(logits);
+    spec::MtpDraftSampleContext context;
+    context.selected_probability = torch::full({14}, -1.0, options);
+    auto observed                = sampler.forward(logits, 1, &context);
+    auto expected                = std::get<0>(torch::max(torch::softmax(logits, -1), -1, false));
+    EXPECT_TRUE(torch::equal(observed.token_ids, baseline.token_ids));
+    EXPECT_TRUE(torch::equal(context.selected_probability, expected));
+    EXPECT_FALSE(observed.all_probs.defined());
+#endif
+}
+
 TEST_F(MtpExecutorTest, testRejectionSamplingOverwritesPoisonedOutputs) {
     const auto i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
     const auto f32 = i32.dtype(torch::kFloat32);
@@ -1332,6 +1386,38 @@ TEST_F(MtpExecutorTest, testVerificationMetricsStayAlignedAcrossBatches) {
     EXPECT_FALSE(executor.metrics_verification_caps_cpu_.defined());
     EXPECT_FALSE(executor.consumePendingAcceptLenMetrics().valid);
 }
+
+#if USING_CUDA
+TEST_F(MtpExecutorTest, testAdaptiveRestoreMatchesDenseZerosAndIndexCopy) {
+    const auto cuda_options = torch::TensorOptions().device(torch::kCUDA);
+    const auto stream       = cuda_graph::graphGetCurrentStream().stream();
+    for (const auto& removed : {std::vector<int>{4, 5}, std::vector<int>{29, 83}, std::vector<int>{5, 77, 83}}) {
+        std::vector<int64_t> retained;
+        for (int i = 0; i < 84; ++i) {
+            if (std::find(removed.begin(), removed.end(), i) == removed.end()) {
+                retained.push_back(i);
+            }
+        }
+        const auto rows = torch::tensor(retained, cuda_options.dtype(torch::kInt64));
+        for (const auto dtype : {torch::kBFloat16, torch::kFloat32}) {
+            const auto cols    = dtype == torch::kFloat32 ? 154880 : 6144;
+            auto       compact = torch::randn({rows.numel(), cols}, cuda_options.dtype(dtype));
+            // Include signed zero and NaN; compare the underlying bytes.
+            compact[0][0]  = -0.0;
+            compact[0][1]  = std::numeric_limits<float>::quiet_NaN();
+            auto reference = torch::zeros({84, cols}, compact.options());
+            reference.index_copy_(0, rows, compact);
+            auto actual = tryMtpRestoreAdaptiveRows(compact, rows, 84, stream);
+            ASSERT_TRUE(actual.defined());
+            ASSERT_TRUE(torch::equal(reference.view(torch::kUInt8), actual.view(torch::kUInt8)));
+            auto strided = compact.slice(1, 0, cols, 2);
+            ASSERT_FALSE(tryMtpRestoreAdaptiveRows(strided, rows, 84, stream).defined());
+            auto odd_width = compact.slice(1, 0, cols - 1).contiguous();
+            ASSERT_FALSE(tryMtpRestoreAdaptiveRows(odd_width, rows, 84, stream).defined());
+        }
+    }
+}
+#endif
 
 TEST_F(MtpExecutorTest, testAdaptiveTargetPrepareUsesExactPackedMetadata) {
     if (!autil::EnvUtil::getEnv("RTP_LLM_MTP_ASYNC_PREPARE", false)) {

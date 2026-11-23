@@ -14,12 +14,150 @@ os.environ.setdefault(
 import torch
 
 from rtp_llm.models_py.modules.base.cuda.indexer_op import IndexerOp
-from rtp_llm.models_py.modules.base.cuda.paged_mqa import paged_mqa_context_lens
+from rtp_llm.models_py.modules.base.cuda.paged_mqa import (
+    adaptive_target_layout,
+    expand_adaptive_paged_mqa_table,
+    paged_mqa_context_lens,
+    refresh_paged_mqa_request_ids,
+    reuse_adaptive_paged_mqa_tables,
+)
 from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.flashmla_sparse_impl import (
     SparseMlaImpl,
     SparseMlaOp,
 )
-from rtp_llm.ops.compute_ops import rtp_llm_ops
+from rtp_llm.ops.compute_ops import PyAttentionInputs, rtp_llm_ops
+
+PAGE_TABLE_REUSE_ENV = {
+    "RTP_LLM_ADAPTIVE_VERIFICATION": "1",
+    "RTP_LLM_ADAPTIVE_INDEXER_REUSE_PAGE_TABLE": "1",
+}
+
+
+class PagedMqaLayoutTest(TestCase):
+    @patch.dict(os.environ, {"RTP_LLM_ADAPTIVE_VERIFICATION": "1"})
+    def test_adaptive_rescan_uses_mla_implementation_graph_context(self):
+        stock = object()
+        op = SimpleNamespace(
+            _paged_topk_op=stock, _adaptive_target_cluster_rescan=True, index_topk=2048
+        )
+        inputs = PyAttentionInputs()
+        inputs.is_target_verify = True
+        # MLA does not populate the Python attention-input graph attribute.
+        inputs.is_cuda_graph = False
+
+        def select(*, graph=True, rows=64, width=264704):
+            return IndexerOp._select_paged_topk(
+                op, inputs, rows, width, is_cuda_graph=graph
+            )
+
+        self.assertIs(select(rows=56), rtp_llm_ops.topk_v3_adaptive_cluster_rescan)
+        self.assertIs(select(), rtp_llm_ops.topk_v3_adaptive_cluster_rescan)
+        self.assertIs(select(graph=False), stock)
+        self.assertIs(select(rows=84), stock)
+        self.assertIs(select(width=65536), stock)
+        self.assertIs(select(width=524352), stock)
+        for field in ("uniform_target_verify_layout", "is_draft_extend"):
+            setattr(inputs, field, True)
+            self.assertIs(select(), stock)
+            setattr(inputs, field, False)
+        op._adaptive_target_cluster_rescan = False
+        self.assertIs(select(), stock)
+
+    def test_full_width_binding_keeps_uniform_layout_with_adaptive_enabled(self):
+        inputs = PyAttentionInputs()
+        inputs.is_target_verify = True
+        inputs.kv_cache_kernel_block_id_device = torch.zeros((14, 1), dtype=torch.int32)
+        params = SimpleNamespace(expanded_seq_lens=torch.arange(84, dtype=torch.int32))
+        with (
+            patch.dict(os.environ, {"RTP_LLM_ADAPTIVE_VERIFICATION": "1"}),
+            patch(
+                "rtp_llm.models_py.modules.base.cuda.paged_mqa._native_paged_mqa_enabled",
+                return_value=True,
+            ),
+        ):
+            self.assertFalse(inputs.uniform_target_verify_layout)
+            self.assertTrue(adaptive_target_layout(inputs))
+            self.assertEqual(paged_mqa_context_lens(inputs, params).shape, (84, 1))
+            inputs.uniform_target_verify_layout = True
+            self.assertFalse(adaptive_target_layout(inputs))
+            self.assertEqual(paged_mqa_context_lens(inputs, params).shape, (14, 6))
+            self.assertIsNone(
+                refresh_paged_mqa_request_ids(
+                    inputs, params, params.expanded_seq_lens, None, forbid_realloc=True
+                )
+            )
+
+    @patch.dict(os.environ, PAGE_TABLE_REUSE_ENV)
+    def test_page_table_reuse_respects_scoped_role_and_switch(self):
+        inputs = SimpleNamespace(is_target_verify=True)
+        table = torch.arange(12, dtype=torch.int32).view(3, 4)
+        ids = torch.tensor([0, 1, 1], dtype=torch.int32)
+        with reuse_adaptive_paged_mqa_tables(inputs):
+            cached = expand_adaptive_paged_mqa_table(table, ids)
+            self.assertIs(
+                expand_adaptive_paged_mqa_table(table.view_as(table), ids), cached
+            )
+            for disabled in (
+                SimpleNamespace(is_target_verify=False),
+                SimpleNamespace(
+                    is_target_verify=True, uniform_target_verify_layout=True
+                ),
+                SimpleNamespace(is_target_verify=True, is_draft_extend=True),
+            ):
+                with (
+                    self.subTest(inputs=disabled),
+                    reuse_adaptive_paged_mqa_tables(disabled),
+                ):
+                    self.assertIsNot(
+                        expand_adaptive_paged_mqa_table(table, ids), cached
+                    )
+            self.assertIs(expand_adaptive_paged_mqa_table(table, ids), cached)
+        with (
+            patch.dict(os.environ, {"RTP_LLM_ADAPTIVE_INDEXER_REUSE_PAGE_TABLE": "0"}),
+            reuse_adaptive_paged_mqa_tables(inputs),
+        ):
+            first = expand_adaptive_paged_mqa_table(table, ids)
+            self.assertIsNot(expand_adaptive_paged_mqa_table(table, ids), first)
+
+    @patch.dict(os.environ, PAGE_TABLE_REUSE_ENV)
+    def test_page_table_reuse_distinguishes_groups_views_and_row_maps(self):
+        inputs = SimpleNamespace(is_target_verify=True)
+        table_a = torch.arange(16, dtype=torch.int32).view(4, 4)
+        table_b = table_a + 100
+        ids_a = torch.tensor([0, 1, 1], dtype=torch.int32)
+        ids_b = torch.tensor([2, 1, 0], dtype=torch.int32)
+        with reuse_adaptive_paged_mqa_tables(inputs):
+            for table, ids in (
+                (table_a, ids_a),
+                (table_b, ids_a),
+                (table_a.T, ids_a),
+                (table_a, ids_b),
+            ):
+                with self.subTest(table=table, ids=ids):
+                    expanded = expand_adaptive_paged_mqa_table(table, ids)
+                    torch.testing.assert_close(
+                        expanded, table.index_select(0, ids.long())
+                    )
+                    self.assertIs(expand_adaptive_paged_mqa_table(table, ids), expanded)
+
+    @patch.dict(os.environ, PAGE_TABLE_REUSE_ENV)
+    def test_page_table_reuse_is_discarded_on_forward_exit_and_exception(self):
+        inputs = SimpleNamespace(is_target_verify=True)
+        table = torch.arange(12, dtype=torch.int32).view(3, 4)
+        ids = torch.tensor([0, 1, 1], dtype=torch.int32)
+        with self.assertRaisesRegex(RuntimeError, "test forward failure"):
+            with reuse_adaptive_paged_mqa_tables(inputs):
+                old = expand_adaptive_paged_mqa_table(table, ids)
+                raise RuntimeError("test forward failure")
+        table.add_(100)
+        ids.copy_(torch.tensor([2, 0, 1], dtype=torch.int32))
+        self.assertIsNot(expand_adaptive_paged_mqa_table(table, ids), old)
+        with reuse_adaptive_paged_mqa_tables(inputs):
+            current = expand_adaptive_paged_mqa_table(table, ids)
+            self.assertIsNot(current, old)
+            torch.testing.assert_close(current, table.index_select(0, ids.long()))
+        with reuse_adaptive_paged_mqa_tables(inputs):
+            self.assertIsNot(expand_adaptive_paged_mqa_table(table, ids), current)
 
 
 @skipUnless(
@@ -103,6 +241,41 @@ class PagedMqaTest(TestCase):
 
     def refresh(self, owner, inputs, forbid=False):
         SparseMlaImpl._refresh_paged_mqa_schedule_metadata(owner, inputs, forbid)
+
+    @patch.dict(os.environ, PAGE_TABLE_REUSE_ENV)
+    def test_page_table_reuse_replays_current_groups_and_mapping(self):
+        inputs = SimpleNamespace(is_target_verify=True)
+        table_a = torch.arange(16, dtype=torch.int32, device="cuda").view(4, 4)
+        table_b = table_a + 100
+        ids = torch.tensor([0, 1, 1], dtype=torch.int32, device="cuda")
+        side = torch.cuda.Stream()
+
+        def forward():
+            with reuse_adaptive_paged_mqa_tables(inputs):
+                result_a = expand_adaptive_paged_mqa_table(table_a, ids)
+                self.assertIs(expand_adaptive_paged_mqa_table(table_a, ids), result_a)
+                result_b = expand_adaptive_paged_mqa_table(table_b, ids)
+                main_stream = torch.cuda.current_stream()
+                side.wait_stream(main_stream)
+                with torch.cuda.stream(side):
+                    side_a = expand_adaptive_paged_mqa_table(table_a, ids)
+                    self.assertIsNot(side_a, result_a)
+                main_stream.wait_stream(side)
+                return result_a, result_b, side_a
+
+        forward()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            result_a, result_b, side_a = forward()
+        for i in range(1, 4):
+            table_a.copy_(table_a.roll(i, dims=1))
+            table_b.copy_(table_b.roll(i, dims=0))
+            ids.copy_((ids + i) % table_a.size(0))
+            graph.replay()
+            expected_a = table_a.index_select(0, ids.long())
+            torch.testing.assert_close(result_a, expected_a)
+            torch.testing.assert_close(side_a, expected_a)
+            torch.testing.assert_close(result_b, table_b.index_select(0, ids.long()))
 
     def test_native_and_flattened_wrapper(self):
         for batch, next_n, draft, heads in [
