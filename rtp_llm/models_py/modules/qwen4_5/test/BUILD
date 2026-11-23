@@ -34,3 +34,25 @@ py_test(
         "//rtp_llm/models_py:modules",
     ],
 )
+
+py_test(
+    name = "qwen4_5_pd_serving_test",
+    srcs = ["test_qwen4_5_pd_serving.py"],
+    main = "test_qwen4_5_pd_serving.py",
+    deps = [
+        "//rtp_llm/models/qwen4_5:qwen4_5",
+        "//rtp_llm/models_py:models",
+        "//rtp_llm/models_py:modules",
+    ],
+)
+
+py_test(
+    name = "qwen4_5_accuracy_bench",
+    srcs = ["bench_qwen4_5_accuracy.py"],
+    main = "bench_qwen4_5_accuracy.py",
+    deps = [
+        "//rtp_llm/models/qwen4_5:qwen4_5",
+        "//rtp_llm/models_py:models",
+        "//rtp_llm/models_py:modules",
+    ],
+)

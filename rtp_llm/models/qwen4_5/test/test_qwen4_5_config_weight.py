@@ -112,9 +112,10 @@ class TestQwen4_5ConfigWeightKVCache(unittest.TestCase):
             qcfg.modules_to_convert, ("ple.ple_embedding.ngram_embedding",)
         )
         self.assertEqual(len(qcfg.modules_to_not_convert), 826)
-        # Every BF16 excluded module must map to a BF16 .weight tensor in the checkpoint specs
+        # Every BF16 excluded module/parameter must map to a BF16 tensor in the checkpoint specs
+        # (bare nn.Parameter latent_* entries appear directly without a '.weight' suffix in real 1109 checkpoints)
         for mod_name in qcfg.modules_to_not_convert:
-            tensor_key = f"{mod_name}.weight"
+            tensor_key = mod_name if mod_name in self.specs else f"{mod_name}.weight"
             self.assertIn(tensor_key, self.specs)
             self.assertEqual(self.specs[tensor_key][0], "BF16")
 

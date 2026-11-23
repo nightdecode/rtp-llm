@@ -16,6 +16,7 @@ from rtp_llm.models_py.model_desc.qwen4_5 import (
     Qwen4_5ForCausalLM,
     Qwen4_5Model,
     Qwen4_5ProfileRecorder,
+    Qwen4_5RTPModel,
 )
 from rtp_llm.models_py.modules.qwen4_5.contracts import Qwen4_5ArchConfig
 
@@ -135,7 +136,7 @@ class TestQwen4_5E2E(unittest.TestCase):
     def test_01_registration_and_runtime_state_plan(self) -> None:
         # Verify factory registration strings & _py_model_class wiring
         qwen_cls = Qwen4_5.__new__(Qwen4_5)
-        self.assertIs(qwen_cls._py_model_class(), Qwen4_5Model)
+        self.assertIs(qwen_cls._py_model_class(), Qwen4_5RTPModel)
 
         model = Qwen4_5ForCausalLM(self.cfg, dtype=torch.bfloat16, device=self.device)
         # Verify architectural roles

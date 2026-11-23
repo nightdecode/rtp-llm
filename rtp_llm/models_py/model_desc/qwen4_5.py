@@ -28,6 +28,7 @@ import torch.nn as nn
 
 from rtp_llm.models_py.modules.qwen4_5.attention import Qwen4_5Attention
 from rtp_llm.models_py.modules.qwen4_5.contracts import (
+    GDNLayerState,
     Qwen4_5ArchConfig,
     Qwen4_5RuntimeState,
     SharedGDNInputs,
@@ -248,6 +249,7 @@ class Qwen4_5DecoderLayer(nn.Module):
         prev_latent: Optional[torch.Tensor],
         deferred: Optional[Tuple[torch.Tensor, torch.Tensor]],
         shared_gdn_by_source: Dict[int, SharedGDNInputs],
+        source_prefix_ssm: Optional[Dict[int, torch.Tensor]] = None,
         state: Optional[Qwen4_5RuntimeState] = None,
         positions: Optional[torch.Tensor] = None,
         seq_offset: Optional[int] = None,
@@ -326,6 +328,33 @@ class Qwen4_5DecoderLayer(nn.Module):
         # Step C: Attention core (GDN or Full Attention)
         if self.linear_attn is not None:
             gdn_state = state.gdn.get(lid) if state is not None else None
+            if (
+                self.is_source
+                and source_prefix_ssm is not None
+                and gdn_state is not None
+                and gdn_state.ssm_state is not None
+            ):
+                source_prefix_ssm[lid] = gdn_state.ssm_state.clone()
+            yoco_on = (
+                cfg.enable_yoco_decode
+                if enable_yoco_decode is None
+                else bool(enable_yoco_decode)
+            )
+            gdn_call_state = gdn_state
+            if (
+                self.is_consumer
+                and input_ids.shape[1] > 1
+                and yoco_on
+                and gdn_state is not None
+                and gdn_state.ssm_state is None
+                and source_prefix_ssm is not None
+                and self.source_layer_idx in source_prefix_ssm
+            ):
+                # Reuse pre-suffix source SSM transiently so chunked/suffix prefill preserves prefix context
+                gdn_call_state = GDNLayerState(
+                    conv_state=gdn_state.conv_state,
+                    ssm_state=source_prefix_ssm[self.source_layer_idx].clone(),  # type: ignore[index]
+                )
             shared_in = (
                 shared_gdn_by_source[self.source_layer_idx]
                 if (self.is_consumer and self.source_layer_idx is not None)
@@ -336,14 +365,14 @@ class Qwen4_5DecoderLayer(nn.Module):
                 with profiler.record(cat):
                     attn_out, published = self.linear_attn(
                         attn_in,
-                        state=gdn_state,
+                        state=gdn_call_state,
                         shared=shared_in,
                         enable_yoco_decode=enable_yoco_decode,
                     )
             else:
                 attn_out, published = self.linear_attn(
                     attn_in,
-                    state=gdn_state,
+                    state=gdn_call_state,
                     shared=shared_in,
                     enable_yoco_decode=enable_yoco_decode,
                 )
@@ -599,8 +628,9 @@ class Qwen4_5Model(nn.Module):
             for p_idx, (name, param) in enumerate(layer.named_parameters()):
                 g = _gen(base_seed + p_idx)
                 if name.endswith("A_log"):
-                    # Typical decay log-rate around -2..-0.5
+                    # Match BF16 storage precision of real 1109 checkpoint (cast to FP32 at runtime)
                     param.uniform_(-2.0, -0.5, generator=g)
+                    param.copy_(param.to(torch.bfloat16).float())
                 elif name.endswith("dt_bias"):
                     param.uniform_(-1.0, 0.5, generator=g)
                 elif "expert_bias" in name:
@@ -645,12 +675,12 @@ class Qwen4_5Model(nn.Module):
                 ple = layer.ple
                 total_shards = cfg.split_ngram_parts
                 if ple_shard_rows is None:
-                    shard_rows = (
-                        (ple.total_vocab_size + total_shards - 1) // total_shards
+                    align = math.lcm(
+                        max(1, int(cfg.make_ngram_vocab_size_divisible_by)),
+                        int(total_shards),
                     )
-                    div = cfg.make_ngram_vocab_size_divisible_by
-                    if div > 1:
-                        shard_rows = ((shard_rows + div - 1) // div) * div
+                    padded_rows = ((ple.total_vocab_size + align - 1) // align) * align
+                    shard_rows = padded_rows // total_shards
                 else:
                     shard_rows = int(ple_shard_rows)
 
@@ -768,6 +798,10 @@ class Qwen4_5Model(nn.Module):
         prev_latent: Optional[torch.Tensor] = None
         deferred: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         shared_gdn_by_source: Dict[int, SharedGDNInputs] = {}
+        past_len = state.seq_len if state is not None else 0
+        source_prefix_ssm: Optional[Dict[int, torch.Tensor]] = (
+            {} if (state is not None and seq_len > 1 and past_len > 0) else None
+        )
 
         for layer in self.layers:
             assert isinstance(layer, Qwen4_5DecoderLayer)
@@ -777,6 +811,7 @@ class Qwen4_5Model(nn.Module):
                 prev_latent=prev_latent,
                 deferred=deferred,
                 shared_gdn_by_source=shared_gdn_by_source,
+                source_prefix_ssm=source_prefix_ssm,
                 state=state,
                 positions=positions,
                 seq_offset=seq_offset,
@@ -914,5 +949,13 @@ __all__ = [
     "Qwen4_5DecoderLayer",
     "Qwen4_5ForCausalLM",
     "Qwen4_5Model",
+    "Qwen4_5PagedStateBridge",
     "Qwen4_5ProfileRecorder",
+    "Qwen4_5RTPModel",
 ]
+
+def __getattr__(name: str) -> Any:
+    if name in ("Qwen4_5RTPModel", "Qwen4_5PagedStateBridge"):
+        from rtp_llm.models_py.model_desc import qwen4_5_runtime
+        return getattr(qwen4_5_runtime, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

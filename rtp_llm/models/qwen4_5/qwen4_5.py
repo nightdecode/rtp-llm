@@ -69,9 +69,9 @@ class Qwen4_5(_BaseModel):
         return getattr(self, "model_config", None) is not None
 
     def _py_model_class(self) -> Any:
-        from rtp_llm.models_py.model_desc.qwen4_5 import Qwen4_5Model
+        from rtp_llm.models_py.model_desc.qwen4_5_runtime import Qwen4_5RTPModel
 
-        return Qwen4_5Model
+        return Qwen4_5RTPModel
 
     @classmethod
     def create_config(
@@ -155,6 +155,52 @@ class Qwen4_5(_BaseModel):
                 )
             except Exception:
                 pass
+
+    @classmethod
+    def _post_build_model_config(cls, model_config: Any) -> None:
+        """Finalize RTP-LLM runtime config, hybrid KV cache specs, and PD cache tags."""
+        arch_cfg = getattr(model_config, "qwen4_5_arch_config", None) or getattr(
+            model_config, "arch_config", None
+        )
+        if arch_cfg is None:
+            raw_cfg = getattr(model_config, "raw_config", None)
+            if isinstance(raw_cfg, Mapping):
+                arch_cfg = parse_qwen4_5_config_json(raw_cfg, strict=False)
+                model_config.qwen4_5_arch_config = arch_cfg
+        if arch_cfg is None:
+            return
+
+        attn = getattr(model_config, "attn_config", None)
+        if attn is not None:
+            if getattr(attn, "tokens_per_block", 0) in (0, None):
+                attn.tokens_per_block = 64
+            if getattr(attn, "kernel_tokens_per_block", 0) in (0, None):
+                attn.kernel_tokens_per_block = attn.tokens_per_block
+            attn.head_num = arch_cfg.num_attention_heads
+            attn.kv_head_num = arch_cfg.num_key_value_heads
+            attn.size_per_head = arch_cfg.head_dim
+
+        model_config.hc_mult = arch_cfg.hc_count
+        model_config.qwen4_5_kv_cache_plan = cls.build_kv_cache_plan(arch_cfg)
+        try:
+            from rtp_llm.ops import HybridAttentionType
+
+            if hasattr(model_config, "hybrid_attention_config"):
+                model_config.hybrid_attention_config.enable_hybrid_attention = True
+                model_config.hybrid_attention_config.hybrid_attention_types = [
+                    (
+                        HybridAttentionType.LINEAR
+                        if lt == "linear_attention"
+                        else HybridAttentionType.NONE
+                    )
+                    for lt in arch_cfg.layer_types
+                ]
+            model_config.kv_cache_spec_descs = build_qwen4_5_kv_cache_spec_descs(
+                model_config, arch_cfg
+            )
+        except Exception:
+            # Pure-Python environment without compiled rtp_llm.ops
+            pass
 
     @classmethod
     def build_kv_cache_plan(

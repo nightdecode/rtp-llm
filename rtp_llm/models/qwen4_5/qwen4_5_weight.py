@@ -644,28 +644,28 @@ def _build_layer_descriptors(
             [
                 Qwen4_5WeightDescriptor(
                     QWEN4_5_W.moe_latent_down_proj,
-                    f"{p}mlp.latent_down_proj.weight",
+                    f"{p}mlp.latent_down_proj",
                     "BF16",
                     (r_h, h),
                     layer_idx,
                 ),
                 Qwen4_5WeightDescriptor(
                     QWEN4_5_W.moe_latent_gate_proj,
-                    f"{p}mlp.latent_gate_proj.weight",
+                    f"{p}mlp.latent_gate_proj",
                     "BF16",
                     (r_h, h),
                     layer_idx,
                 ),
                 Qwen4_5WeightDescriptor(
                     QWEN4_5_W.moe_latent_up_proj,
-                    f"{p}mlp.latent_up_proj.weight",
+                    f"{p}mlp.latent_up_proj",
                     "BF16",
                     (h, r_h),
                     layer_idx,
                 ),
                 Qwen4_5WeightDescriptor(
                     QWEN4_5_W.moe_latent_scale_gate,
-                    f"{p}mlp.latent_scale_gate.weight",
+                    f"{p}mlp.latent_scale_gate",
                     "BF16",
                     (1, h),
                     layer_idx,

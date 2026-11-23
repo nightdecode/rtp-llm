@@ -6,6 +6,15 @@ from rtp_llm.models_py.modules.qwen4_5.activation import (
     situ_and_mul_triton,
 )
 from rtp_llm.models_py.modules.qwen4_5.attention import Qwen4_5Attention
+from rtp_llm.models_py.modules.qwen4_5.checkpoint_loader import (
+    Qwen2BPETokenizer,
+    SafetensorsShardReader,
+    arch_config_to_hf_dict,
+    bind_qwen4_5_model_weights,
+    load_qwen4_5_from_checkpoint,
+    save_qwen4_5_safetensors_checkpoint,
+    write_safetensors_file,
+)
 from rtp_llm.models_py.modules.qwen4_5.contracts import (
     FullAttnKVCache,
     GDNLayerState,
@@ -35,6 +44,13 @@ from rtp_llm.models_py.modules.qwen4_5.yoco import (
 )
 
 __all__ = [
+    "Qwen2BPETokenizer",
+    "SafetensorsShardReader",
+    "arch_config_to_hf_dict",
+    "bind_qwen4_5_model_weights",
+    "load_qwen4_5_from_checkpoint",
+    "save_qwen4_5_safetensors_checkpoint",
+    "write_safetensors_file",
     "FullAttnKVCache",
     "GDNLayerState",
     "GemmaRMSNorm",
