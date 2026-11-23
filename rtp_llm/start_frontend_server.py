@@ -21,7 +21,7 @@ from rtp_llm.utils.concurrency_controller import (
 from rtp_llm.utils.scr.template_utils import (
     ScrParticipantManifest,
     arrive_scr_template_barrier,
-    is_scr_template_phase_active,
+    template_phase_active,
 )
 
 setup_logging()
@@ -88,7 +88,7 @@ def start_frontend_server(
         app = FrontendApp(py_env_configs, separated_frontend)
 
         def on_prebind() -> None:
-            if not is_scr_template_phase_active():
+            if not template_phase_active():
                 return
             if scr_manifest is None:
                 # A template phase without a manifest means the launcher did

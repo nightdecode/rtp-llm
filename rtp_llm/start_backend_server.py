@@ -40,7 +40,7 @@ from rtp_llm.utils.scr.template_utils import (
     arrive_scr_template_barrier as arrive_scr_checkpoint_barrier,
 )
 from rtp_llm.utils.scr.template_utils import (
-    is_scr_template_phase_active,
+    template_phase_active,
     register_for_scr,
 )
 from rtp_llm.utils.signal_guard import ignore_sigpipe
@@ -88,7 +88,7 @@ def _register_scr_resources(backend_manager, py_env_configs):
     before-checkpoint registration hints to Epsilon.
     """
 
-    if not is_scr_template_phase_active() or backend_manager is None:
+    if not template_phase_active() or backend_manager is None:
         return None
 
     try:
@@ -117,7 +117,7 @@ def _register_scr_resources(backend_manager, py_env_configs):
 def _start_scr_rank_arrival(backend_manager, py_env_configs, scr_manifest=None):
     """Synchronously announce this CUDA rank's pre-service safe point."""
 
-    if not is_scr_template_phase_active() or backend_manager is None:
+    if not template_phase_active() or backend_manager is None:
         return None
     try:
         pc = py_env_configs.parallelism_config
@@ -162,7 +162,7 @@ def _start_scr_rank_arrival(backend_manager, py_env_configs, scr_manifest=None):
 def _start_scr_manager_arrival(scr_manifest):
     """Synchronously announce the manager's pre-service safe point."""
 
-    if scr_manifest is None or not is_scr_template_phase_active():
+    if scr_manifest is None or not template_phase_active():
         return None
     worker_id = scr_manifest.worker_id("backend_manager", "0")
     result = arrive_scr_checkpoint_barrier(

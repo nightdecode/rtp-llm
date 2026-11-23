@@ -202,7 +202,7 @@ class ScrTemplateUtilsTest(unittest.TestCase):
             with self.subTest(environment=environment), mock.patch.dict(
                 os.environ, environment, clear=True
             ):
-                self.assertEqual(scr.is_scr_template_phase_active(), expected)
+                self.assertEqual(scr.template_phase_active(), expected)
 
 
 if __name__ == "__main__":

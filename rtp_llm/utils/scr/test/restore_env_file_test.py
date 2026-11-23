@@ -70,7 +70,7 @@ class ScrRestoreEnvFileTest(unittest.TestCase):
             return 0
 
         with patch.object(
-            scr, "is_scr_template_phase_active", return_value=True
+            scr, "template_phase_active", return_value=True
         ), patch.object(
             scr, "get_template_lifecycle", return_value=lifecycle
         ), patch.object(
@@ -231,7 +231,7 @@ class ScrRestoreEnvFileTest(unittest.TestCase):
     def test_normal_startup_does_not_read_file(self):
         self.path.write_text("not-json", encoding="utf-8")
         with patch.object(
-            scr, "is_scr_template_phase_active", return_value=False
+            scr, "template_phase_active", return_value=False
         ), patch.object(
             scr, "arrive_scr_checkpoint_barrier", return_value=None
         ), patch.object(

@@ -19,6 +19,9 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger(__name__)
 RTPLLM_ENABLE_SCR_ENV = "RTPLLM_ENABLE_SCR"
 SCR_PHASE_ENV = "SCR_PHASE"
+SCR_PHASE_CHECKPOINT = "checkpoint"
+SCR_PHASE_RESTORE = "restore"
+SCR_PHASE_NORMAL = "normal"
 
 
 def is_scr_enabled() -> bool:
@@ -31,11 +34,16 @@ def is_scr_enabled() -> bool:
     }
 
 
+def current_phase() -> str:
+    """Return the normalized SCR phase supplied by the control plane."""
+    return os.environ.get(SCR_PHASE_ENV, "").strip().lower()
+
+
 def template_phase_active() -> bool:
     """Return whether the external controller selected a template phase."""
-    return is_scr_enabled() and os.environ.get(SCR_PHASE_ENV, "").strip().lower() in {
-        "checkpoint",
-        "restore",
+    return is_scr_enabled() and current_phase() in {
+        SCR_PHASE_CHECKPOINT,
+        SCR_PHASE_RESTORE,
     }
 
 

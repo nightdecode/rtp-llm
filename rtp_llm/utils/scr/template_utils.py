@@ -29,13 +29,15 @@ from typing import Mapping as TypingMapping
 
 from rtp_llm.utils.scr.lifecycle import (
     RTPLLM_ENABLE_SCR_ENV,
+    SCR_PHASE_CHECKPOINT,
     SCR_PHASE_ENV,
+    SCR_PHASE_NORMAL,
+    SCR_PHASE_RESTORE,
     CallbackHook,
+    current_phase,
     get_template_lifecycle,
     is_scr_enabled,
-)
-from rtp_llm.utils.scr.lifecycle import (
-    template_phase_active as is_scr_template_phase_active,
+    template_phase_active,
 )
 from rtp_llm.utils.scr.restore_context import RestoreContext
 from rtp_llm.utils.scr.runtime_fixup import fixup_runtime_after_restore
@@ -93,9 +95,6 @@ def register_server_config_template_hook(py_env_configs: Any) -> None:
 # ``RTPLLM_ENABLE_SCR`` is RTP-LLM's own participation switch.  ``SCR_ENABLE``
 # and ``SCR_PHASE`` are external control-plane inputs and are never derived or
 # mutated here. Checkpoint versus restore is chosen by the controller/platform.
-SCR_PHASE_CHECKPOINT = "checkpoint"
-SCR_PHASE_RESTORE = "restore"
-SCR_PHASE_NORMAL = "normal"
 
 
 def epsilon_backend_mode(epsilon: Any | None = None) -> str:
@@ -127,7 +126,7 @@ def _external_shim_phase_active() -> bool:
 
     mode = epsilon_backend_mode()
     if mode == "external-shim":
-        return is_scr_template_phase_active()
+        return template_phase_active()
     return True
 
 
@@ -731,14 +730,14 @@ def arrive_scr_template_barrier(
     # that is being captured.
     ignore_sigpipe("before template arrival")
 
-    if not is_scr_template_phase_active():
+    if not template_phase_active():
         return arrive_scr_checkpoint_barrier(
             worker_id=worker_id,
             worker_num=worker_num,
             fail_closed=fail_closed,
         )
 
-    phase = os.environ.get(SCR_PHASE_ENV, "").strip().lower()
+    phase = current_phase()
     lifecycle = get_template_lifecycle()
     lifecycle.prepare_for_template(phase)
     try:
@@ -771,15 +770,3 @@ def _reset_for_test() -> None:
     if hasattr(_scr_prepare_local, "skip_next"):
         del _scr_prepare_local.skip_next
 
-
-__all__ = [
-    "ScrParticipantManifest",
-    "arrive_scr_checkpoint_barrier",
-    "arrive_scr_template_barrier",
-    "build_scr_participant_manifest",
-    "epsilon_backend_mode",
-    "get_scr_barrier_return_time",
-    "is_scr_enabled",
-    "is_scr_template_phase_active",
-    "register_for_scr",
-]

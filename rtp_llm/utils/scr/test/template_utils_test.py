@@ -95,7 +95,7 @@ class ScrTemplateUtilsTest(unittest.TestCase):
             {scr.RTPLLM_ENABLE_SCR_ENV: "1", scr.SCR_PHASE_ENV: "checkpoint"},
             clear=True,
         ), mock.patch.object(
-            scr, "is_scr_template_phase_active", return_value=True
+            scr, "template_phase_active", return_value=True
         ), mock.patch.object(
             scr, "get_template_lifecycle", return_value=lifecycle
         ), mock.patch.object(

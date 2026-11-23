@@ -85,7 +85,7 @@ class ScrRuntimeFixupTest(unittest.TestCase):
             or {"RequestedIP": "192.0.2.20"},
         )
         with patch.dict(sys.modules, {"libth_transformer": native}), patch.object(
-            scr, "is_scr_template_phase_active", return_value=True
+            scr, "template_phase_active", return_value=True
         ), patch.object(
             scr, "get_template_lifecycle", return_value=lifecycle
         ), patch.object(
@@ -176,7 +176,7 @@ class ScrRuntimeFixupTest(unittest.TestCase):
         with patch.dict(sys.modules, {"libth_transformer": NS()}), patch.object(
             runtime, "current_pod_ip", return_value="192.0.2.20"
         ), patch.object(
-            scr, "is_scr_template_phase_active", return_value=True
+            scr, "template_phase_active", return_value=True
         ), patch.object(
             scr, "get_template_lifecycle", return_value=lifecycle
         ), patch.object(
@@ -195,7 +195,7 @@ class ScrRuntimeFixupTest(unittest.TestCase):
         lifecycle = self.lifecycle(events)
         self.mock_restore_reader(side_effect=ValueError("invalid restore data"))
         with patch.object(
-            scr, "is_scr_template_phase_active", return_value=True
+            scr, "template_phase_active", return_value=True
         ), patch.object(
             scr, "get_template_lifecycle", return_value=lifecycle
         ), patch.object(
@@ -236,7 +236,7 @@ class ScrRuntimeFixupTest(unittest.TestCase):
         provider = Mock(side_effect=AssertionError("unexpected read"))
         self.mock_restore_reader(provider)
         with patch.object(
-            scr, "is_scr_template_phase_active", return_value=False
+            scr, "template_phase_active", return_value=False
         ), patch.object(scr, "arrive_scr_checkpoint_barrier", return_value=None):
             scr.arrive_scr_template_barrier(worker_id=0, worker_num=1)
         provider.assert_not_called()
@@ -360,7 +360,7 @@ class ScrRuntimeFixupTest(unittest.TestCase):
                 ), patch.object(
                     runtime, "current_pod_ip", return_value="192.0.2.20"
                 ), patch.object(
-                    scr, "is_scr_template_phase_active", return_value=True
+                    scr, "template_phase_active", return_value=True
                 ), patch.object(
                     scr, "get_template_lifecycle", return_value=lifecycle
                 ), patch.object(

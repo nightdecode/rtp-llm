@@ -40,7 +40,7 @@ from rtp_llm.utils.scr.template_utils import (
 from rtp_llm.utils.scr.template_utils import (
     build_scr_participant_manifest,
     get_scr_barrier_return_time,
-    is_scr_template_phase_active,
+    template_phase_active,
 )
 from rtp_llm.utils.signal_guard import ignore_sigpipe
 from rtp_llm.utils.warmup import configure_warmup
@@ -88,7 +88,7 @@ def _build_scr_participant_manifest(
     # checkpoint/restore phase.
     role = py_env_configs.role_config.role_type
     # A standalone ViT Pod owns its own listeners and never enters Epsilon.
-    if role == RoleType.VIT or not is_scr_template_phase_active():
+    if role == RoleType.VIT or not template_phase_active():
         return None
 
     participants: list[tuple[str, object]] = [("start_server", "0")]
@@ -189,7 +189,7 @@ def start_backend_server_impl(
 
     # only for debug
     if py_env_configs.profiling_debug_logging_config.debug_load_server:
-        if is_scr_template_phase_active():
+        if template_phase_active():
             # The inline backend would join the quorum from the parent process,
             # which cannot also run _start_parent_scr_arrival: the rendezvous
             # never completes. Reject the combination instead of hanging.
@@ -825,7 +825,7 @@ def _start_parent_scr_arrival(
     controller has captured the complete process tree.
     """
 
-    if scr_manifest is None or not is_scr_template_phase_active():
+    if scr_manifest is None or not template_phase_active():
         return None
     worker_id = scr_manifest.worker_id("start_server", "0")
     result = arrive_scr_checkpoint_barrier(
@@ -916,7 +916,7 @@ def start_server(py_env_configs: PyEnvConfigs):
     py_env_configs.server_config.validate_port_layout(dash_sc_enabled=dash_sc_enabled)
 
     if (
-        is_scr_template_phase_active()
+        template_phase_active()
         and py_env_configs.role_config.role_type != RoleType.VIT
     ):
         # Children derive local rank from the launcher-resolved topology.
@@ -958,7 +958,7 @@ def start_server(py_env_configs: PyEnvConfigs):
         # All actual children now have stable identities.  The parent joins
         # the same Epsilon wait_mode=1 quorum; no local UDS/barrier is needed.
         _start_parent_scr_arrival(scr_manifest)
-        if scr_manifest is not None and is_scr_template_phase_active():
+        if scr_manifest is not None and template_phase_active():
             # Include runtime fixup/release, health checks and real warmup, but
             # not the checkpoint's saved startup or the time spent in storage.
             barrier_return_time = get_scr_barrier_return_time()
