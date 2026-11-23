@@ -189,6 +189,13 @@ def start_backend_server_impl(
 
     # only for debug
     if py_env_configs.profiling_debug_logging_config.debug_load_server:
+        if is_scr_template_phase_active():
+            # The inline backend would join the quorum from the parent process,
+            # which cannot also run _start_parent_scr_arrival: the rendezvous
+            # never completes. Reject the combination instead of hanging.
+            raise RuntimeError(
+                "--debug_load_server cannot run during an SCR template phase"
+            )
         start_backend_server(
             global_controller, py_env_configs, None, service_draining=service_draining, scr_manifest=scr_manifest
         )
