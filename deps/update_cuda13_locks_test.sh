@@ -24,10 +24,20 @@ arm=$($script arm --print-command)
 [[ "$arm" == *"aarch64-manylinux_2_28"* ]]
 [[ "$arm" == *"requirements_cuda13_arm.update"* ]]
 
-workspace=$(dirname "$(dirname "$script")")
-xgrammar=$(sed -n 's/^\(xgrammar==[^[:space:]]*\)$/\1/p' "$workspace/deps/requirements_base.txt")
+script_dir=$(cd "$(dirname "$script")" && pwd -P)
+xgrammar=$(sed -n 's/^\(xgrammar==[^[:space:]]*\)$/\1/p' "$script_dir/requirements_base.txt")
 [[ -n "$xgrammar" ]]
-for source in "$workspace/arch_config/arch_select.bzl" "$workspace/rtp_llm/BUILD"; do
+# Bazel passes runfiles-root-relative paths for the two main-workspace files
+# (see deps/BUILD), so the test also works when analyzed as @rtp_deps//:....
+if [[ $# -ge 2 ]]; then
+    arch_select="${TEST_SRCDIR:-}/$1"
+    rtp_llm_build="${TEST_SRCDIR:-}/$2"
+else
+    workspace=$(dirname "$script_dir")
+    arch_select="$workspace/arch_config/arch_select.bzl"
+    rtp_llm_build="$workspace/rtp_llm/BUILD"
+fi
+for source in "$arch_select" "$rtp_llm_build"; do
     wheel_pin=$(grep -oE 'xgrammar==[0-9.]+' "$source" | sort -u)
     if [[ "$wheel_pin" != "$xgrammar" ]]; then
         echo "$source: wheel pin $wheel_pin differs from CUDA13 runtime $xgrammar" >&2

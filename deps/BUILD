@@ -115,11 +115,19 @@ sh_binary(
 sh_test(
     name = "update_cuda13_locks_test",
     srcs = ["update_cuda13_locks_test.sh"],
+    # deps/BUILD is also the root BUILD of @rtp_deps, so bare // labels would
+    # resolve inside that repository and fail analysis there. Name the main
+    # workspace explicitly and hand the script runfiles-root paths, which are
+    # valid from either view.
+    args = [
+        "$(rlocationpath @arch_config//:arch_select.bzl)",
+        "$(rlocationpath @rtp_llm//rtp_llm:BUILD)",
+    ],
     data = [
         "update_cuda13_locks.sh",
         "requirements_base.txt",
-        "//arch_config:arch_select.bzl",
-        "//rtp_llm:BUILD",
+        "@arch_config//:arch_select.bzl",
+        "@rtp_llm//rtp_llm:BUILD",
     ],
 )
 
