@@ -136,8 +136,6 @@ class TemplateLifecycleTest(unittest.TestCase):
         lifecycle.prepare_for_template("restore")
         with self.assertRaisesRegex(RuntimeError, "cannot register"):
             lifecycle.register_fixup("late", SimpleNamespace(restore_fixup=Mock()))
-        with self.assertRaisesRegex(RuntimeError, "cannot unregister"):
-            lifecycle.unregister("one")
         with self.assertRaisesRegex(RuntimeError, "before successful fixup"):
             lifecycle.release_template()
 

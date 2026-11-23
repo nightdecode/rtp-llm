@@ -129,14 +129,6 @@ class TemplateLifecycle:
                 return
             self.register(name, _FixupHook(fixup), replace=replace)
 
-    def unregister(self, name: str) -> None:
-        with self._lock:
-            if self._phase is not None:
-                raise RuntimeError(
-                    "cannot unregister hooks during a template lifecycle"
-                )
-            self._hooks.pop(name, None)
-
     def _snapshot(self) -> list[tuple[str, TemplateLifecycleHook]]:
         with self._lock:
             return list(self._hooks.items())

@@ -222,8 +222,6 @@ class ScrRegistration:
     """Diagnostic result retained by the caller after registration."""
 
     tensors: tuple[Any, ...]
-    cache_result: int | None
-    hook_result: int | None
     ok: bool
     registration_duration_ms: float = 0.0
 
@@ -506,8 +504,6 @@ def _register_for_scr_once(
 
     registration = ScrRegistration(
         tensors=tensors,
-        cache_result=cache_result,
-        hook_result=hook_result,
         ok=ok,
         registration_duration_ms=(time.monotonic() - started) * 1000.0,
     )
