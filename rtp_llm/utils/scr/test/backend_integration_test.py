@@ -110,6 +110,7 @@ class BackendScrIntegrationTest(unittest.TestCase):
                     "finalize_rank_local_deepep_internode",
                     "configure_kv_cache_event_host_ip_port",
                     "setup_cuda_device_and_accl_env",
+                    "configure_kernel_tuning",
                     "set_global_controller",
                     "install_oom_dump",
                     "ignore_sigpipe",
@@ -251,7 +252,11 @@ class BackendScrIntegrationTest(unittest.TestCase):
                 local_rank=local_rank,
                 world_rank=world_rank,
                 local_world_size=4,
-            )
+            ),
+            kernel_tuning_config=SimpleNamespace(
+                aiter_fmoe_config_paths="",
+                rocm_fp8_moe_deterministic_reduce=False,
+            ),
         )
 
     def _launcher_config(
