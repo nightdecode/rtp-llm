@@ -434,12 +434,18 @@ class FrontendApp(object):
             )
         # Built after the SCR prebind barrier: the restored pod must resolve
         # backend addresses from the refreshed config, not from the snapshot.
-        self.grpc_client: Optional[GrpcClientWrapper] = None
+        self._grpc_client: Optional[GrpcClientWrapper] = None
 
         logging.info(
             f"frontend app rank_id = {self.server_config.rank_id}, "
             f"server_port = {self.server_config.server_port}, frontend_server_id = {self.server_config.frontend_server_id}"
         )
+
+    @property
+    def grpc_client(self) -> GrpcClientWrapper:
+        if self._grpc_client is None:
+            raise RuntimeError("frontend gRPC client is not initialized")
+        return self._grpc_client
 
     async def _wait_backend_health_ready_impl(self) -> None:
         """Loop until backend gRPC health_check returns ok (used when PD 不分离)."""
@@ -486,7 +492,7 @@ class FrontendApp(object):
             world_info=world_info,
             parallelism_config=self.py_env_configs.parallelism_config,
         )
-        self.grpc_client = GrpcClientWrapper(
+        self._grpc_client = GrpcClientWrapper(
             self.server_config.rpc_server_port,
             dp_addresses=dp_addresses,
             client_config=self.client_config,
