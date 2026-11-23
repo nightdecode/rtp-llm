@@ -86,6 +86,7 @@ def register_server_config_template_hook(py_env_configs: Any) -> None:
     get_template_lifecycle().register_fixup(
         f"server-config:{id(py_env_configs)}",
         _ServerConfigTemplateHook(py_env_configs),
+        replace=True,
     )
 
 

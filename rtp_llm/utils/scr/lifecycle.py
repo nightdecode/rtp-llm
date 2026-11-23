@@ -104,17 +104,22 @@ class TemplateLifecycle:
                 raise ValueError(f"template lifecycle hook already registered: {name}")
             self._hooks[name] = hook
 
-    def register_fixup(self, name: str, fixup: RestoreFixup) -> None:
+    def register_fixup(
+        self, name: str, fixup: RestoreFixup, *, replace: bool = False
+    ) -> None:
         """Register a fixup-only component without three empty lifecycle methods.
 
         Fixups run in registration order. Register local identity/address repairs
         before service discovery or registration, and register before prepare.
+        ``replace`` lets a component that is constructed more than once (for
+        example a hook bound to one config object) overwrite its own entry
+        instead of failing on the duplicate name.
         """
         with self._lock:
             existing = self._hooks.get(name)
             if isinstance(existing, _FixupHook) and existing.target is fixup:
                 return
-            self.register(name, _FixupHook(fixup))
+            self.register(name, _FixupHook(fixup), replace=replace)
 
     def unregister(self, name: str) -> None:
         with self._lock:
