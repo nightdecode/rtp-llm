@@ -148,7 +148,7 @@ diff --git aios/kmonitor/cpp_client/src/kmonitor/client/core/MetricsSystem.h aio
  #include <vector>
 +#include <map>
 +#include <set>
-@@ -39,6 +39,8 @@
+@@ -39,6 +41,8 @@
      MetricsSystem &operator=(const MetricsSystem &) = delete;
 
  public:
@@ -157,7 +157,7 @@ diff --git aios/kmonitor/cpp_client/src/kmonitor/client/core/MetricsSystem.h aio
      void Init(MetricsConfig *config);
      void Stop();
      bool Started();
-@@ -77,6 +79,8 @@
+@@ -77,6 +81,8 @@
      int64_t random_time_;
      std::mutex queue_mutex_;
      std::queue<std::pair<int64_t, MetricsRecords>> publish_queue_;
