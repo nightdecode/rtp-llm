@@ -20,7 +20,7 @@ public:
     static bool decodeTransfer(const MemoryOperationRequestPB&  request,
                                std::vector<TransferDescriptor>& descriptors,
                                const std::vector<GroupSetPtr>&  group_sets,
-                               bool                             allow_absent_group_sets = false,
+                               bool                             project_to_local_group_sets = false,
                                std::vector<size_t>*             wire_item_indices       = nullptr);
 
     static MemoryOperationResponsePB::Code encodeCode(CacheCopyError error);

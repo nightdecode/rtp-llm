@@ -100,12 +100,18 @@ TEST(PPTopologyValidatorTest, LeadingStageRequiresAtLeastOneCacheGroup) {
     EXPECT_NE(result.error.find("stage 0 cache snapshot has no cache groups"), std::string::npos);
 }
 
-TEST(PPTopologyValidatorTest, SameTypePartialOverlapFailsUntilPerRankProjectionIsImplemented) {
-    auto result =
-        validatePPTopology({makeSameTypeSnapshot({"csa_kv", "indexer_kv"}, 100), makeSameTypeSnapshot({"csa_kv"}, 90)});
-    ASSERT_FALSE(result.ok);
-    EXPECT_NE(result.error.find("has 1 of 2 group-set members"), std::string::npos);
-    EXPECT_NE(result.error.find("partial group-set overlap is not supported yet"), std::string::npos);
+TEST(PPTopologyValidatorTest, SameTypePartialOverlapUsesEachStagesTierLayout) {
+    auto stage0 = makeSameTypeSnapshot({"csa_kv", "indexer_kv"}, 100);
+    auto stage1 = makeSameTypeSnapshot({"csa_kv"}, 90);
+    stage0.block_tree.group_sets.front().pool_stride = 8192;
+    stage0.block_tree.host_budget_bytes = stage1.block_tree.host_budget_bytes = 120 * 4096;
+    stage0.block_tree.disk_budget_bytes = stage1.block_tree.disk_budget_bytes = 180 * 4096;
+
+    auto result = validatePPTopology({stage0, stage1});
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_EQ(canonicalBlockNums(result), (std::vector<uint32_t>{90, 100}));
+    EXPECT_EQ(result.agreed.block_tree.host.at(CacheGroupType::FULL), 60u);
+    EXPECT_EQ(result.agreed.block_tree.disk.at(CacheGroupType::FULL), 90u);
 }
 
 TEST(PPTopologyValidatorTest, SameTypeFullOverlapIgnoresLocalTagOrder) {

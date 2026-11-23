@@ -90,6 +90,19 @@ def cached_text_rope(
             "mrope_dim3",
         )
     )
+
+    def materialize():
+        rope = build_qsa_rope_from_logical_positions(
+            positions,
+            rope_config,
+            token_count=token_count,
+            dtype=dtype,
+            device=device,
+            inv_freq=frequency,
+        )
+        # Keep the input storage alive while its address is a cache key.
+        return positions, rope
+
     return cached_step_value(
         context,
         (
@@ -101,12 +114,5 @@ def cached_text_rope(
             dtype,
             device,
         ),
-        lambda: build_qsa_rope_from_logical_positions(
-            positions,
-            rope_config,
-            token_count=token_count,
-            dtype=dtype,
-            device=device,
-            inv_freq=frequency,
-        ),
-    )
+        materialize,
+    )[1]

@@ -62,9 +62,8 @@ struct PPValidationResult {
  * table. Groups pair by tag;
  * every stage's groups must be a subset of stage 0's because the leading
  * stage issues all block ids. Same-tag owners must agree on policy and token
- * geometry; capacity is the owner-stage minimum. A reusable group set must
- * be fully present or absent on each stage; partial overlap is rejected until
- * per-rank request projection is implemented.
+ * geometry; capacity is the owner-stage minimum. Transfer requests for
+ * reusable group sets are projected onto each stage's local groups.
  */
 PPValidationResult validatePPTopology(const std::vector<StageCacheSnapshot>& stages);
 

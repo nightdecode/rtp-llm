@@ -24,6 +24,7 @@ enum class GroupSetResolution {
 
 GroupSetResolution resolveGroupSet(const MemoryOperationRequestPB::CopyItem& item,
                                    const std::vector<GroupSetPtr>&           group_sets,
+                                   bool                                      project_to_local_group_sets,
                                    const GroupSet*&                          match) {
     match = nullptr;
     if (item.group_tags_size() == 0) {
@@ -35,8 +36,9 @@ GroupSetResolution resolveGroupSet(const MemoryOperationRequestPB::CopyItem& ite
             return GroupSetResolution::INVALID;
         }
     }
-    bool            has_overlap = false;
-    const GroupSet* exact_match = nullptr;
+    size_t          overlapping_sets = 0;
+    const GroupSet* exact_match      = nullptr;
+    const GroupSet* local_subset     = nullptr;
     for (const auto& candidate : group_sets) {
         if (!candidate) {
             continue;
@@ -48,8 +50,12 @@ GroupSetResolution resolveGroupSet(const MemoryOperationRequestPB::CopyItem& ite
         if (overlap == 0) {
             continue;
         }
-        has_overlap = true;
-        if (overlap != requested_tags.size() || overlap != candidate->groupTags().size()) {
+        ++overlapping_sets;
+        if (overlap != candidate->groupTags().size()) {
+            continue;
+        }
+        if (overlap != requested_tags.size()) {
+            local_subset = candidate.get();
             continue;
         }
         if (exact_match != nullptr) {
@@ -57,11 +63,15 @@ GroupSetResolution resolveGroupSet(const MemoryOperationRequestPB::CopyItem& ite
         }
         exact_match = candidate.get();
     }
-    if (exact_match != nullptr) {
-        match = exact_match;
+    match = exact_match;
+    // A PP request can include nonlocal tags, but must cover one whole local GroupSet.
+    if (match == nullptr && project_to_local_group_sets && overlapping_sets == 1) {
+        match = local_subset;
+    }
+    if (match != nullptr) {
         return GroupSetResolution::MATCHED;
     }
-    return has_overlap ? GroupSetResolution::INVALID : GroupSetResolution::ABSENT;
+    return overlapping_sets == 0 ? GroupSetResolution::ABSENT : GroupSetResolution::INVALID;
 }
 
 }  // namespace
@@ -98,7 +108,10 @@ bool BlockTransferRequestConverter::decodeDeviceBlocks(const CopyItem&          
             return false;
         }
     }
-    if (blocks_by_tag.size() != group_tags.size() || device_pools.size() != group_tags.size()) {
+    if (blocks_by_tag.size() != static_cast<size_t>(item.group_tags_size()) || device_pools.size() != group_tags.size()
+        || std::any_of(item.group_tags().begin(), item.group_tags().end(), [&](const std::string& tag) {
+               return blocks_by_tag.count(tag) == 0;
+           })) {
         return false;
     }
     blocks.reserve(group_tags.size());
@@ -174,7 +187,7 @@ bool BlockTransferRequestConverter::encodeTransfer(MemoryOperationRequestPB&    
 bool BlockTransferRequestConverter::decodeTransfer(const MemoryOperationRequestPB&  request,
                                                    std::vector<TransferDescriptor>& descriptors,
                                                    const std::vector<GroupSetPtr>&  group_sets,
-                                                   bool                             allow_absent_group_sets,
+                                                   bool                             project_to_local_group_sets,
                                                    std::vector<size_t>*             wire_item_indices) {
     // This boundary is shared by the real RPC service and native smoke workers.
     // group_set links in-process ranks to worker_init and dispatcher_init logs.
@@ -213,13 +226,14 @@ bool BlockTransferRequestConverter::decodeTransfer(const MemoryOperationRequestP
     for (int item_index = 0; item_index < request.copy_items_size(); ++item_index) {
         const CopyItem&          item          = request.copy_items(item_index);
         const GroupSet*          group_set_ptr = nullptr;
-        const GroupSetResolution resolution    = resolveGroupSet(item, group_sets, group_set_ptr);
+        const GroupSetResolution resolution    =
+            resolveGroupSet(item, group_sets, project_to_local_group_sets, group_set_ptr);
         if (resolution == GroupSetResolution::INVALID) {
             RTP_LLM_LOG_WARNING("invalid or partially overlapping BlockTree GroupSet membership");
             return false;
         }
         if (resolution == GroupSetResolution::ABSENT) {
-            if (!allow_absent_group_sets) {
+            if (!project_to_local_group_sets) {
                 RTP_LLM_LOG_WARNING("cannot resolve BlockTree GroupSet membership");
                 return false;
             }

@@ -1028,12 +1028,12 @@ bool KVCacheManager::executeFunction(const FunctionRequestPB& request, FunctionR
     }
     std::vector<TransferDescriptor> descriptors;
     std::vector<size_t>             wire_item_indices;
-    const bool                      allow_absent_group_sets = parallelism_config_.pp_size > 1;
+    const bool                      project_to_local_group_sets = parallelism_config_.pp_size > 1;
     if (!BlockTransferRequestConverter::decodeTransfer(request.mem_request(),
                                                        descriptors,
                                                        block_tree_cache_->groupSets(),
-                                                       allow_absent_group_sets,
-                                                       allow_absent_group_sets ? &wire_item_indices : nullptr)) {
+                                                       project_to_local_group_sets,
+                                                       project_to_local_group_sets ? &wire_item_indices : nullptr)) {
         RTP_LLM_LOG_WARNING("KVCacheManager::executeFunction: invalid grouped transfer request");
         return true;
     }
@@ -1061,7 +1061,7 @@ bool KVCacheManager::executeFunction(const FunctionRequestPB& request, FunctionR
     transfer_task.setWorkflow(request.mem_request().transfer_workflow_id(), request.mem_request().transfer_parent_id());
     auto         status          = block_tree_cache_->executeTransfer(std::move(transfer_task));
     const size_t wire_item_count = static_cast<size_t>(request.mem_request().copy_items_size());
-    if (allow_absent_group_sets && wire_item_indices.size() != wire_item_count) {
+    if (project_to_local_group_sets && wire_item_indices.size() != wire_item_count) {
         // A PP stage can omit whole group sets. Restore the original wire order
         // so skipped items remain no-ops without shifting another item's error.
         status.expandBlockErrors(wire_item_indices.size());

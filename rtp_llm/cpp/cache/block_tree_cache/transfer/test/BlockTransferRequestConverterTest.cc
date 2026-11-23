@@ -382,7 +382,7 @@ TEST(BlockTransferRequestConverterTest, DecodeSkipsGroupSetAbsentFromThisRankOnl
     std::vector<TransferDescriptor> descriptors;
     EXPECT_FALSE(BlockTransferRequestConverter::decodeTransfer(request, descriptors, groupSets()));
     EXPECT_TRUE(BlockTransferRequestConverter::decodeTransfer(
-        request, descriptors, groupSets(), /*allow_absent_group_sets=*/true));
+        request, descriptors, groupSets(), /*project_to_local_group_sets=*/true));
     EXPECT_TRUE(descriptors.empty());
 }
 
@@ -392,8 +392,32 @@ TEST(BlockTransferRequestConverterTest, DecodeRejectsPartialGroupSetMembership) 
 
     std::vector<TransferDescriptor> descriptors;
     EXPECT_FALSE(BlockTransferRequestConverter::decodeTransfer(
-        request, descriptors, groupSets(), /*allow_absent_group_sets=*/true));
+        request, descriptors, groupSets(), /*project_to_local_group_sets=*/true));
     EXPECT_TRUE(descriptors.empty());
+}
+
+TEST(BlockTransferRequestConverterTest, DecodeProjectsTransfersToTheLocalGroupSet) {
+    const auto& full = groupSets()[1];
+    const auto  local =
+        makeTestGroupSet(0, full->topologyPtr(), {"group2"}, {full->devicePools()[1]}, full->hostPool(), full->diskPool());
+    for (const auto& input : {TransferDescriptor::deviceToHost(1, {11, 12}, 21),
+                              TransferDescriptor::hostToDevice(1, 21, {11, 12}),
+                              TransferDescriptor::diskToDevice(1, 31, {11, 12})}) {
+        MemoryOperationRequestPB request;
+        ASSERT_TRUE(BlockTransferRequestConverter::encodeTransfer(request, makeTransferTask({input}), groupSets()));
+        std::vector<TransferDescriptor> descriptors;
+        EXPECT_FALSE(BlockTransferRequestConverter::decodeTransfer(request, descriptors, {local}));
+        ASSERT_TRUE(BlockTransferRequestConverter::decodeTransfer(
+            request, descriptors, {local}, /*project_to_local_group_sets=*/true));
+        ASSERT_EQ(descriptors.size(), 1u);
+        const auto& output = descriptors.front();
+        EXPECT_EQ(output.group_set_id, 0u);
+        EXPECT_EQ(output.source_tier, input.source_tier);
+        EXPECT_EQ(output.target_tier, input.target_tier);
+        EXPECT_EQ(output.blocksAt(Tier::DEVICE), (std::vector<BlockIdxType>{12}));
+        const auto backing_tier = input.source_tier == Tier::DEVICE ? input.target_tier : input.source_tier;
+        EXPECT_EQ(output.singleBlockAt(backing_tier), input.singleBlockAt(backing_tier));
+    }
 }
 
 TEST(BlockTransferRequestConverterTest, DecodeContinuesPastPartialOverlapToUniqueExactMatch) {
@@ -407,7 +431,7 @@ TEST(BlockTransferRequestConverterTest, DecodeContinuesPastPartialOverlapToUniqu
 
     std::vector<TransferDescriptor> descriptors;
     ASSERT_TRUE(BlockTransferRequestConverter::decodeTransfer(
-        request, descriptors, {partial, exact}, /*allow_absent_group_sets=*/true));
+        request, descriptors, {partial, exact}, /*project_to_local_group_sets=*/true));
     ASSERT_EQ(descriptors.size(), 1u);
     EXPECT_EQ(descriptors.front().group_set_id, 1u);
 }
@@ -423,7 +447,7 @@ TEST(BlockTransferRequestConverterTest, DecodeRejectsMultipleExactGroupSetMatche
 
     std::vector<TransferDescriptor> descriptors;
     EXPECT_FALSE(BlockTransferRequestConverter::decodeTransfer(
-        request, descriptors, {first, second}, /*allow_absent_group_sets=*/true));
+        request, descriptors, {first, second}, /*project_to_local_group_sets=*/true));
     EXPECT_TRUE(descriptors.empty());
 }
 
@@ -435,7 +459,7 @@ TEST(BlockTransferRequestConverterTest, DecodeKeepsMatchedItemsWhenSkippingAbsen
 
     std::vector<TransferDescriptor> descriptors;
     ASSERT_TRUE(BlockTransferRequestConverter::decodeTransfer(
-        request, descriptors, groupSets(), /*allow_absent_group_sets=*/true));
+        request, descriptors, groupSets(), /*project_to_local_group_sets=*/true));
     ASSERT_EQ(descriptors.size(), 1u);
     EXPECT_EQ(descriptors.front().group_set_id, 0u);
 }

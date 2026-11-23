@@ -57,8 +57,6 @@ void deriveConstructionInputs(PPValidationResult& result) {
     result.agreed.paged_block_num = paged_min;
 }
 
-using GroupSetMemberCountsByType = std::unordered_map<CacheGroupType, size_t>;
-
 CanonicalGroupEntry makeCanonicalGroupEntry(const StageCacheGroupSnapshot& group) {
     CanonicalGroupEntry entry;
     entry.tag                       = group.tag;
@@ -101,27 +99,6 @@ validateAndMergeCanonicalGroup(CanonicalGroupEntry& entry, const StageCacheGroup
                + "] != canonical [" + entry.policy_fingerprint + "]";
     }
     entry.logical_block_num = std::min(entry.logical_block_num, group.block_num);
-    return {};
-}
-
-std::string validateGroupSetStructure(size_t                            stage_index,
-                                      const GroupSetMemberCountsByType& canonical,
-                                      const GroupSetMemberCountsByType& local) {
-    for (const auto& [type, local_count] : local) {
-        const auto expected = canonical.find(type);
-        // Tags are unique, later stages are stage-0 subsets, and shared tags
-        // already agree on type and reuse policy. Equal non-zero counts
-        // therefore imply an identical group set.
-        const size_t expected_count = expected == canonical.end() ? 0 : expected->second;
-        // TODO(pp-partial-group-set): once the sender can project each
-        // CopyItem (including group_blocks) per target PP rank, allow a
-        // non-empty proper subset. A wholly absent group set is skipped receiver-side.
-        if (local_count != expected_count) {
-            return "stage " + std::to_string(stage_index) + " has " + std::to_string(local_count) + " of "
-                   + std::to_string(expected_count) + " group-set members for type "
-                   + std::to_string(static_cast<int>(type)) + "; partial group-set overlap is not supported yet";
-        }
-    }
     return {};
 }
 
@@ -395,7 +372,6 @@ PPValidationResult validatePPTopology(const std::vector<StageCacheSnapshot>& sta
     }
 
     std::unordered_map<std::string, size_t> canonical_index;
-    GroupSetMemberCountsByType              canonical_group_set_member_counts;
     for (size_t s = 0; s < stages.size(); ++s) {
         const auto& stage = stages[s];
         if (s == 0 && stage.groups.empty()) {
@@ -403,7 +379,6 @@ PPValidationResult validatePPTopology(const std::vector<StageCacheSnapshot>& sta
         }
 
         std::unordered_set<std::string> unique_tags;
-        GroupSetMemberCountsByType      local_group_set_member_counts;
         for (const auto& group : stage.groups) {
             if (group.tag.empty() || !unique_tags.emplace(group.tag).second) {
                 return fail("stage " + std::to_string(s) + " has an empty or duplicate cache group tag [" + group.tag
@@ -413,10 +388,6 @@ PPValidationResult validatePPTopology(const std::vector<StageCacheSnapshot>& sta
                 return fail("stage " + std::to_string(s) + " group [" + group.tag
                             + "] has 0 KV blocks; the group could not allocate a single block");
             }
-            if (group.block_tree_group_member) {
-                ++local_group_set_member_counts[group.type];
-            }
-
             if (s == 0) {
                 canonical_index.emplace(group.tag, result.canonical_groups.size());
                 result.canonical_groups.push_back(makeCanonicalGroupEntry(group));
@@ -437,13 +408,6 @@ PPValidationResult validatePPTopology(const std::vector<StageCacheSnapshot>& sta
             }
         }
 
-        if (s == 0) {
-            canonical_group_set_member_counts = std::move(local_group_set_member_counts);
-        } else if (const auto error =
-                       validateGroupSetStructure(s, canonical_group_set_member_counts, local_group_set_member_counts);
-                   !error.empty()) {
-            return fail(error);
-        }
         if (const auto error = validateTierSizing(stage, stages.front().block_tree); !error.empty()) {
             return fail("stage " + std::to_string(s) + ": " + error);
         }
