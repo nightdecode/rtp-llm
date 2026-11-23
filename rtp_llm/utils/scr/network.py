@@ -15,6 +15,7 @@ does it reach its peers?
 
 import ipaddress
 import json
+import logging
 import os
 import socket
 import subprocess
@@ -25,6 +26,15 @@ from rtp_llm.utils.gang_info import GangInfoReader, get_gang_member
 
 VIP_INTERFACE = "scr_vxlan0"
 NETWORK_READY_SOCKET = Path("/scr-share/snm/daemon.sock")
+# Platform readiness is normally seconds; the upper bound only prevents a
+# permanent misconfiguration from parking startup forever.
+NETWORK_READY_TIMEOUT_SECONDS = 1800.0
+NETWORK_WARNING_INTERVAL_SECONDS = 30.0
+NETWORK_RETRY_INTERVAL_SECONDS = 0.5
+
+
+class ScrNetworkConfigurationError(RuntimeError):
+    """Permanent SCR network misconfiguration; retrying cannot fix it."""
 
 
 def enabled(pc) -> bool:
@@ -65,13 +75,18 @@ def read_topology(
 
 def validate_device(address: str) -> None:
     device = VIP_INTERFACE
-    rows = json.loads(
-        subprocess.check_output(
+    try:
+        output = subprocess.check_output(
             ["ip", "-j", "-4", "address", "show", "dev", device],
             text=True,
             timeout=5,
         )
-    )
+    except FileNotFoundError as e:
+        # A missing `ip` binary is an image defect, not a readiness race.
+        raise ScrNetworkConfigurationError(
+            f"SCR network inspection requires the `ip` command: {e}"
+        ) from e
+    rows = json.loads(output)
     if not any(
         item.get("local") == address
         for row in rows
@@ -88,6 +103,23 @@ def validate_device(address: str) -> None:
         probe.bind((address, 0))
 
 
+def _network_ready_timeout_seconds() -> float:
+    raw = os.environ.get("RTPLLM_SCR_NETWORK_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return NETWORK_READY_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError as e:
+        raise ValueError(
+            "RTPLLM_SCR_NETWORK_TIMEOUT_SECONDS must be a positive number"
+        ) from e
+    if value <= 0:
+        raise ValueError(
+            "RTPLLM_SCR_NETWORK_TIMEOUT_SECONDS must be a positive number"
+        )
+    return value
+
+
 def topology(pc, gang_info: GangInfoReader) -> dict[int, str]:
     if not 0 <= pc.world_rank < pc.world_size:
         raise ValueError("SCR world rank is outside the topology")
@@ -100,23 +132,36 @@ def topology(pc, gang_info: GangInfoReader) -> dict[int, str]:
         raise ValueError(
             f"SCR VIP requires RANK_SIZE={node_count} in the worker environment"
         )
+    deadline = time.monotonic() + _network_ready_timeout_seconds()
+    last_warning = 0.0
     while True:
         try:
             nodes = read_topology(pc.world_size, pc.local_world_size, gang_info)
             validate_device(nodes[pc.world_rank // pc.local_world_size])
             return nodes
+        except ScrNetworkConfigurationError:
+            raise
         except (
-            # Transient: the projection/device is not published yet.
+            # Transient: the projection/device is not published yet. A
+            # partially merged gang projection can also miss `real_ip` until
+            # the restore fixup completes, so KeyError stays retryable.
             OSError,
             KeyError,
             RuntimeError,
             subprocess.SubprocessError,
-        ):
+        ) as e:
             # ValueError means the gang annotation itself is malformed; retrying
             # cannot fix it, so surface it immediately.
-            # Readiness waiting shares the control plane's startup lifetime;
-            # do not impose a second deadline inside the restored process.
-            time.sleep(0.5)
+            now = time.monotonic()
+            if now >= deadline:
+                raise RuntimeError(
+                    "SCR network did not become ready within "
+                    f"{_network_ready_timeout_seconds():.0f}s: {e}"
+                ) from e
+            if now - last_warning >= NETWORK_WARNING_INTERVAL_SECONDS:
+                logging.warning("Waiting for SCR network readiness: %s", e)
+                last_warning = now
+            time.sleep(NETWORK_RETRY_INTERVAL_SECONDS)
 
 
 def internal_ip(pc, fallback: str, gang_info: GangInfoReader) -> str:
