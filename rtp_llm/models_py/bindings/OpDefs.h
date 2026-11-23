@@ -30,6 +30,8 @@ namespace torch_ext {
 struct LayerKVCache {
     torch::Tensor kv_cache_base;
     torch::Tensor kv_scale_base;
+    torch::Tensor kv_host_base;
+    uint32_t      logical_device_blocks = 0;
     int           seq_size_per_block = 0;
     int           layer_id           = -1;
     std::string   tag                = "default";
@@ -102,6 +104,18 @@ public:
 
     int getKernelSeqSizePerBlock(const std::string& tag) const {
         return static_cast<int>(grouped_layout_.topology().group(tag).kernelSeqSizePerBlock());
+    }
+
+    uint32_t getPrefillStagingBlocks(const std::string& tag) const {
+        return grouped_layout_.group(tag).stagingBlocks();
+    }
+
+    uint32_t getPrefillStagingLayers(const std::string& tag) const {
+        return grouped_layout_.group(tag).stagingLayers();
+    }
+
+    torch::Tensor getBlockGenerations(const std::string& tag) const {
+        return grouped_layout_.group(tag).blockGenerations();
     }
 
     // Entry count of the exposed layer-cache view; zero for non-opaque specs.
@@ -204,6 +218,33 @@ private:
         }
 
         if (spec_type == rtp_llm::KVCacheSpecType::MultiHeadLatentAttention) {
+            if (buffers.kv_host_addr.defined()) {
+                const int64_t logical_device_blocks = buffers.logical_device_blocks;
+                const int64_t host_blocks           = buffers.kv_host_addr.size(0);
+                const int64_t device_view_blocks    = physical_block_num;
+                RTP_LLM_CHECK_WITH_INFO(logical_device_blocks > 0 && host_blocks > 0
+                                            && logical_device_blocks + host_blocks == group.block_num
+                                            && device_view_blocks > logical_device_blocks
+                                            && !buffers.kv_scale_addr.defined(),
+                                        "invalid split MLA storage for layer=%d tag=%s",
+                                        layer_id,
+                                        group.tag.c_str());
+                const auto kernel_blocks_per_page = kernelBlocksPerPhysicalBlock(group);
+                result.logical_device_blocks      = buffers.logical_device_blocks;
+                result.kv_cache_base              = reshapeMlaTensor(buffers.kv_addr,
+                                                        device_view_blocks,
+                                                        device_view_blocks * kernel_blocks_per_page,
+                                                        kernel_seq_size,
+                                                        "MLA device and working-set tensor",
+                                                        group.tag);
+                result.kv_host_base               = reshapeMlaTensor(buffers.kv_host_addr,
+                                                       host_blocks,
+                                                       host_blocks * kernel_blocks_per_page,
+                                                       kernel_seq_size,
+                                                       "MLA host backing tensor",
+                                                       group.tag);
+                return result;
+            }
             result.kv_cache_base = reshapeMlaTensor(buffers.kv_addr,
                                                     physical_block_num,
                                                     kernel_block_num,
