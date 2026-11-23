@@ -7,7 +7,7 @@ from typing import Optional
 
 import torch
 
-from rtp_llm.config.py_config_modules import PyEnvConfigs
+from rtp_llm.config.py_config_modules import PyEnvConfigs, resolve_max_generate_batch_size
 from rtp_llm.model_factory_register import ModelDict
 from rtp_llm.models_py.distributed.rank_layout import Group, RankLayout
 from rtp_llm.ops import (
@@ -630,7 +630,10 @@ def configure_kv_cache_event_host_ip_port(py_env_configs: PyEnvConfigs) -> None:
     kv_cache_config = py_env_configs.kv_cache_config
     parallelism_config = py_env_configs.parallelism_config
     if (
-        kv_cache_config.kv_cache_event_publisher_type != "kvcm"
+        (
+            kv_cache_config.kv_cache_event_publisher_type != "kvcm"
+            and not kv_cache_config.enable_remote_cache
+        )
         or parallelism_config.tp_rank != 0
     ):
         return
@@ -643,7 +646,7 @@ def configure_kv_cache_event_host_ip_port(py_env_configs: PyEnvConfigs) -> None:
             f"{server_ip}:{server_config.server_port}"
         )
         logging.info(
-            "KV_CACHE_EVENT_HOST_IP_PORT was empty; derived per-rank endpoint "
+            "Derived per-rank KVCM host endpoint "
             "%s from start_port=%s rank_id=%s worker_info_port_num=%s",
             kv_cache_config.kv_cache_event_host_ip_port,
             server_config.start_port,
@@ -653,7 +656,7 @@ def configure_kv_cache_event_host_ip_port(py_env_configs: PyEnvConfigs) -> None:
 
     if parallelism_config.dp_size > 1:
         logging.warning(
-            "dp_size=%s requires a distinct KV_CACHE_EVENT_HOST_IP_PORT for every DP replica; "
+            "dp_size=%s requires a distinct KVCM host endpoint for every DP replica; "
             "using %s value %s for dp_rank=%s. Sharing this value lets KVCM snapshots "
             "overwrite another replica's host state.",
             parallelism_config.dp_size,
@@ -673,7 +676,14 @@ def setup_and_configure_server(py_env_configs: PyEnvConfigs):
     """
     setup_default_args(py_env_configs)
     fetch_model_files_to_local(py_env_configs)
-    ll_num_max_token = py_env_configs.concurrency_config.concurrency_limit
+    # DeepEP's wrapper init derives ll_num_max_token from
+    # runtime_config.max_generate_batch_size while the low-latency router
+    # derives it from moe_config.ll_num_max_token configured here, and
+    # DeepepWrapperConfig.equal compares both chains; resolving the cap with
+    # the same shared helper as EngineConfig.create keeps them identical when
+    # --max_generate_batch_size overrides concurrency_limit (this function
+    # also re-validates positivity, since it runs before EngineConfig.create).
+    ll_num_max_token = resolve_max_generate_batch_size(py_env_configs)
     sp_type = py_env_configs.sp_config.type  # Get SpeculativeType enum value
     if py_env_configs.sp_config.type != SpeculativeType.NONE:
         ll_num_max_token *= py_env_configs.sp_config.gen_num_per_cycle + 1

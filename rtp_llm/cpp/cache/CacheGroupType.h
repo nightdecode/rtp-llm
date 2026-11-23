@@ -98,7 +98,7 @@ inline std::vector<CacheStoreBlockPair> buildCacheStorePlan(const CacheGroupPoli
                                                             int                     cp_size,
                                                             size_t                  key_blocks_per_logical_block = 1,
                                                             size_t                  cache_key_count              = 0,
-                                                            size_t                  publish_start_block           = 0) {
+                                                            size_t                  publish_start_block          = 0) {
     std::vector<CacheStoreBlockPair> plan;
     if (total_logical_blocks == 0) {
         return plan;
@@ -190,6 +190,12 @@ inline bool cacheGroupParticipatesInBlockTree(const CacheGroupPolicy& policy) {
 // would suppress publication for almost every key.
 inline bool cacheGroupPublishesPrefixChain(const CacheGroupPolicy& policy) {
     return cacheGroupParticipatesInBlockTree(policy) && policy.active_tail_blocks == 0;
+}
+
+// Reusable groups report their own resident components. Tag exclusions and
+// memory placement are validated before attaching to the cache tree.
+inline bool cacheGroupPublishesEvents(const CacheGroupPolicy& policy) {
+    return policy.enable_prefix_reuse;
 }
 
 }  // namespace rtp_llm

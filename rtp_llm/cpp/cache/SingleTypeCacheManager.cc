@@ -31,6 +31,21 @@ bool SingleTypeCacheManager::init() {
     return true;
 }
 
+void SingleTypeCacheManager::reclaimHistory(BlockIds& block_ids, size_t end) {
+    end = std::min(end, block_ids.blocksNum());
+    BlockIndicesType    released;
+    std::vector<size_t> positions;
+    for (size_t pos = block_ids.reclaimedPrefixBlocks(); pos < end; ++pos) {
+        if (!isNullBlockIdx(block_ids.blocks()[pos])) {
+            released.push_back(block_ids.blocks()[pos]);
+            positions.push_back(pos);
+        }
+    }
+    unreference(released);
+    block_ids.remove(positions);
+    block_ids.setReclaimedPrefixBlocks(end);
+}
+
 void SingleTypeCacheManager::setEvictCallback(EvictCallback callback) {
     evict_callback_ = std::move(callback);
 }
@@ -145,13 +160,13 @@ void SingleTypeCacheManager::reference(BlockIds& block_ids, const BlockIndicesTy
     reference(valid_blocks);
 }
 
-void SingleTypeCacheManager::reference(const BlockIndicesType& block_indices) {
+void SingleTypeCacheManager::reference(const BlockIndicesType& block_indices, DeviceBlockRefType ref_type) {
     if (!block_indices.empty()) {
-        block_pool_->incRef(block_indices);
+        block_pool_->incRef(block_indices, ref_type);
     }
 }
 
-void SingleTypeCacheManager::unreference(const BlockIndicesType& block_indices) {
+void SingleTypeCacheManager::unreference(const BlockIndicesType& block_indices, DeviceBlockRefType ref_type) {
     BlockIndicesType valid_blocks;
     valid_blocks.reserve(block_indices.size());
     for (const BlockIdxType block : block_indices) {
@@ -160,7 +175,7 @@ void SingleTypeCacheManager::unreference(const BlockIndicesType& block_indices) 
         }
     }
     if (!valid_blocks.empty()) {
-        block_pool_->decRef(valid_blocks);
+        block_pool_->decRef(valid_blocks, ref_type);
     }
 }
 

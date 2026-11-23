@@ -17,8 +17,11 @@
 #include "rtp_llm/cpp/cache/AsyncContext.h"
 #include "rtp_llm/cpp/cache/KVCacheResource.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeCacheFactory.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/ScopeRollback.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/storage_backend/StorageBackend.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/load/LoadAsyncContext.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/test/BlockTreeCacheTestUtils.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/test/BoundedThreadTestUtils.h"
 #include "rtp_llm/cpp/engine_base/stream/GenerateStream.h"
 #include "rtp_llm/cpp/engine_base/stream/GenerateTypes.h"
 #include "rtp_llm/cpp/engine_base/stream/StreamCacheResource.h"
@@ -36,6 +39,8 @@
 #include <functional>
 #include <memory>
 #include <limits>
+#include <optional>
+#include <stdexcept>
 #include <thread>
 
 using namespace std;
@@ -101,8 +106,13 @@ makeAllocatorLoadContext(size_t matched_blocks, const std::vector<Tier>& source_
     std::vector<TransferDescriptor> descriptors;
     descriptors.reserve(source_tiers.size());
     for (size_t path_index = 0; path_index < source_tiers.size(); ++path_index) {
-        descriptors.emplace_back(
-            nullptr, /*group_set_id=*/0, path_index, source_tiers[path_index], Tier::DEVICE, BlockIndicesType{1});
+        descriptors.emplace_back(nullptr,
+                                 /*group_set_id=*/0,
+                                 path_index,
+                                 source_tiers[path_index],
+                                 Tier::DEVICE,
+                                 BlockIndicesType{1},
+                                 /*initial_owner=*/false);
     }
     auto context =
         coordinator->create(std::move(descriptors), std::vector<bool>(source_tiers.size(), false), matched_blocks);
@@ -115,6 +125,9 @@ makeAllocatorLoadContext(size_t matched_blocks, const std::vector<Tier>& source_
 
 class StreamReadStorageBackend: public StorageBackend {
 public:
+    explicit StreamReadStorageBackend(std::chrono::milliseconds timeout = std::chrono::seconds(10)):
+        StorageBackend(nullptr, nullptr, -1, timeout) {}
+
     ~StreamReadStorageBackend() override {
         shutdown();
     }
@@ -135,6 +148,16 @@ public:
         release_reads_ = false;
     }
 
+    void timeoutNextRead() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        timeout_read_ = true;
+    }
+
+    void failNextRead() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        fail_read_ = true;
+    }
+
     void releaseReads() {
         std::lock_guard<std::mutex> lock(mutex_);
         release_reads_ = true;
@@ -151,6 +174,11 @@ public:
         cv_.wait(lock, [&] { return read_calls_ >= count; });
     }
 
+    bool waitForReadsFor(size_t count) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, std::chrono::seconds(5), [&] { return read_calls_ >= count; });
+    }
+
     size_t writeCalls() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return write_calls_;
@@ -158,6 +186,11 @@ public:
     size_t writtenKeys() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return written_keys_;
+    }
+
+    CacheKeysType writtenKeyValues() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return written_key_values_;
     }
 
     size_t matchCalls() const {
@@ -182,12 +215,21 @@ protected:
         ++read_calls_;
         cv_.notify_all();
         cv_.wait(lock, [&] { return release_reads_; });
+        if (timeout_read_) {
+            timeout_read_ = false;
+            throw StorageOperationTimeout("injected remote read timeout", StorageQuarantineReason::RPC_TIMEOUT);
+        }
+        if (fail_read_) {
+            fail_read_ = false;
+            throw std::runtime_error("injected remote read failure");
+        }
     }
 
     void writeImpl(const StorageRequest& request) override {
         std::lock_guard<std::mutex> lock(mutex_);
         ++write_calls_;
         written_keys_ += request.handles.size();
+        written_key_values_.insert(written_key_values_.end(), request.keys->begin(), request.keys->end());
     }
 
 private:
@@ -195,10 +237,13 @@ private:
     std::condition_variable cv_;
     bool                    release_matches_{true};
     bool                    release_reads_{true};
+    bool                    timeout_read_{false};
+    bool                    fail_read_{false};
     size_t                  match_calls_{0};
     size_t                  read_calls_{0};
     size_t                  write_calls_{0};
     size_t                  written_keys_{0};
+    CacheKeysType           written_key_values_;
 };
 
 class StreamCacheResourceTest: public DeviceTestBase {
@@ -243,9 +288,19 @@ protected:
                                         const std::vector<int>& input_tokens,
                                         bool                    reuse_cache,
                                         RoleType                role_type,
-                                        const KVCacheConfig&    kv_cache_config = {}) {
-        cache_manager_ = std::make_shared<KVCacheManager>(
-            cache_config, /*warmup=*/false, /*metrics_reporter=*/nullptr, kv_cache_config);
+                                        const KVCacheConfig&    kv_cache_config      = {},
+                                        int                     num_return_sequences = 2,
+                                        std::optional<int>      max_new_tokens       = std::nullopt) {
+        PDSepConfig pd_sep_config;
+        pd_sep_config.role_type = role_type;
+        cache_manager_          = std::make_shared<KVCacheManager>(cache_config,
+                                                          /*warmup=*/false,
+                                                          /*metrics_reporter=*/nullptr,
+                                                          kv_cache_config,
+                                                          ParallelismConfig{},
+                                                          RuntimeConfig{},
+                                                          SpeculativeExecutionConfig{},
+                                                          pd_sep_config);
         ASSERT_TRUE(cache_manager_->init());
         size_t expected_free_blocks = 0;
         for (const auto& group : cache_manager_->cacheConfig().topology().groups()) {
@@ -259,7 +314,10 @@ protected:
 
         std::shared_ptr<GenerateInput>  generate_input(new GenerateInput());
         std::shared_ptr<GenerateConfig> generate_config(new GenerateConfig());
-        generate_config->num_return_sequences = 2;
+        generate_config->num_return_sequences = num_return_sequences;
+        if (max_new_tokens.has_value()) {
+            generate_config->max_new_tokens = *max_new_tokens;
+        }
         generate_input->input_ids =
             torch::tensor(std::vector<int32_t>(input_tokens.begin(), input_tokens.end()), torch::kInt32);
         generate_input->generate_config = generate_config;
@@ -273,7 +331,11 @@ protected:
     }
 
     std::shared_ptr<StreamReadStorageBackend>
-    prepareStorageBackendResource(bool block_matches, bool seed_host = false, RoleType role_type = RoleType::PDFUSION) {
+    prepareStorageBackendResource(bool                      block_matches,
+                                  bool                      seed_host     = false,
+                                  RoleType                  role_type     = RoleType::PDFUSION,
+                                  bool                      seed_resident = false,
+                                  std::chrono::milliseconds timeout       = std::chrono::seconds(10)) {
         KVCacheConfig kv_cache_config;
         kv_cache_config.enable_remote_cache   = true;
         kv_cache_config.enable_memory_cache   = seed_host;
@@ -285,7 +347,7 @@ protected:
         prepareResourceWithCacheConfig(
             init_config(), {1, 2, 3, 4, 5, 6}, /*reuse_cache=*/true, role_type, manager_kv_cache_config);
 
-        auto backend = std::make_shared<StreamReadStorageBackend>();
+        auto backend = std::make_shared<StreamReadStorageBackend>(timeout);
         if (block_matches) {
             backend->blockMatches();
         }
@@ -326,13 +388,12 @@ protected:
             RTP_LLM_CHECK(stored);
             std::vector<std::vector<GroupSetResource>> resources(1, std::vector<GroupSetResource>(1));
             resources[0][0].host_block = block;
-            RTP_LLM_CHECK(cache->tree()
-                              ->insertNode({resource.batch_kv_cache_resource_->cacheKeys(0).front()},
-                                           resources,
-                                           false,
-                                           /*is_resident=*/false)
-                              .accepted_resource_count
-                          == 1);
+            RTP_LLM_CHECK(
+                cache->tree()
+                    ->insertNode(
+                        {resource.batch_kv_cache_resource_->cacheKeys(0).front()}, resources, false, seed_resident)
+                    .accepted_resource_count
+                == 1);
             group->releaseSingleBlock(Tier::HOST, block, BlockTreeRefType::CACHE);
         }
 
@@ -350,6 +411,35 @@ protected:
         }
     };
 
+    void prepareLinearHistoryResource(bool enable_reclaim = true) {
+        auto config = test::makeSimpleHybridMhaCacheConfig(
+            /*layer_num=*/4, /*block_num=*/32, /*tokens_per_block=*/2, DataType::TYPE_FP16);
+        config.reuse_cache_tail_blocks = std::numeric_limits<int>::max();
+        config.enable_linear_cache_reclaim = enable_reclaim;
+        prepareResourceWithCacheConfig(
+            config, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, true, RoleType::PDFUSION, {}, 1, 32);
+        // PERF_TEST emits zero tokens, which is also the model's default EOS.
+        // These ownership tests need every accepted speculative token committed.
+        stream_->generateConfig()->ignore_eos  = true;
+        stream_->generateConfig()->reuse_cache = true;
+        stream_->vocab_size_                   = 1024;
+        ASSERT_TRUE(stream_->streamCacheResource().initKVBlock().ok());
+    }
+
+    void commitLinearHistoryToken() {
+        stream_->update({torch::tensor({{13}}, torch::kInt32),
+                         1,
+                         torch::Tensor(),
+                         torch::Tensor(),
+                         torch::Tensor(),
+                         torch::Tensor(),
+                         torch::Tensor(),
+                         torch::Tensor(),
+                         torch::Tensor(),
+                         torch::Tensor()});
+        ASSERT_FALSE(stream_->hasError());
+    }
+
 #define CHECK_BLOCK(block_vec, outter_size, inner_size)                                                                \
     do {                                                                                                               \
         SCOPED_TRACE("checkBlockFunc");                                                                                \
@@ -361,6 +451,434 @@ protected:
     GenerateStreamPtr               stream_;
     std::shared_ptr<KVCacheManager> cache_manager_;
 };
+
+TEST_F(StreamCacheResourceTest, LinearHistoryReclaimedAfterCommittedPrefillAndNotBackfilled) {
+    prepareLinearHistoryResource();
+    auto&      resource    = stream_->streamCacheResource();
+    const auto before      = resource.kvCache().blocks(0, "linear");
+    const auto full_before = resource.kvCache().blocks(0, "full1");
+    ASSERT_EQ(before.size(), 6u);
+    EXPECT_TRUE(std::all_of(before.begin(), before.end(), [](int block) { return !isNullBlockIdx(block); }));
+
+    commitLinearHistoryToken();
+    // Output commit publishes only a watermark. The scheduler owns block-table
+    // mutation and drains it before allocating the next execution's blocks.
+    EXPECT_EQ(resource.kvCache().blocks(0, "linear"), before);
+    ASSERT_TRUE(resource.incrKVBlock().ok());
+
+    const auto& after = resource.kvCache().blocks(0, "linear");
+    ASSERT_EQ(after.size(), before.size() + 1);
+    for (size_t i = 0; i < 4; ++i) {
+        EXPECT_EQ(after[i], NULL_BLOCK_IDX);
+    }
+    EXPECT_EQ(after[4], before[4]);
+    EXPECT_EQ(after[5], before[5]);
+    const auto& full_after = resource.kvCache().blocks(0, "full1");
+    ASSERT_GE(full_after.size(), full_before.size());
+    EXPECT_TRUE(std::equal(full_before.begin(), full_before.end(), full_after.begin()));
+    auto prefix_keys = resource.cacheKeys(0);
+    prefix_keys.resize(4);
+    auto match = cache_manager_->block_tree_cache_->match(prefix_keys);
+    EXPECT_EQ(match.matched_device_blocks, 4u);
+    for (const auto& matched_resource : match.matched_device_resources) {
+        cache_manager_->block_tree_cache_->groupSets()[matched_resource.group_set_id]->unreferenceBlocks(
+            matched_resource);
+    }
+
+    ASSERT_TRUE(resource.incrKVBlock().ok());
+    for (size_t i = 0; i < 4; ++i) {
+        EXPECT_EQ(resource.kvCache().blocks(0, "linear")[i], NULL_BLOCK_IDX);
+    }
+}
+
+TEST_F(StreamCacheResourceTest, LinearHistoryReclaimDefersAsyncWorkerMutationUntilSchedulerAllocation) {
+    prepareLinearHistoryResource();
+    auto&      resource    = stream_->streamCacheResource();
+    const auto before      = resource.kvCache().blocks(0, "linear");
+    const auto keys_before = resource.cacheKeys(0);
+    // The next normal async gather may read the host block table while its
+    // predecessor commits. The worker must only publish the committed watermark.
+    stream_->incPendingAsyncBookkeeping();
+    commitLinearHistoryToken();
+    EXPECT_EQ(resource.kvCache().blocks(0, "linear"), before);
+    EXPECT_EQ(resource.cacheKeys(0), keys_before);
+    stream_->decPendingAsyncBookkeepingAndMaybeRelease();
+
+    // An allocation upper bound is not a committed-token watermark.
+    ASSERT_TRUE(resource.incrKVBlock(/*seq_len_override=*/17).ok());
+    for (size_t i = 0; i < 4; ++i) {
+        EXPECT_EQ(resource.kvCache().blocks(0, "linear")[i], NULL_BLOCK_IDX);
+    }
+    EXPECT_EQ(resource.kvCache().blocks(0, "linear")[4], before[4]);
+    EXPECT_EQ(resource.kvCache().blocks(0, "linear")[5], before[5]);
+}
+
+TEST_F(StreamCacheResourceTest, LinearHistoryReclaimDisabledFoldsHistoryToDecodeTail) {
+    prepareLinearHistoryResource(/*enable_reclaim=*/false);
+    auto&      resource = stream_->streamCacheResource();
+    const auto before   = resource.kvCache().blocks(0, "linear");
+    commitLinearHistoryToken();
+    ASSERT_TRUE(resource.incrKVBlock().ok());
+    const auto& after = resource.kvCache().blocks(0, "linear");
+    ASSERT_GE(after.size(), before.size());
+    // Without the committed-watermark retirement the decode cleanup restores
+    // the base folding semantics: history below the retained decode window is
+    // released to the pool instead of staying pinned by request references for
+    // the whole request lifetime.
+    const size_t live =
+        std::count_if(after.begin(), after.end(), [](int block) { return !isNullBlockIdx(block); });
+    EXPECT_LE(live, 3u);
+    EXPECT_EQ(after.front(), NULL_BLOCK_IDX);
+}
+
+TEST_F(StreamCacheResourceTest, LinearHistoryIneligibleTransfersAndTiersFoldToDecodeTail) {
+    for (bool pd_transfer : {true, false}) {
+        SCOPED_TRACE(pd_transfer ? "PD transfer" : "asynchronous lower tier publication");
+        prepareLinearHistoryResource();
+        auto&      resource                            = stream_->streamCacheResource();
+        const auto before                              = resource.kvCache().blocks(0, "linear");
+        stream_->generateConfig()->pd_separation       = pd_transfer;
+        resource.resource_context_.enable_device_cache = pd_transfer;
+        resource.resource_context_.enable_memory_cache  = !pd_transfer;
+        ASSERT_FALSE(resource.canReclaimLinearHistory(1));
+        commitLinearHistoryToken();
+        ASSERT_TRUE(resource.incrKVBlock().ok());
+        const auto& after = resource.kvCache().blocks(0, "linear");
+        ASSERT_GE(after.size(), before.size());
+        // These streams never own the committed-watermark retirement, so they
+        // keep the base folding semantics instead of pinning the whole
+        // history without any release path.
+        const size_t live =
+            std::count_if(after.begin(), after.end(), [](int block) { return !isNullBlockIdx(block); });
+        EXPECT_LE(live, 3u);
+        EXPECT_EQ(after.front(), NULL_BLOCK_IDX);
+        // Restore the configured storage tier before ordinary end-of-request cleanup.
+        resource.resource_context_.enable_device_cache = true;
+        resource.resource_context_.enable_memory_cache  = false;
+        stream_->releaseResource();
+    }
+}
+
+TEST_F(StreamCacheResourceTest, LinearHistoryReclaimUsesAcceptedSpecTokensAndPreservesSwappedTail) {
+    prepareLinearHistoryResource();
+    auto& resource = stream_->streamCacheResource();
+    // Set up a completed prefill without invoking the normal-update reclaim hook.
+    stream_->completeTokenIdsPtr()->data(0)[12] = 13;
+    stream_->setSeqLength(13);
+    stream_->setIsContextStream(false);
+    stream_->setReserveStep(4);
+    ASSERT_TRUE(resource.incrKVBlock().ok());
+    const auto before = resource.kvCache().blocks(0, "linear");
+    ASSERT_EQ(before.size(), 10u);
+    auto output    = std::make_shared<SpeculativeExecutorStreamOutput>();
+    output->tokens = torch::zeros({1, 2}, torch::kInt32);
+    stream_->setSPOutputBuffer(output);
+
+    StreamSpecUpdateInfo update_info{
+        .new_tokens          = torch::tensor({{14, 15, 16}}, torch::kInt32),
+        .num_new_tokens      = 3,
+        .draft_tokens        = torch::Tensor(),
+        .draft_hidden_states = torch::Tensor(),
+        .draft_token_probs   = torch::Tensor(),
+        .draft_token_gpu     = std::nullopt,
+    };
+    stream_->specUpdate(update_info);
+    ASSERT_FALSE(stream_->hasError());
+    ASSERT_EQ(stream_->seqLength(), 16);
+    const auto committed = resource.kvCache().blocks(0, "linear");
+    EXPECT_TRUE(std::equal(before.begin(), before.begin() + 6, committed.begin()));
+    EXPECT_EQ(committed[6], before[7]);
+    EXPECT_EQ(committed[7], before[8]);
+    EXPECT_EQ(committed[8], before[6]);
+    ASSERT_TRUE(resource.incrKVBlock().ok());
+    const auto& after = resource.kvCache().blocks(0, "linear");
+    ASSERT_EQ(after.size(), before.size() + 1);
+    for (size_t i = 0; i < 5; ++i) {
+        EXPECT_EQ(after[i], NULL_BLOCK_IDX);
+    }
+    EXPECT_EQ(after[5], before[5]);
+    EXPECT_EQ(after[6], before[7]);
+    EXPECT_EQ(after[7], before[8]);
+    EXPECT_EQ(after[8], before[6]);
+    EXPECT_EQ(after[9], before[9]);
+}
+
+TEST_F(StreamCacheResourceTest, LinearHistoryIneligibleGuardsFoldToDecodeTail) {
+    for (int guard = 0; guard < 3; ++guard) {
+        SCOPED_TRACE(guard);
+        prepareLinearHistoryResource();
+        auto&      resource = stream_->streamCacheResource();
+        const auto before   = resource.kvCache().blocks(0, "linear");
+        commitLinearHistoryToken();
+        if (guard == 0) {
+            stream_->setNeedReleaseResource(false);
+        } else if (guard == 1) {
+            resource.block_update_mapping_ = {{"linear", before.back(), before.back()}};
+        } else {
+            resource.holdKVCacheForPDSep();
+        }
+        ASSERT_FALSE(resource.canReclaimLinearHistory(1));
+        ASSERT_TRUE(resource.incrKVBlock().ok());
+        const auto& after = resource.kvCache().blocks(0, "linear");
+        ASSERT_GE(after.size(), before.size());
+        // None of these guards grants the committed-watermark retirement, so
+        // the decode cleanup folds to the retained decode tail exactly like
+        // base instead of pinning the whole history without a release path.
+        const size_t live =
+            std::count_if(after.begin(), after.end(), [](int block) { return !isNullBlockIdx(block); });
+        EXPECT_LE(live, 3u);
+        EXPECT_EQ(after.front(), NULL_BLOCK_IDX);
+        stream_->setNeedReleaseResource(true);
+        resource.clearKVBlockUpdateMapping();
+        resource.releaseKVCacheForPDSep();
+        stream_->releaseResource();
+    }
+}
+
+TEST_F(StreamCacheResourceTest, LinearHistoryPeakForecastIncludesFutureDecodeForFreshContext) {
+    auto config                        = test::makeSimpleLinearCacheConfig(1, 64, 2, DataType::TYPE_FP16);
+    config.reuse_cache_tail_blocks = std::numeric_limits<int>::max();
+    config.enable_linear_cache_reclaim = true;
+    prepareResourceWithCacheConfig(config, {1, 2}, true, RoleType::PDFUSION, {}, 1, 64);
+    stream_->generateConfig()->reuse_cache = true;
+    auto& resource                         = stream_->streamCacheResource();
+    ASSERT_TRUE(stream_->isContextStream());
+    ASSERT_EQ(resource.curBlocksNum(), 0);
+    const int legacy = cache_manager_->estimatePeakNeedBlocks(
+        resource.batch_kv_cache_resource_, 2, 2, 40, 0, true, 1, LinearCachePolicy::KEEP_HISTORY);
+    // With the folding gate, the keep-history forecast bills the same retained
+    // decode window, so the reclaim forecast matches it for this tiny prompt
+    // instead of staying strictly below the retired full-accumulation model;
+    // both still include the future decode growth beyond the initial prefill.
+    EXPECT_LE(stream_->estimatePeakNeedBlocks(40), legacy);
+    EXPECT_GT(stream_->estimatePeakNeedBlocks(40), stream_->estimateInitialNeedBlocks());
+    EXPECT_EQ(stream_->estimateInitialNeedBlocks(), 1);
+}
+
+TEST_F(StreamCacheResourceTest, LinearHistoryPeakForecastPreservesUnsupportedOwnershipModes) {
+    for (int guard = 0; guard < 12; ++guard) {
+        SCOPED_TRACE(guard);
+        prepareLinearHistoryResource();
+        auto& resource = stream_->streamCacheResource();
+        commitLinearHistoryToken();
+        switch (guard) {
+            case 0:
+                stream_->generateConfig()->num_return_sequences = 2;
+                break;
+            case 1:
+                stream_->generateConfig()->variable_num_beams = {1, 2};
+                break;
+            case 2:
+                stream_->generateConfig()->pd_separation = true;
+                break;
+            case 3:
+                stream_->setNeedReleaseResource(false);
+                break;
+            case 4:
+                resource.fake_inited_ = true;
+                break;
+            case 5:
+                resource.resource_released_ = true;
+                break;
+            case 6:
+                resource.allocator_load_context_ = std::make_shared<ImmediateAllocatorContext>(true);
+                break;
+            case 7:
+                resource.block_update_mapping_ = {{"linear", 1, 1}};
+                break;
+            case 8:
+                resource.holdKVCacheForPDSep();
+                break;
+            case 9:
+                resource.resource_context_.enable_device_cache = false;
+                resource.resource_context_.enable_memory_cache = true;
+                break;
+            case 10:
+                resource.resource_context_.role_type = RoleType::PREFILL;
+                break;
+            case 11:
+                resource.resource_context_.role_type = RoleType::DECODE;
+                break;
+        }
+        const int target = stream_->maxBatchSize();
+        int       common = std::min(stream_->completeTokenIdsPtr()->commonSeqLength(), stream_->seqLength());
+        if (target > 1) {
+            common = common / 2 * 2;
+        }
+        const int legacy = cache_manager_->estimatePeakNeedBlocks(resource.batch_kv_cache_resource_,
+                                                                  stream_->seqLength(),
+                                                                  common,
+                                                                  40,
+                                                                  0,
+                                                                  resource.reuseCache(),
+                                                                  target,
+                                                                  LinearCachePolicy::KEEP_HISTORY);
+        EXPECT_EQ(stream_->estimatePeakNeedBlocks(40), legacy);
+        stream_->generateConfig()->num_return_sequences = 1;
+        stream_->generateConfig()->variable_num_beams.clear();
+        stream_->setNeedReleaseResource(true);
+        resource.fake_inited_       = false;
+        resource.resource_released_ = false;
+        resource.allocator_load_context_.reset();
+        resource.clearKVBlockUpdateMapping();
+        resource.releaseKVCacheForPDSep();
+        resource.resource_context_.enable_device_cache = true;
+        resource.resource_context_.enable_memory_cache = false;
+        resource.resource_context_.role_type           = RoleType::PDFUSION;
+        stream_->releaseResource();
+    }
+}
+
+TEST_F(StreamCacheResourceTest, PDLinearTailHandoffKeepsInitialAdmissionEqualToAllocationWhenReclaimEnabled) {
+    for (bool enable_reclaim : {false, true}) {
+        SCOPED_TRACE(enable_reclaim);
+        auto config                        = test::makeSimpleHybridMhaCacheConfig(4, 64, 2, DataType::TYPE_FP16);
+        config.reuse_cache_tail_blocks = std::numeric_limits<int>::max();
+        config.enable_linear_cache_reclaim = enable_reclaim;
+        prepareResourceWithCacheConfig(
+            config, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, true, RoleType::PDFUSION, {}, 1, 32);
+        auto& resource                                 = stream_->streamCacheResource();
+        resource.resource_context_.enable_device_cache = true;
+        stream_->generateConfig()->reuse_cache         = true;
+        // The verified P->D handoff is authoritative even before the surrounding
+        // role/context transition. Both switches must use the tail allocator's
+        // demand, rather than charging a Fusion prefill that will never run.
+        resource.setPDDecodeLinearTailOnly(true);
+        ASSERT_TRUE(stream_->isContextStream());
+        const int    predicted   = stream_->estimatePeakNeedBlocks(/*remaining_tokens=*/0);
+        const size_t free_before = cache_manager_->freeBlocksNum();
+        ASSERT_TRUE(resource.initKVBlock().ok());
+        const int allocated = static_cast<int>(free_before - cache_manager_->freeBlocksNum());
+        EXPECT_EQ(allocated, 7);  // Six Full blocks and one Linear handoff state.
+        EXPECT_EQ(predicted, allocated);
+        EXPECT_FALSE(resource.canReclaimLinearHistory(/*target_batch_size=*/1));
+        const auto& linear = resource.kvCache().blocks(0, "linear");
+        ASSERT_EQ(linear.size(), 6u);
+        EXPECT_TRUE(std::all_of(linear.begin(), linear.end() - 1, isNullBlockIdx));
+        EXPECT_FALSE(isNullBlockIdx(linear.back()));
+    }
+}
+
+TEST_F(StreamCacheResourceTest, LinearCacheSwitchCombinationsPreserveRoleOwnershipAndRelease) {
+    for (const auto role : {RoleType::PDFUSION, RoleType::PREFILL, RoleType::DECODE}) {
+        for (bool enable_reclaim : {false, true}) {
+            for (bool enable_tail_only : {false, true}) {
+                SCOPED_TRACE(testing::Message() << "role=" << roleTypeToString(role) << " reclaim=" << enable_reclaim
+                                                << " tail=" << enable_tail_only);
+                auto config        = test::makeSimpleHybridMhaCacheConfig(4, 64, 2, DataType::TYPE_FP16);
+                config.reuse_cache_tail_blocks = std::numeric_limits<int>::max();
+                config.enable_linear_cache_reclaim = enable_reclaim;
+                prepareResourceWithCacheConfig(config, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, true, role, {}, 1, 64);
+                auto& resource                                 = stream_->streamCacheResource();
+                resource.resource_context_.enable_device_cache = true;
+                stream_->generateConfig()->reuse_cache         = true;
+                stream_->generateConfig()->ignore_eos          = true;
+                stream_->vocab_size_                           = 1024;
+                // Only DecodeRpcServer applies the global tail-only switch to a
+                // verified handoff. Ordinary Fusion/P requests keep their policy.
+                const bool handoff = role == RoleType::DECODE && enable_tail_only;
+                resource.setPDDecodeLinearTailOnly(handoff);
+                const int    peak_before = stream_->estimatePeakNeedBlocks(/*remaining_tokens=*/0);
+                const size_t free_before = cache_manager_->freeBlocksNum();
+                ASSERT_TRUE(resource.initKVBlock().ok());
+                EXPECT_EQ(peak_before, static_cast<int>(free_before - cache_manager_->freeBlocksNum()));
+                const auto original_full  = resource.kvCache().blocks(0, "full1");
+                for (int step = 0; step < 16; ++step) {
+                    commitLinearHistoryToken();
+                    ASSERT_TRUE(resource.incrKVBlock().ok());
+                    const auto& linear = resource.kvCache().blocks(0, "linear");
+                    const auto  live =
+                        std::count_if(linear.begin(), linear.end(), [](int block) { return !isNullBlockIdx(block); });
+                    // Reclaim retires committed history to NULL slots while the
+                    // decode tail stays live; every other combination (reclaim
+                    // off, or a role without the retirement path) folds the
+                    // layout to the same retained tail window via the decode
+                    // cleanup, exactly like base. Both keep the live tail
+                    // bounded instead of pinning the whole history.
+                    EXPECT_LE(live, 3);
+                    EXPECT_TRUE(isNullBlockIdx(linear.front()));
+                    const auto& full = resource.kvCache().blocks(0, "full1");
+                    ASSERT_GE(full.size(), original_full.size());
+                    EXPECT_TRUE(std::equal(original_full.begin(), original_full.end(), full.begin()));
+                    EXPECT_EQ(resource.mallocFailedTimes(), 0);
+                }
+                // Cancellation must retire the active tail exactly once, also
+                // when pending Fusion publication and the PD flag are both on.
+                stream_->reportError(ErrorCode::CANCELLED, "test cancellation");
+                stream_->releaseResource();
+                EXPECT_EQ(resource.curBlocksNum(), 0);
+                for (const auto& pool : cache_manager_->coordinator_manager_->groupBlockPools()) {
+                    EXPECT_EQ(pool->referencedBlocksNum(), 0u);
+                }
+            }
+        }
+    }
+}
+
+TEST_F(StreamCacheResourceTest, LinearHistoryReclaimRequiresSingleFutureBatch) {
+    prepareLinearHistoryResource();
+    auto&      resource = stream_->streamCacheResource();
+    const auto before   = resource.kvCache().blocks(0, "linear");
+    // One physical row today does not authorize retirement for a future fork.
+    stream_->generateConfig()->num_return_sequences = 2;
+    ASSERT_EQ(resource.kvCache().batchSize(), 1);
+    ASSERT_EQ(stream_->maxBatchSize(), 2);
+    resource.reclaimLinearHistory(12);
+    stream_->setIsContextStream(false);
+    resource.drainLinearHistory();
+    EXPECT_EQ(resource.kvCache().blocks(0, "linear"), before);
+    stream_->generateConfig()->num_return_sequences = 1;
+}
+
+TEST_F(StreamCacheResourceTest, LinearHistoryAsyncReservationJoinsOnlyAtPhysicalGrowth) {
+    for (bool enabled : {false, true}) {
+        SCOPED_TRACE(enabled);
+        prepareLinearHistoryResource(enabled);
+        commitLinearHistoryToken();
+        ASSERT_TRUE(stream_->streamCacheResource().incrKVBlock().ok());
+        ASSERT_EQ(stream_->seqLength(), 13);
+        auto& resource = stream_->streamCacheResource();
+        ASSERT_EQ(resource.kvCache().blocks(0, "linear").size(), 7u);
+        stream_->incPendingAsyncBookkeeping();
+        // Missing publication must not silently allocate against an unknown
+        // committed watermark. The stale-block-table guard applies with or
+        // without the reclaim forecast policy.
+        EXPECT_TRUE(stream_->needsAsyncBookkeepingJoinForKvReservation());
+        GenerateStream::NormalAsyncDeviceState state;
+        state.next_real_seq_len = 14;
+        stream_->setNormalAsyncDeviceState(state);
+        EXPECT_EQ(resource.singleBatchNeedBlocks(14, 0), 0);
+        EXPECT_FALSE(stream_->needsAsyncBookkeepingJoinForKvReservation());
+        state.next_real_seq_len = 15;
+        stream_->setNormalAsyncDeviceState(state);
+        EXPECT_GT(resource.singleBatchNeedBlocks(15, 0), 0);
+        EXPECT_EQ(stream_->needsAsyncBookkeepingJoinForKvReservation(), enabled);
+        stream_->decPendingAsyncBookkeepingAndMaybeRelease();
+    }
+}
+
+TEST_F(StreamCacheResourceTest, LinearHistoryAsyncReservationKeepsBaseJoinGuardWithoutReclaimEligibility) {
+    for (bool enabled : {false, true}) {
+        SCOPED_TRACE(enabled);
+        prepareLinearHistoryResource(enabled);
+        // A PD decode stream never owns the committed-watermark retirement:
+        // with reclaim enabled it must keep the base "join while no device
+        // length is published" guard instead of allocating the KV reservation
+        // against a length the async worker has not committed yet.
+        stream_->streamCacheResource().resource_context_.role_type = RoleType::DECODE;
+        ASSERT_FALSE(stream_->streamCacheResource().canReclaimLinearHistory(1));
+        commitLinearHistoryToken();
+        ASSERT_TRUE(stream_->streamCacheResource().incrKVBlock().ok());
+        stream_->incPendingAsyncBookkeeping();
+        EXPECT_TRUE(stream_->needsAsyncBookkeepingJoinForKvReservation());
+        GenerateStream::NormalAsyncDeviceState state;
+        state.next_real_seq_len = 14;
+        stream_->setNormalAsyncDeviceState(state);
+        // Once published, the base policy allocates from the published length.
+        EXPECT_FALSE(stream_->needsAsyncBookkeepingJoinForKvReservation());
+        stream_->decPendingAsyncBookkeepingAndMaybeRelease();
+    }
+}
 
 TEST_F(StreamCacheResourceTest, testResourceContextReadsIgnoreRequestCacheSwitchesEnv) {
     {
@@ -430,10 +948,11 @@ TEST_F(StreamCacheResourceTest, SwapLinearBlocksUsesPolicyAndTagAfterGroupReorde
 TEST_F(StreamCacheResourceTest, PrefillIncrementAfterHostLoadPreservesLinearReuseState) {
     for (const int tail_blocks : {2, 8}) {
         SCOPED_TRACE(tail_blocks);
+// Full-checkpoint materialization window (pre-#1574 linear_step=1).
         auto config                    = test::makeSimpleHybridMhaCacheConfig(4, 16, 2, DataType::TYPE_FP16, 2);
         config.reuse_cache_tail_blocks = tail_blocks;
         KVCacheConfig tiered_config;
-        tiered_config.enable_device_cache  = false;
+        tiered_config.enable_device_cache  = true;
         tiered_config.enable_memory_cache  = true;
         tiered_config.memory_cache_size_mb = 1;
         prepareResourceWithCacheConfig(config, {1, 2, 3, 4, 5, 6, 7, 8, 9}, true, RoleType::PDFUSION, tiered_config);
@@ -767,7 +1286,7 @@ TEST_F(StreamCacheResourceTest, testPrefillOnlyDisablesPrefixAndDeviceCacheReuse
         EXPECT_TRUE(resource.waitForAllocatorLoad().ok());
         EXPECT_EQ(resource.allocator_load_context_, nullptr);
         EXPECT_EQ(stream_->reuseLength(), 0);
-        EXPECT_EQ(resource.storeTarget(), Tier::NONE);
+        EXPECT_EQ(resource.insertTarget(), Tier::NONE);
         EXPECT_TRUE(stream_->generateConfig()->reuse_cache);
         cache_manager_->coordinator_manager_ = real_allocator;
         stream_->releaseResource();
@@ -823,7 +1342,7 @@ TEST_F(StreamCacheResourceTest, testCacheLookupIgnoresPerRequestTierSwitches) {
     EXPECT_TRUE(resource.enableCacheLookup());
 }
 
-TEST_F(StreamCacheResourceTest, testStoreTargetUsesDeploymentLocalTiers) {
+TEST_F(StreamCacheResourceTest, testInsertTargetUsesDeploymentLocalTiers) {
     prepareResource(true);
     auto& resource   = stream_->streamCacheResource();
     auto& request    = *stream_->generate_input_->generate_config;
@@ -836,9 +1355,9 @@ TEST_F(StreamCacheResourceTest, testStoreTargetUsesDeploymentLocalTiers) {
         Tier target;
     };
     const DeploymentCase cases[] = {{false, false, false, Tier::NONE},
-                                    {false, false, true, Tier::DISK},
-                                    {false, true, false, Tier::HOST},
-                                    {false, true, true, Tier::HOST},
+                                    {false, false, true, Tier::NONE},
+                                    {false, true, false, Tier::NONE},
+                                    {false, true, true, Tier::NONE},
                                     {true, false, false, Tier::DEVICE},
                                     {true, false, true, Tier::DEVICE},
                                     {true, true, false, Tier::DEVICE},
@@ -862,20 +1381,20 @@ TEST_F(StreamCacheResourceTest, testStoreTargetUsesDeploymentLocalTiers) {
                                  + " target=" + std::to_string(static_cast<int>(test_case.target)));
                     deployment.ignore_request_cache_switches = ignore_request_switches;
                     request.reuse_cache                      = true;
-                    EXPECT_EQ(resource.storeTarget(), test_case.target);
+                    EXPECT_EQ(resource.insertTarget(), test_case.target);
                     EXPECT_EQ(resource.enableDeviceCache(), test_case.device);
                     EXPECT_EQ(resource.enableMemoryCache(), test_case.host);
                     EXPECT_EQ(resource.enableDiskCache(), test_case.disk);
 
                     request.reuse_cache = false;
-                    EXPECT_EQ(resource.storeTarget(), ignore_request_switches ? test_case.target : Tier::NONE);
+                    EXPECT_EQ(resource.insertTarget(), ignore_request_switches ? test_case.target : Tier::NONE);
                 }
             }
         }
     }
 }
 
-TEST_F(StreamCacheResourceTest, testStoreTargetPreservesReuseCacheOverride) {
+TEST_F(StreamCacheResourceTest, testInsertTargetPreservesReuseCacheOverride) {
     prepareResource(true);
     auto& resource   = stream_->streamCacheResource();
     auto& request    = *stream_->generate_input_->generate_config;
@@ -889,20 +1408,20 @@ TEST_F(StreamCacheResourceTest, testStoreTargetPreservesReuseCacheOverride) {
     deployment.enable_device_cache           = true;
     deployment.enable_memory_cache           = true;
     deployment.enable_disk_cache             = true;
-    EXPECT_EQ(resource.storeTarget(), Tier::DEVICE);
+    EXPECT_EQ(resource.insertTarget(), Tier::DEVICE);
 
     deployment.enable_device_cache = false;
-    EXPECT_EQ(resource.storeTarget(), Tier::HOST);
+    EXPECT_EQ(resource.insertTarget(), Tier::NONE);
 
     deployment.enable_memory_cache = false;
-    EXPECT_EQ(resource.storeTarget(), Tier::DISK);
+    EXPECT_EQ(resource.insertTarget(), Tier::NONE);
 
     deployment.enable_disk_cache   = false;
     deployment.enable_remote_cache = true;
-    EXPECT_EQ(resource.storeTarget(), Tier::NONE);
+    EXPECT_EQ(resource.insertTarget(), Tier::NONE);
 
     deployment.enable_remote_cache = false;
-    EXPECT_EQ(resource.storeTarget(), Tier::NONE);
+    EXPECT_EQ(resource.insertTarget(), Tier::NONE);
 }
 
 TEST_F(StreamCacheResourceTest, testDecodeInitKVBlock_DisablesDeviceCacheOnlyForFirstMalloc) {
@@ -1007,6 +1526,64 @@ TEST_F(StreamCacheResourceTest, testAsyncLoadCache_WithoutAllocatorContext_Retur
 
     // No allocator-owned load context is in flight.
     ASSERT_FALSE(resource.asyncLoadCache());
+}
+
+TEST_F(StreamCacheResourceTest, PDLinearTailPolicyPersistsThroughAllocationAndRelease) {
+    prepareHybridResource(/*reuse_cache=*/true, RoleType::DECODE);
+    auto& resource                                 = stream_->streamCacheResource();
+    resource.resource_context_.enable_device_cache = true;
+    resource.setPDDecodeLinearTailOnly(true);
+    // PD handoff allocation happens before the stream becomes a decode stream.
+    ASSERT_TRUE(stream_->isContextStream());
+
+    auto allocator = std::make_shared<testing::NiceMock<MockCoordinatorCacheManager>>(cache_manager_->config_);
+    cache_manager_->coordinator_manager_ = allocator;
+    EXPECT_CALL(*allocator, initMallocForCommonLen(testing::_))
+        .WillOnce(testing::Invoke([](const MallocInfo& info) -> MallocResult {
+            EXPECT_TRUE(info.pd_decode_linear_tail_only);
+            EXPECT_TRUE(info.reuse_cache);
+            EXPECT_TRUE(info.enable_cache_lookup);
+            return {true, 0};
+        }));
+    EXPECT_CALL(*allocator, incrMalloc(testing::_))
+        .Times(2)
+        .WillRepeatedly(testing::Invoke([](const MallocInfo& info) -> MallocResult {
+            EXPECT_TRUE(info.pd_decode_linear_tail_only);
+            EXPECT_TRUE(info.reuse_cache);
+            for (int b = 0; b < info.batch_kv_cache_resource->batchSize(); ++b) {
+                info.batch_kv_cache_resource->mutableBlockIds(b, "linear").assign({NULL_BLOCK_IDX, 1});
+            }
+            return {true, 0};
+        }));
+    EXPECT_CALL(*allocator, insertIntoCache(testing::_, testing::_))
+        .WillOnce(testing::Invoke([](const InsertInfo& info, size_t&) {
+            EXPECT_TRUE(info.pd_decode_linear_tail_only);
+            EXPECT_EQ(info.target_tier, Tier::DEVICE);
+        }));
+
+    ASSERT_TRUE(resource.initKVBlock().ok());
+    stream_->setIsContextStream(false);
+    ASSERT_TRUE(resource.incrKVBlock().ok());
+    stream_->generate_status_->status = StreamState::FINISHED;
+    resource.releaseResource();
+}
+
+TEST_F(StreamCacheResourceTest, DecodeRoleAloneDoesNotEnableLinearTailPolicy) {
+    prepareHybridResource(/*reuse_cache=*/true, RoleType::DECODE);
+    auto& resource  = stream_->streamCacheResource();
+    auto  allocator = std::make_shared<testing::NiceMock<MockCoordinatorCacheManager>>(cache_manager_->config_);
+    cache_manager_->coordinator_manager_ = allocator;
+    EXPECT_CALL(*allocator, initMallocForCommonLen(testing::_))
+        .WillOnce(testing::Invoke([](const MallocInfo& info) -> MallocResult {
+            EXPECT_FALSE(info.pd_decode_linear_tail_only);
+            return {true, 0};
+        }));
+    EXPECT_CALL(*allocator, incrMalloc(testing::_))
+        .WillOnce(testing::Invoke([](const MallocInfo& info) -> MallocResult {
+            EXPECT_FALSE(info.pd_decode_linear_tail_only);
+            return {true, 0};
+        }));
+    ASSERT_TRUE(resource.initKVBlock().ok());
 }
 
 TEST_F(StreamCacheResourceTest, testLoadCacheDone_NoContext_ReturnsTrue) {
@@ -1138,6 +1715,47 @@ TEST_F(StreamCacheResourceTest, testCacheLoadPrepareFailureHasNoWaitLatency) {
     EXPECT_GE(metrics.match_to_ready_latency_us, metrics.match_cost_time_us + metrics.load_prepare_latency_us);
 }
 
+TEST_F(StreamCacheResourceTest, CacheLoadRetryWithoutLoadClearsPrepareFailureMetrics) {
+    prepareResource(/*reuse_cache=*/true, RoleType::PREFILL);
+    auto& resource = stream_->streamCacheResource();
+    for (bool matched : {false, true}) {
+        SCOPED_TRACE(matched);
+        MallocResult failed{false, 0, 100, MallocStatus::RETRYABLE_RESOURCE_EXHAUSTED};
+        failed.malloc_begin_time_us    = currentTimeUs() - 400;
+        failed.match_end_time_us       = failed.malloc_begin_time_us + 100;
+        failed.load_prepare_latency_us = 300;
+        failed.load_attempted          = true;
+        resource.recordCacheReuseMallocResult(failed);
+        ASSERT_TRUE(resource.cache_reuse_metrics_.report_load_metrics);
+        ASSERT_FALSE(resource.cache_reuse_metrics_.load_success);
+        ASSERT_TRUE(resource.cache_reuse_metrics_.report_match_to_ready_latency);
+
+        MallocResult retry{true, 0};
+        retry.device_input_length  = 6;
+        retry.malloc_begin_time_us = currentTimeUs() - 20;
+        retry.match_end_time_us    = matched ? retry.malloc_begin_time_us + 10 : 0;
+        retry.match_cost_time_us   = matched ? 10 : 0;
+        resource.recordCacheReuseMallocResult(retry);
+
+        const auto& metrics = resource.cache_reuse_metrics_;
+        EXPECT_FALSE(metrics.load_attempted);
+        EXPECT_FALSE(metrics.load_success);
+        EXPECT_FALSE(metrics.report_load_metrics);
+        EXPECT_FALSE(metrics.report_load_wait_latency);
+        EXPECT_EQ(metrics.load_prepare_latency_us, 0);
+        EXPECT_EQ(metrics.load_wait_latency_us, 0);
+        EXPECT_EQ(metrics.device_input_length, retry.device_input_length);
+        EXPECT_EQ(metrics.match_cost_time_us, retry.match_cost_time_us);
+        EXPECT_EQ(metrics.report_match_cost_time, matched);
+        EXPECT_EQ(metrics.report_match_to_ready_latency, matched);
+        if (matched) {
+            EXPECT_GE(metrics.match_to_ready_latency_us, retry.match_cost_time_us);
+        } else {
+            EXPECT_EQ(metrics.match_to_ready_latency_us, 0);
+        }
+    }
+}
+
 TEST_F(StreamCacheResourceTest, testCacheLoadFailureKeepsDeviceReuseMetrics) {
     prepareResource(/*reuse_cache=*/true, RoleType::PREFILL);
     StreamCacheResource&         resource = stream_->streamCacheResource();
@@ -1156,10 +1774,18 @@ TEST_F(StreamCacheResourceTest, testCacheLoadFailureKeepsDeviceReuseMetrics) {
     resource.malloc_begin_time_us_                    = resource.load_wait_begin_time_us_;
 
     auto load_context = makeAllocatorLoadContext(/*matched_blocks=*/1, {Tier::HOST});
+    stream_->recordLoadingCacheStartTime();
+    const auto exposed_start_us = currentTimeUs();
+    stream_->startCacheExposedWait(exposed_start_us);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
     ASSERT_TRUE(load_context->completeTransfers(1, false));
     ASSERT_EQ(load_context->mallocStatus(), MallocStatus::NONE);
+    const auto completed_us = load_context->completionTimeUs();
+    ASSERT_GT(completed_us, exposed_start_us);
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
     resource.allocator_load_context_ = load_context;
     ASSERT_TRUE(resource.loadCacheDone());
+    EXPECT_EQ(stream_->getTimeInfo().cache_exposed_wait_us, completed_us - exposed_start_us);
 
     EXPECT_EQ(stream_->reuseLength(), 2);
     EXPECT_EQ(stream_->initialReuseLength(), 2);
@@ -1241,6 +1867,349 @@ TEST_F(StreamCacheResourceTest, StorageMatchDefersReusePublicationUntilReadCompl
     EXPECT_EQ(resource.kvCache().cacheResource(0).storageBackendReuseBlockNum(), 2u);
 }
 
+TEST_F(StreamCacheResourceTest, RequestFinishFiltersRemoteReuseOnlyForPrefill) {
+    autil::EnvGuard feature("RTP_LLM_REMOTE_CACHE_ENABLE_DECODE_PUBLISH", "0");
+    for (const auto role : {RoleType::PREFILL, RoleType::PDFUSION, RoleType::DECODE}) {
+        SCOPED_TRACE(role);
+        auto  backend  = prepareStorageBackendResource(false, false, role);
+        auto& resource = stream_->streamCacheResource();
+        ASSERT_TRUE(resource.initKVBlock().ok());
+        ASSERT_TRUE(resource.waitForAllocatorLoad().ok());
+        auto& counts = resource.batch_kv_cache_resource_->cacheResource(0);
+        counts.setDeviceReuseBlockNum(1);
+        counts.setStorageBackendReuseBlockNum(1);
+        auto expected = counts.cacheKeys();
+        ASSERT_EQ(expected.size(), 3u);
+        if (role == RoleType::PREFILL) {
+            expected.erase(expected.begin() + 1);
+        }
+        stream_->generate_status_->status = StreamState::FINISHED;
+        stream_->fillSubGenerateStatus(StreamState::FINISHED);
+        stream_->releaseResource();
+        backend->shutdown();
+        EXPECT_EQ(backend->writtenKeyValues(), expected);
+        EXPECT_TRUE(resource.isResourceReleased());
+    }
+}
+
+TEST_F(StreamCacheResourceTest, AdoptedRemoteCountsControlRequestFinishWrites) {
+    for (const int outcome : {0, 1, 2}) {
+        SCOPED_TRACE(outcome);  // Success, read failure, read timeout.
+        auto backend = prepareStorageBackendResource(false, true, RoleType::PREFILL);
+        if (outcome == 1) {
+            backend->failNextRead();
+        } else if (outcome == 2) {
+            backend->timeoutNextRead();
+        }
+        auto& resource = stream_->streamCacheResource();
+        initCacheKeys(resource.batch_kv_cache_resource_, stream_->completeTokenIdsPtr(), 2);
+        ASSERT_TRUE(resource.initKVBlock().ok());
+        ASSERT_TRUE(resource.waitForAllocatorLoad().ok());
+        ASSERT_FALSE(stream_->hasError());
+        const auto& counts = resource.kvCache().cacheResource(0);
+        EXPECT_EQ(counts.memoryReuseBlockNum(), 1u);
+        EXPECT_EQ(counts.storageBackendReuseBlockNum(), outcome == 0 ? 1u : 0u);
+        auto expected = counts.cacheKeys();
+        ASSERT_EQ(expected.size(), 3u);
+        if (outcome == 0) {
+            expected.erase(expected.begin() + 1);
+        }
+        stream_->generate_status_->status = StreamState::FINISHED;
+        stream_->fillSubGenerateStatus(StreamState::FINISHED);
+        stream_->releaseResource();
+        backend->shutdown();
+        EXPECT_EQ(backend->writtenKeyValues(), expected);
+        EXPECT_TRUE(resource.isResourceReleased());
+    }
+}
+
+TEST_F(StreamCacheResourceTest, OverallDeadlineReturnsBeforeReadAndLateCompletionCannotPublishReuse) {
+    auto  backend  = prepareStorageBackendResource(false, false, RoleType::PREFILL, false, std::chrono::seconds(1));
+    auto& resource = stream_->streamCacheResource();
+    backend->blockReads();
+    block_tree_cache_detail::ScopeRollback release_read([&] { backend->releaseReads(); });
+    ASSERT_TRUE(resource.initKVBlock().ok());
+    ASSERT_TRUE(backend->waitForReadsFor(1));
+    auto context = std::dynamic_pointer_cast<LoadAsyncContext>(resource.allocator_load_context_);
+    ASSERT_NE(context, nullptr);
+    const auto original_resource = resource.batch_kv_cache_resource_;
+    const auto original_blocks   = original_resource->blocks(0, "default");
+    ASSERT_FALSE(original_blocks.empty());
+    auto pool = cache_manager_->coordinator_manager_->groupBlockPools().front();
+    block_tree_cache_test::BoundedThread<absl::Status> waiter(
+        [stream = stream_] { return stream->streamCacheResource().waitForAllocatorLoad(); });
+    ASSERT_EQ(waiter.waitFor(std::chrono::seconds(5)), std::future_status::ready);
+    EXPECT_EQ(waiter.get().code(), absl::StatusCode::kDeadlineExceeded);
+    EXPECT_NE(resource.batch_kv_cache_resource_, original_resource);
+    EXPECT_EQ(resource.kvCache().curBlocksNum(), 0);
+    EXPECT_FALSE(resource.allocator_load_context_);
+    EXPECT_FALSE(resource.skip_remote_cache_);
+    EXPECT_GE(pool->refCount(original_blocks.front()), 1u);
+    EXPECT_EQ(stream_->reuseLength(), 0);
+    EXPECT_FALSE(resource.cache_reuse_metrics_.load_success);
+    EXPECT_TRUE(resource.cache_reuse_metrics_.report_match_to_ready_latency);
+
+    release_read.run();
+    backend->shutdown();
+    block_tree_cache_test::BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*cache_manager_->block_tree_cache_);
+    EXPECT_FALSE(context->success());
+    EXPECT_EQ(context->errorInfo().code(), ErrorCode::DEADLINE_EXCEEDED);
+    EXPECT_EQ(stream_->reuseLength(), 0);
+    EXPECT_EQ(resource.kvCache().curBlocksNum(), 0);
+    EXPECT_FALSE(pool->isAllocated(original_blocks.front()));
+    EXPECT_EQ(backend->writeCalls(), 0u);
+}
+
+TEST_F(StreamCacheResourceTest, AsyncPrefillOverallDeadlineRetriesWithLocalCacheOnly) {
+    auto  backend  = prepareStorageBackendResource(false, true, RoleType::PREFILL, false, std::chrono::seconds(1));
+    auto& resource = stream_->streamCacheResource();
+    initCacheKeys(resource.batch_kv_cache_resource_, stream_->completeTokenIdsPtr(), 2);
+    backend->blockReads();
+    block_tree_cache_detail::ScopeRollback release_read([&] { backend->releaseReads(); });
+    stream_->generate_status_->status = StreamState::WAITING;
+    stream_->reportEvent(StreamEvents::CanRun);
+    ASSERT_EQ(stream_->moveToNext(), StreamState::LOADING_CACHE);
+    ASSERT_TRUE(backend->waitForReadsFor(1));
+    auto context = std::dynamic_pointer_cast<LoadAsyncContext>(resource.allocator_load_context_);
+    ASSERT_NE(context, nullptr);
+    ASSERT_EQ(context->localMatchedBlocks(), 1u);
+    const auto original_resource = resource.batch_kv_cache_resource_;
+    const auto original_blocks   = original_resource->blocks(0, "default");
+    ASSERT_EQ(original_blocks.size(), 3u);
+    auto pool = cache_manager_->coordinator_manager_->groupBlockPools().front();
+
+    block_tree_cache_test::BoundedThread<void> waiter([context] { context->waitDone(); });
+    ASSERT_EQ(waiter.waitFor(std::chrono::seconds(5)), std::future_status::ready);
+    waiter.get();
+    ASSERT_TRUE(context->deadlineExceeded());
+    ASSERT_EQ(stream_->moveToNext(), StreamState::WAITING);
+    EXPECT_FALSE(stream_->hasError());
+    EXPECT_FALSE(stream_->hasEvent(StreamEvents::LoadInitiated));
+    EXPECT_TRUE(resource.skip_remote_cache_);
+    EXPECT_NE(resource.batch_kv_cache_resource_, original_resource);
+    EXPECT_EQ(resource.curBlocksNum(), 0);
+    EXPECT_TRUE(pool->isAllocated(original_blocks[1]));
+    EXPECT_EQ(stream_->reuseLength(), 0);
+
+    auto retry_state = stream_->moveToNext();
+    if (retry_state == StreamState::LOADING_CACHE) {
+        auto retry_context = resource.allocator_load_context_;
+        ASSERT_NE(retry_context, nullptr);
+        block_tree_cache_test::BoundedThread<void> local_waiter([retry_context] { retry_context->waitDone(); });
+        ASSERT_EQ(local_waiter.waitFor(std::chrono::seconds(5)), std::future_status::ready);
+        local_waiter.get();
+        ASSERT_EQ(stream_->moveToNext(), StreamState::WAITING);
+        retry_state = stream_->moveToNext();
+    }
+    ASSERT_EQ(retry_state, StreamState::RUNNING);
+    EXPECT_FALSE(stream_->hasError());
+    EXPECT_EQ(backend->matchCalls(), 1u);
+    EXPECT_EQ(stream_->localReuseLength(), 2);
+    EXPECT_EQ(stream_->remoteReuseLength(), 0);
+    const auto retry_blocks = resource.kvCache().blocks(0, "default");
+    ASSERT_EQ(retry_blocks.size(), original_blocks.size());
+    EXPECT_NE(retry_blocks[1], original_blocks[1]);
+
+    release_read.run();
+    backend->shutdown();
+    block_tree_cache_test::BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*cache_manager_->block_tree_cache_);
+    EXPECT_FALSE(pool->isAllocated(original_blocks[1]));
+    EXPECT_EQ(resource.kvCache().blocks(0, "default"), retry_blocks);
+    EXPECT_EQ(stream_->remoteReuseLength(), 0);
+}
+
+TEST_F(StreamCacheResourceTest, AsyncOverallDeadlineRemainsTerminalOutsidePrefillContext) {
+    for (const auto role : {RoleType::DECODE, RoleType::PDFUSION, RoleType::PREFILL}) {
+        SCOPED_TRACE(static_cast<int>(role));
+        auto backend = prepareStorageBackendResource(false, false, role, false, std::chrono::milliseconds(0));
+        // PREFILL can also carry a decode-phase stream after PD fallback.
+        stream_->setIsContextStream(role != RoleType::PREFILL);
+        auto& resource = stream_->streamCacheResource();
+        ASSERT_TRUE(resource.initKVBlock().ok());
+        auto context = std::dynamic_pointer_cast<LoadAsyncContext>(resource.allocator_load_context_);
+        ASSERT_NE(context, nullptr);
+        ASSERT_TRUE(context->deadlineExceeded());
+
+        EXPECT_TRUE(resource.loadCacheDone());
+        EXPECT_TRUE(stream_->hasError());
+        EXPECT_EQ(stream_->statusInfo().code(), ErrorCode::LOAD_CACHE_TIMEOUT);
+        EXPECT_FALSE(resource.skip_remote_cache_);
+        EXPECT_FALSE(resource.allocator_load_context_);
+        EXPECT_EQ(backend->matchCalls(), 0u);
+        block_tree_cache_test::BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*cache_manager_->block_tree_cache_);
+    }
+}
+
+TEST_F(StreamCacheResourceTest, RemoteTimeoutKeepsHostPrefixAndReplacesFrozenSuffix) {
+    auto  backend  = prepareStorageBackendResource(false, true, RoleType::PREFILL);
+    auto& resource = stream_->streamCacheResource();
+    initCacheKeys(resource.batch_kv_cache_resource_, stream_->completeTokenIdsPtr(), 2);
+    backend->blockReads();
+    block_tree_cache_detail::ScopeRollback release_read([&] { backend->releaseReads(); });
+    backend->timeoutNextRead();
+    ASSERT_TRUE(resource.initKVBlock().ok());
+    ASSERT_TRUE(backend->waitForReadsFor(1));
+    auto context = std::dynamic_pointer_cast<LoadAsyncContext>(resource.allocator_load_context_);
+    ASSERT_NE(context, nullptr);
+    const auto original = resource.kvCache().blocks(0, "default");
+    ASSERT_EQ(original.size(), 3u);
+    ASSERT_EQ(context->localMatchedBlocks(), 1u);
+    auto pool = cache_manager_->coordinator_manager_->groupBlockPools().front();
+    backend->releaseReads();
+    context->waitDone();
+    ASSERT_FALSE(context->success());
+    ASSERT_TRUE(context->localLoadSucceeded());
+    ASSERT_TRUE(pool->isFrozen(original[1]));
+
+    ASSERT_TRUE(resource.waitForAllocatorLoad().ok());
+    EXPECT_FALSE(stream_->hasError());
+    EXPECT_EQ(stream_->reuseLength(), 2);
+    EXPECT_EQ(stream_->initialReuseLength(), 2);
+    EXPECT_EQ(stream_->getMtpTokenIndex(), 2u);
+    EXPECT_EQ(stream_->localReuseLength(), 2);
+    EXPECT_EQ(stream_->hostReuseLength(), 2);
+    EXPECT_EQ(stream_->remoteReuseLength(), 0);
+    EXPECT_EQ(resource.kvCache().cacheResource(0).memoryReuseBlockNum(), 1u);
+    EXPECT_EQ(resource.kvCache().cacheResource(0).storageBackendReuseBlockNum(), 0u);
+    const auto replacement = resource.kvCache().blocks(0, "default");
+    EXPECT_EQ(replacement[0], original[0]);
+    EXPECT_NE(replacement[1], original[1]);
+    EXPECT_EQ(replacement[2], original[2]);
+    EXPECT_FALSE(pool->isFrozen(replacement[1]));
+    EXPECT_EQ(pool->refCount(original[1]), 1u);
+    EXPECT_FALSE(resource.cache_reuse_metrics_.load_success);
+    EXPECT_TRUE(resource.cache_reuse_metrics_.report_load_metrics);
+    EXPECT_TRUE(resource.skip_remote_cache_);
+}
+
+TEST_F(StreamCacheResourceTest, RemoteReadFailureKeepsHostPrefixWithoutAllocationWhenPoolIsFull) {
+    auto  backend  = prepareStorageBackendResource(false, true, RoleType::PREFILL);
+    auto& resource = stream_->streamCacheResource();
+    ASSERT_TRUE(resource.enableDeviceCache());
+    initCacheKeys(resource.batch_kv_cache_resource_, stream_->completeTokenIdsPtr(), 2);
+    backend->blockReads();
+    block_tree_cache_detail::ScopeRollback release_read([&] { backend->releaseReads(); });
+    backend->failNextRead();
+    ASSERT_TRUE(resource.initKVBlock().ok());
+    ASSERT_TRUE(backend->waitForReadsFor(1));
+    auto context = std::dynamic_pointer_cast<LoadAsyncContext>(resource.allocator_load_context_);
+    ASSERT_NE(context, nullptr);
+    const auto original = resource.kvCache().blocks(0, "default");
+    ASSERT_EQ(original.size(), 3u);
+    ASSERT_EQ(context->localMatchedBlocks(), 1u);
+    auto pool = cache_manager_->coordinator_manager_->groupBlockPools().front();
+    backend->releaseReads();
+    context->waitDone();
+    ASSERT_FALSE(context->success());
+    ASSERT_TRUE(context->localLoadSucceeded());
+    ASSERT_FALSE(context->backendTimedOut());
+    ASSERT_EQ(context->errorInfo().code(), ErrorCode::EXECUTION_EXCEPTION);
+    ASSERT_GT(pool->refCount(original[0]), 1u);
+    ASSERT_FALSE(pool->isFrozen(original[1]));
+
+    auto held = pool->malloc(pool->freeBlocksNum());
+    ASSERT_TRUE(held.has_value());
+    pool->incRef(*held);
+    block_tree_cache_detail::ScopeRollback release_held([&] { pool->decRef(*held); });
+    ASSERT_EQ(pool->freeBlocksNum(), 0u);
+    const auto status = resource.waitForAllocatorLoad();
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    EXPECT_FALSE(stream_->hasError());
+    EXPECT_EQ(resource.kvCache().blocks(0, "default"), original);
+    EXPECT_EQ(pool->freeBlocksNum(), 0u);
+    EXPECT_GT(pool->refCount(original[0]), 1u);
+    EXPECT_EQ(stream_->reuseLength(), 2);
+    EXPECT_EQ(stream_->initialReuseLength(), 2);
+    EXPECT_EQ(stream_->getMtpTokenIndex(), 2u);
+    EXPECT_EQ(stream_->localReuseLength(), 2);
+    EXPECT_EQ(stream_->hostReuseLength(), 2);
+    EXPECT_EQ(stream_->remoteReuseLength(), 0);
+    EXPECT_EQ(resource.kvCache().cacheResource(0).memoryReuseBlockNum(), 1u);
+    EXPECT_EQ(resource.kvCache().cacheResource(0).storageBackendReuseBlockNum(), 0u);
+    EXPECT_FALSE(resource.skip_remote_cache_);
+    EXPECT_EQ(backend->matchCalls(), 1u);
+    EXPECT_FALSE(resource.cache_reuse_metrics_.load_success);
+    EXPECT_TRUE(resource.cache_reuse_metrics_.report_load_metrics);
+}
+
+TEST_F(StreamCacheResourceTest, RemoteTimeoutAllocationRetryKeepsLocalLookupAndSkipsBackend) {
+    for (bool resident : {false, true}) {
+        SCOPED_TRACE(resident);
+        auto  backend  = prepareStorageBackendResource(false, true, RoleType::PREFILL, resident);
+        auto& resource = stream_->streamCacheResource();
+        initCacheKeys(resource.batch_kv_cache_resource_, stream_->completeTokenIdsPtr(), 2);
+        backend->blockReads();
+        block_tree_cache_detail::ScopeRollback release_read([&] { backend->releaseReads(); });
+        backend->timeoutNextRead();
+        ASSERT_TRUE(resource.initKVBlock().ok());
+        ASSERT_TRUE(backend->waitForReadsFor(1));
+        auto context = std::dynamic_pointer_cast<LoadAsyncContext>(resource.allocator_load_context_);
+        ASSERT_NE(context, nullptr);
+        ASSERT_EQ(context->localMatchedBlocks(), 1u);
+        auto pool = cache_manager_->coordinator_manager_->groupBlockPools().front();
+        auto held = pool->malloc(pool->freeBlocksNum());
+        ASSERT_TRUE(held.has_value());
+        pool->incRef(*held);
+        block_tree_cache_detail::ScopeRollback release_held([&] { pool->decRef(*held); });
+        backend->releaseReads();
+        context->waitDone();
+        ASSERT_TRUE(context->localLoadSucceeded());
+
+        EXPECT_TRUE(absl::IsUnavailable(resource.waitForAllocatorLoad()));
+        ASSERT_TRUE(resource.cache_reuse_metrics_.report_load_metrics);
+        ASSERT_FALSE(resource.cache_reuse_metrics_.load_success);
+        ASSERT_TRUE(resource.cache_reuse_metrics_.report_load_wait_latency);
+        EXPECT_EQ(resource.curBlocksNum(), 0);
+        EXPECT_EQ(stream_->reuseLength(), 0);
+        pool->decRef(*held);
+        release_held.dismiss();
+        ASSERT_TRUE(resource.initKVBlock().ok());
+        ASSERT_TRUE(resource.waitForAllocatorLoad().ok());
+        EXPECT_EQ(backend->matchCalls(), 1u);
+        // Atomic suffix replacement preserves the local prefix on allocation retry.
+        EXPECT_EQ(stream_->reuseLength(), 2);
+        EXPECT_EQ(stream_->deviceReuseLength(), 2);
+        EXPECT_EQ(stream_->remoteReuseLength(), 0);
+        EXPECT_FALSE(resource.cache_reuse_metrics_.load_attempted);
+        EXPECT_FALSE(resource.cache_reuse_metrics_.report_load_metrics);
+        EXPECT_FALSE(resource.cache_reuse_metrics_.report_load_wait_latency);
+        EXPECT_EQ(resource.cache_reuse_metrics_.load_prepare_latency_us, 0);
+        EXPECT_EQ(resource.cache_reuse_metrics_.load_wait_latency_us, 0);
+        EXPECT_TRUE(resource.cache_reuse_metrics_.report_match_to_ready_latency);
+    }
+}
+
+TEST_F(StreamCacheResourceTest, RemoteReadFailurePublishesOnlyReadyLocalTiersWithCpReuseUnit) {
+    for (const auto error : {ErrorCode::DEADLINE_EXCEEDED, ErrorCode::EXECUTION_EXCEPTION}) {
+        SCOPED_TRACE(static_cast<int>(error));
+        for (bool local_success : {false, true}) {
+            SCOPED_TRACE(local_success);
+            prepareResourceWithInputTokens(std::vector<int>(16, 1), true, RoleType::PREFILL);
+            auto& resource                  = stream_->streamCacheResource();
+            cache_manager_->cp_slot_mapper_ = std::make_shared<CPSlotMapper>(0, 2, 2);
+            const int reuse_unit            = resource.reuseBlockTokens();
+            auto      context         = makeAllocatorLoadContext(3, {Tier::DEVICE, Tier::HOST, Tier::DISK}, false);
+            context->backend_pending_ = true;
+            ASSERT_TRUE(context->commit());
+            stream_->setReuseLength(reuse_unit);
+            stream_->setInitialReuseLength(reuse_unit);
+            stream_->setLocalReuseLength(reuse_unit);
+            resource.allocator_load_context_ = context;
+            ASSERT_TRUE(context->completeTransfers(1, true));
+            ASSERT_TRUE(context->completeTransfers(1, local_success));
+            context->onBackendRead(ErrorInfo(error, "remote read failure"));
+            ASSERT_TRUE(resource.waitForAllocatorLoad().ok());
+            EXPECT_EQ(stream_->reuseLength(), (local_success ? 3 : 1) * reuse_unit);
+            EXPECT_EQ(stream_->hostReuseLength(), local_success ? reuse_unit : 0);
+            EXPECT_EQ(stream_->diskReuseLength(), local_success ? reuse_unit : 0);
+            EXPECT_EQ(stream_->deviceReuseLength(), reuse_unit);
+            EXPECT_EQ(stream_->remoteReuseLength(), 0);
+            EXPECT_FALSE(resource.cache_reuse_metrics_.load_success);
+            EXPECT_EQ(resource.skip_remote_cache_, error == ErrorCode::DEADLINE_EXCEEDED);
+        }
+    }
+}
+
 TEST_F(StreamCacheResourceTest, StorageMatchDoesNotBlockIndependentAllocation) {
     auto  backend        = prepareStorageBackendResource(/*block_matches=*/true);
     auto& first_resource = stream_->streamCacheResource();
@@ -1313,8 +2282,19 @@ TEST_F(StreamCacheResourceTest, testAllocatorLoadContextGatesReadinessUntilDone)
 
     EXPECT_TRUE(resource.asyncLoadCache());
     EXPECT_FALSE(resource.loadCacheDone());
+    stream_->recordLoadingCacheStartTime();
+    const auto exposed_start_us = currentTimeUs();
+    stream_->startCacheExposedWait(exposed_start_us);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
     EXPECT_TRUE(load_context->completeTransfers(1, true));
-    EXPECT_TRUE(resource.loadCacheDone());
+    const auto completed_us = load_context->completionTimeUs();
+    ASSERT_GT(completed_us, exposed_start_us);
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    stream_->reportEvent(StreamEvents::CanRun);
+    stream_->reportEvent(StreamEvents::LoadInitiated);
+    stream_->generate_status_->status = StreamState::LOADING_CACHE;
+    EXPECT_EQ(stream_->moveToNext(), StreamState::WAITING);
+    EXPECT_EQ(stream_->getTimeInfo().cache_exposed_wait_us, completed_us - exposed_start_us);
     EXPECT_EQ(resource.allocator_load_context_, nullptr);
     EXPECT_FALSE(stream_->hasError());
 }
@@ -1510,6 +2490,68 @@ TEST_F(StreamCacheResourceTest, testPrefillLoadFailureDetachesSharedSuffix) {
         stream_->releaseResource();
         EXPECT_EQ(cache_manager_->freeBlocksNum(), 8u);
     }
+}
+
+TEST_F(StreamCacheResourceTest, HostSuccessDiskFailureKeepsJointPrefixAndDetachesOnlySuffix) {
+    prepareResourceWithInputTokens({1, 2, 3, 4, 5, 6, 7, 8}, true, RoleType::PREFILL);
+    auto& resource = stream_->streamCacheResource();
+    ASSERT_TRUE(resource.initKVBlock().ok());
+    auto&      batch    = resource.kvCacheMutable();
+    const auto original = batch.blocks(0, "default");
+    ASSERT_EQ(original.size(), 4u);
+    const auto pool = cache_manager_->coordinator_manager_->groupBlockPools().front();
+    for (const auto block : original) {
+        pool->incTreeRef(block, BlockTreeRefType::CACHE);
+    }
+    stream_->setReuseLength(2);
+    stream_->setInitialReuseLength(2);
+    stream_->setLocalReuseLength(2);
+    auto context = makeAllocatorLoadContext(4, {Tier::DEVICE, Tier::HOST, Tier::DISK, Tier::HOST}, false);
+    context->setLocalMatchLengths(1, 2);
+    ASSERT_TRUE(context->commit());
+    ASSERT_TRUE(context->completeTransfers(2, true, Tier::HOST));
+    EXPECT_FALSE(context->done());
+    ASSERT_TRUE(context->completeTransfers(1, false, Tier::DISK));
+    ASSERT_EQ(context->deviceReadyBlocks(), 2u);
+    resource.allocator_load_context_ = context;
+
+    ASSERT_TRUE(resource.waitForAllocatorLoad().ok());
+    EXPECT_EQ(stream_->reuseLength(), 4);
+    EXPECT_EQ(stream_->initialReuseLength(), 4);
+    EXPECT_EQ(stream_->localReuseLength(), 4);
+    EXPECT_EQ(stream_->deviceReuseLength(), 2);
+    EXPECT_EQ(stream_->hostReuseLength(), 2);
+    EXPECT_EQ(stream_->diskReuseLength(), 0);
+    EXPECT_EQ(batch.cacheResource(0).deviceReuseBlockNum(), 1u);
+    EXPECT_EQ(batch.cacheResource(0).memoryReuseBlockNum(), 1u);
+    EXPECT_EQ(batch.cacheResource(0).diskReuseBlockNum(), 0u);
+    EXPECT_FALSE(resource.cache_reuse_metrics_.load_success);
+    for (size_t index = 0; index < original.size(); ++index) {
+        EXPECT_EQ(batch.blocks(0, "default")[index] == original[index], index < 2);
+        pool->decTreeRef(original[index], BlockTreeRefType::CACHE);
+    }
+    stream_->releaseResource();
+    EXPECT_EQ(cache_manager_->freeBlocksNum(), 8u);
+}
+
+TEST_F(StreamCacheResourceTest, HostSuccessDiskFailureUsesJointPrefixWithCpReuseUnit) {
+    prepareResourceWithInputTokens(std::vector<int>(16, 1), true, RoleType::PREFILL);
+    cache_manager_->cp_slot_mapper_ = std::make_shared<CPSlotMapper>(0, 2, 2);
+    auto&     resource              = stream_->streamCacheResource();
+    const int unit                  = resource.reuseBlockTokens();
+    stream_->setReuseLength(unit);
+    auto context = makeAllocatorLoadContext(4, {Tier::DEVICE, Tier::HOST, Tier::DISK, Tier::HOST}, false);
+    context->setLocalMatchLengths(1, 2);
+    ASSERT_TRUE(context->commit());
+    ASSERT_TRUE(context->completeTransfers(1, false, Tier::DISK));
+    EXPECT_FALSE(context->done());
+    ASSERT_TRUE(context->completeTransfers(2, true, Tier::HOST));
+    resource.allocator_load_context_ = context;
+    ASSERT_TRUE(resource.waitForAllocatorLoad().ok());
+    EXPECT_EQ(stream_->reuseLength(), 2 * unit);
+    EXPECT_EQ(stream_->deviceReuseLength(), unit);
+    EXPECT_EQ(stream_->hostReuseLength(), unit);
+    EXPECT_EQ(stream_->diskReuseLength(), 0);
 }
 
 TEST_F(StreamCacheResourceTest, testPrefillLoadFailureDetachShortfallRearmsAllocation) {

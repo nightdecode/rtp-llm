@@ -380,7 +380,7 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
 
     py::object py_init_result;
     // Always initialize py_model_ so it can be used as fallback when CUDA graph cannot run
-    py_model_ = py_instance;
+    py_model_                      = py_instance;
     synchronize_cuda_graph_choice_ = enable_cuda_graph_ && py::hasattr(py_model_, "synchronize_cuda_graph_choice")
                                      && py_model_.attr("synchronize_cuda_graph_choice").cast<bool>();
     // MtpExecutor passes use_spec_decoding only to its target wrapper. The
@@ -424,7 +424,8 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
         params.sp_config.type == SP_TYPE_NONE && params.parallelism_config.role_type == RoleType::PDFUSION
         && params.parallelism_config.dp_size > 1 && py::hasattr(py_model_, "prepare_moe_forward");
     if (mtp_indexer_role_ != MtpIndexerRole::NORMAL) {
-        RTP_LLM_CHECK_WITH_INFO((fixed_graph_indexer_ || enable_cuda_graph_) && dspark_model_role_ == DSparkModelRole::NONE,
+        RTP_LLM_CHECK_WITH_INFO((fixed_graph_indexer_ || enable_cuda_graph_)
+                                    && dspark_model_role_ == DSparkModelRole::NONE,
                                 "MTP index sharing requires a fixed ordinary CUDA graph wrapper");
         RTP_LLM_CHECK(py::hasattr(py_model_, "set_mtp_indexer_role"));
         py_model_.attr("set_mtp_indexer_role")(static_cast<int>(mtp_indexer_role_));
@@ -482,12 +483,16 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
             RTP_LLM_CHECK_WITH_INFO(width > 0, "DSpARK CUDA graph input hidden width must be positive, got %ld", width);
             graph_params.input_hidden_size = static_cast<size_t>(width);
         }
-        graph_params.model_data_type        = dtype;
-        graph_params.max_context_batch_size = params.concurrency_config.concurrency_limit;
-        if (fixed_graph_indexer_) {
-            graph_params.max_context_batch_size =
-                std::min<int64_t>(graph_params.max_context_batch_size, params.runtime_config.max_generate_batch_size);
-        }
+        graph_params.model_data_type = dtype;
+        // The decode scheduler caps decode batches at
+        // min(concurrency_limit, max_generate_batch_size); converge the capture
+        // side to the same bound. Decode-role DSV4 models size their MoE
+        // per-rank capacity from the (smaller) override, so capturing buckets
+        // at the raw concurrency limit makes the eager probe forward exceed
+        // max_tokens_per_rank and abort engine startup.
+        graph_params.max_context_batch_size =
+            std::min<size_t>(static_cast<size_t>(std::max(params.concurrency_config.concurrency_limit, 1)),
+                             static_cast<size_t>(std::max(params.runtime_config.max_generate_batch_size, int64_t(1))));
         graph_params.prefill_capture_seq_lens   = params.hw_kernel_config.prefill_capture_seq_lens;
         graph_params.decode_capture_batch_sizes = params.hw_kernel_config.decode_capture_batch_sizes;
         if (params.kv_cache_layer_layout.has_value()) {

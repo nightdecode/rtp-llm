@@ -31,6 +31,9 @@ from rtp_llm.server.server_args.grpc_group_args import (
 )
 from rtp_llm.server.server_args.hw_kernel_group_args import init_hw_kernel_group_args
 from rtp_llm.server.server_args.jit_group_args import init_jit_group_args
+from rtp_llm.server.server_args.kernel_tuning_group_args import (
+    init_kernel_tuning_group_args,
+)
 from rtp_llm.server.server_args.kv_cache_group_args import init_kv_cache_group_args
 from rtp_llm.server.server_args.load_group_args import init_load_group_args
 from rtp_llm.server.server_args.lora_group_args import init_lora_group_args
@@ -63,6 +66,7 @@ from rtp_llm.server.server_args.speculative_decoding_group_args import (
 )
 from rtp_llm.server.server_args.vit_group_args import init_vit_group_args
 from rtp_llm.utils.backend_registry import ensure_backend_entrypoint_loaded
+from rtp_llm.utils.kvcm_address import normalize_kvcm_address
 
 _T = TypeVar("_T")
 
@@ -472,6 +476,7 @@ def init_all_group_args(
     )
     init_hw_kernel_group_args(parser, py_env_configs.py_hw_kernel_config)
     init_kv_cache_group_args(parser, py_env_configs.kv_cache_config)
+    init_kernel_tuning_group_args(parser, py_env_configs.kernel_tuning_config)
     init_load_group_args(parser, py_env_configs.load_config, py_env_configs.model_args)
     init_lora_group_args(parser, py_env_configs.lora_config)
     init_master_group_args(parser, py_env_configs.master_config)
@@ -544,6 +549,28 @@ def setup_args(args: Optional[Sequence[str]] = None) -> PyEnvConfigs:
     # 解析参数（会自动应用所有配置绑定）
     parsed_args = parser.parse_args(args)
     py_env_configs.server_config.validate_allocator_dump_config()
+    kv_cache_config = py_env_configs.kv_cache_config
+    server_address, vipserver_domain = normalize_kvcm_address(
+        kv_cache_config.kvcm_server_address
+    )
+    kv_cache_config.kvcm_server_address = server_address
+    kv_cache_config.kvcm_vipserver_domain = vipserver_domain
+    kv_cache_config.kvcm_enable_vipserver = bool(vipserver_domain)
+    if (
+        kv_cache_config.kv_cache_event_publisher_type == "kvcm"
+        and not kv_cache_config.kv_cache_event_instance_id
+    ):
+        kv_cache_config.kv_cache_event_instance_id = (
+            os.environ.get("SPECTRUM_DEPLOYMENT_NAME", "").strip()
+            or os.environ.get("DEPLOYMENT_NAME", "").strip()
+        )
+    if (
+        kv_cache_config.kv_cache_event_snapshot_interval_ms <= 0
+        and not kv_cache_config.enable_remote_cache
+    ):
+        parser.error(
+            "kv_cache_event_snapshot_interval_ms must be positive when remote cache is disabled"
+        )
 
     # Normalize the two switches before model construction and process spawn.
     from rtp_llm.utils.warmup import configure_warmup

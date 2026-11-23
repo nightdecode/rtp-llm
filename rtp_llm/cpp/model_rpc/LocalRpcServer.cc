@@ -18,6 +18,7 @@
 #include "rtp_llm/cpp/model_rpc/proto/model_rpc_service.pb.h"
 #include "rtp_llm/cpp/config/EplbConfig.h"
 #include "rtp_llm/cpp/config/RoleTypes.h"
+#include "rtp_llm/cpp/cache/CacheGroupType.h"
 #include "rtp_llm/cpp/cache/Types.h"
 #include "rtp_llm/cpp/telemetry/PhaseSpanSynthesizer.h"
 
@@ -522,16 +523,23 @@ grpc::Status LocalRpcServer::GenerateStreamCall(grpc::ServerContext*            
         }
         const auto             time_info = stream->getTimeInfo();
         telemetry::PhaseTiming phase_timing;
-        phase_timing.begin_time_us           = time_info.begin_time_us;
-        phase_timing.running_started         = time_info.running_started;
-        phase_timing.running_started_time_us = time_info.running_started_time_us;
-        phase_timing.first_token_committed   = time_info.first_token_committed;
-        phase_timing.first_token_time_us     = time_info.first_token_time_us;
-        phase_timing.generation_done         = time_info.generation_done;
-        phase_timing.generation_done_time_us = time_info.generation_done_time_us;
-        phase_timing.synthesis_end_time_us   = currentTimeUs();
-        phase_timing.request_id              = generate_context.request_id;
-        const bool request_ok                = generate_context.error_status.ok() && !exception_unwinding;
+        phase_timing.begin_time_us               = time_info.begin_time_us;
+        phase_timing.running_started             = time_info.running_started;
+        phase_timing.running_started_time_us     = time_info.running_started_time_us;
+        phase_timing.first_token_committed       = time_info.first_token_committed;
+        phase_timing.first_token_time_us         = time_info.first_token_time_us;
+        phase_timing.generation_done             = time_info.generation_done;
+        phase_timing.generation_done_time_us     = time_info.generation_done_time_us;
+        phase_timing.synthesis_end_time_us       = currentTimeUs();
+        phase_timing.request_id                  = generate_context.request_id;
+        phase_timing.scheduler_enqueue_time_us   = time_info.scheduler_enqueue_time_us;
+        phase_timing.can_run_time_us             = time_info.can_run_time_us;
+        phase_timing.kv_ready_time_us            = time_info.kv_ready_time_us;
+        phase_timing.prefill_previous_release_us = time_info.prefill_previous_release_us;
+        phase_timing.prefill_dispatch_time_us    = time_info.prefill_dispatch_time_us;
+        phase_timing.prefill_forward_time_us     = time_info.prefill_forward_time_us;
+        phase_timing.cache_exposed_wait_us       = time_info.cache_exposed_wait_us;
+        const bool request_ok                    = generate_context.error_status.ok() && !exception_unwinding;
         if (request_ok && time_info.generation_done) {
             // Beam rows are an internal search width; Fusion exposes one primary
             // sequence (the remaining candidates live in beam_responses). Only
@@ -917,10 +925,43 @@ grpc::Status LocalRpcServer::GetWorkerStatus(grpc::ServerContext*   context,
     response->set_precision(status_info.precision);
     response->set_dp_rank(status_info.dp_rank);
     response->set_max_seq_len(maga_init_params_.model_config_.max_seq_len);
-    response->set_max_batch_tokens_size(maga_init_params_.runtime_config.fifo_scheduler_config.max_batch_tokens_size);
+    const auto& runtime_config = maga_init_params_.runtime_config;
+    const auto& fifo_config    = runtime_config.fifo_scheduler_config;
+    auto        batch_tokens   = fifo_config.max_batch_tokens_size;
+    const bool  uses_fifo =
+        maga_init_params_.parallelism_config.pp_size <= 1 && !runtime_config.use_batch_decode_scheduler
+        && !(maga_init_params_.pd_sep_config.role_type == RoleType::PDFUSION
+             && parsePDFusionSchedulerMode(fifo_config.pdfusion_scheduler_mode) == PDFusionSchedulerMode::RATIO);
+    if (uses_fifo && fifo_config.max_batch_kv_len > 0) {
+        // Legacy planners have one compute cap and use a full-prompt rectangle.
+        // Bounding it by both FIFO sums is conservative; physical KV stays separate
+        // so an oversized head request can still run alone. Negative T becomes
+        // an unsigned limit in FIFO; zero T permits only the singleton fast path.
+        batch_tokens = batch_tokens < 0 ? fifo_config.max_batch_kv_len :
+                                          std::max<int64_t>(1, std::min(batch_tokens, fifo_config.max_batch_kv_len));
+    }
+    response->set_max_batch_tokens_size(batch_tokens);
     auto kv_info = engine_->getCacheStatusInfo(-1, false);
     response->set_available_kv_cache(kv_info.available_kv_cache);
     response->set_total_kv_cache(kv_info.total_kv_cache);
+    auto       group_mode    = KV_CACHE_GROUP_MODE_UNSPECIFIED;
+    const auto cache_manager = engine_->getCacheManager();
+    if (cache_manager && cache_manager->cacheConfig().groupNums() > 0) {
+        for (const auto& group : cache_manager->cacheConfig().topology().groups()) {
+            // Match the HBM publisher's eligibility, including its exact tag exclusions.
+            if (!cacheGroupPublishesEvents(group.policy)
+                || group.policy.memory_placement != CacheMemoryPlacement::DEVICE
+                || group.tag == "csa_state" || group.tag == "swa_kv") {
+                continue;
+            }
+            if (group.policy.group_type == CacheGroupType::LINEAR) {
+                group_mode = KV_CACHE_GROUP_MODE_WITH_MAMBA;
+                break;
+            }
+            group_mode = KV_CACHE_GROUP_MODE_FULL_ATTENTION_ONLY;
+        }
+    }
+    response->set_kv_cache_group_mode(group_mode);
     reportWorkerStatusTime(request_begin_time_us, request_after_ws_time_us);
     return grpc::Status::OK;
 }
@@ -1378,6 +1419,23 @@ void LocalRpcServer::reportCacheStatusTime(int64_t request_begin_time_us) {
     if (!cache_manager) {
         RTP_LLM_LOG_WARNING("execute function failed, cache manager is null");
         return grpc::Status(grpc::StatusCode::INTERNAL, "cache manager is null");
+    }
+    FunctionRequestPB bounded_request;
+    if (request->has_remote_request()
+        && (request->remote_request().op() == REMOTE_OPERATION_READ
+            || request->remote_request().op() == REMOTE_OPERATION_WRITE)) {
+        if (request->remote_request().timeout_ms() <= 0) {
+            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "remote task budget must be positive");
+        }
+        const auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            context->deadline() - std::chrono::system_clock::now()).count();
+        if (remaining_ms <= 0) {
+            return grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED, "remote task expired before execution");
+        }
+        bounded_request.CopyFrom(*request);
+        bounded_request.mutable_remote_request()->set_timeout_ms(
+            std::min<int64_t>(request->remote_request().timeout_ms(), remaining_ms));
+        request = &bounded_request;
     }
     if (!cache_manager->executeFunction(*request, *response)) {
         RTP_LLM_LOG_WARNING("execute function failed, request: [%s]", request->DebugString().c_str());

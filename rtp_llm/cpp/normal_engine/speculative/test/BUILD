@@ -19,6 +19,21 @@ cuda13_torch_link_deps = select({
     "//conditions:default": [],
 })
 
+# Keep the speculative lifecycle and sampler tests runnable on both GPU stacks.
+_spec_gpu_deps = select({
+    "@//:using_rocm": [
+        "//rtp_llm/models_py/bindings/core:exec_ctx_rocm",
+        "@local_config_rocm//rocm:rocm_headers",
+        "@local_config_rocm//rocm:rocm",
+    ],
+    "//conditions:default": [
+        "//rtp_llm/models_py/bindings/core:exec_ops_test_lib",
+        "//rtp_llm/models_py/bindings/cuda/ops:cuda_impl",
+        "@local_config_cuda//cuda:cuda_headers",
+        "@local_config_cuda//cuda:cudart",
+    ],
+})
+
 cc_test(
     name = "speculative_sampler_test",
     srcs = [
@@ -58,12 +73,9 @@ cc_test(
         "//rtp_llm/cpp/models:logits_processor",
         "//rtp_llm/cpp/normal_engine",
         "//rtp_llm/cpp/testing:device_test_utils",
-        "//rtp_llm/models_py/bindings/cuda/ops:cuda_impl",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
-        "@local_config_cuda//cuda:cuda_headers",
-        "@local_config_cuda//cuda:cudart",
-    ] + torch_deps() + cuda13_torch_link_deps,
+    ] + _spec_gpu_deps + torch_deps() + cuda13_torch_link_deps,
     env = {
         "TEST_USING_DEVICE": "CUDA",
     },

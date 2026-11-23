@@ -2,6 +2,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -15,6 +17,8 @@
 
 namespace rtp_llm {
 
+struct BlockTreeCrcWorkspacePlan;
+
 struct KVCacheBlockBudget {
     struct ProjectedPool {
         size_t   bytes_per_block;
@@ -25,6 +29,7 @@ struct KVCacheBlockBudget {
     size_t                     paged_block_bytes           = 0;
     size_t                     swa_block_bytes             = 0;
     std::vector<ProjectedPool> projected_pools;
+    uint32_t                   max_baseline_block_num = std::numeric_limits<uint32_t>::max();
 };
 
 // Returns the largest global block count whose independent-pool backing fits
@@ -57,9 +62,21 @@ public:
                                          const KVCacheConfig&                             kv_cache_config,
                                          const ParallelismConfig&                         parallelism_config,
                                          const std::optional<WarmUpResult>&               warm_up_result = std::nullopt,
-                                         const std::optional<SpeculativeExecutionConfig>& sp_config = std::nullopt);
+                                         const std::optional<SpeculativeExecutionConfig>& sp_config      = std::nullopt,
+                                         BlockTreeCrcWorkspacePlan*                       crc_plan       = nullptr);
     static uint32_t synchronizeBlockNum(uint32_t local_block_num, const ParallelismConfig& parallelism_config);
-    static uint32_t selectConfirmedBlockNum(const int* candidates, size_t count);
+    static uint32_t synchronizeBlockNum(uint32_t                 local_block_num,
+                                        const ParallelismConfig& parallelism_config,
+                                        const CacheConfig&       config);
+    // is_ffn_service defaults to the attention cohort: main retired the
+    // FFN-disaggregation role that used the third argument.
+    static uint32_t selectConfirmedBlockNum(const int* candidates, size_t count, bool is_ffn_service = false);
+    using SizingSignature = std::array<int32_t, 5>;
+    // baseline=0 describes sizing rules; a positive baseline also includes
+    // resulting capacities. Both signatures have a fixed collective shape.
+    static SizingSignature
+                sizingSignature(const CacheConfig& config, uint32_t baseline = 0, bool is_ffn_service = false);
+    static void validateSizingSignatures(const int32_t* signatures, size_t rank_count);
 
     // Shared hybrid pools agree on bytes before deriving tag-local slot ids.
     // A block count is not comparable across heterogeneous cache groups.
@@ -73,7 +90,8 @@ public:
                                            const KVCacheConfig&               kv_cache_config,
                                            const ParallelismConfig&           parallelism_config,
                                            const std::optional<WarmUpResult>& warm_up_result          = std::nullopt,
-                                           const std::optional<SpeculativeExecutionConfig>& sp_config = std::nullopt);
+                                           const std::optional<SpeculativeExecutionConfig>& sp_config = std::nullopt,
+                                           BlockTreeCrcWorkspacePlan*                       crc_plan  = nullptr);
     static uint64_t synchronizeCacheBytes(uint64_t local_bytes, const ParallelismConfig& parallelism_config);
     static uint64_t selectConfirmedCacheBytes(const int64_t* candidates, size_t count);
 

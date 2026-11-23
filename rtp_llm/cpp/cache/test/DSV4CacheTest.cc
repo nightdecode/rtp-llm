@@ -183,31 +183,6 @@ static const std::vector<std::string>& dsv4StateSwaTags() {
     return kTags;
 }
 
-// DEV expressed "put the fixed pools in pinned host memory" with a single global
-// KVCacheConfig::dsv4_fixed_pool_use_memory flag.  MAIN drives residency per pool through the
-// spec desc; a host-resident pool must also opt out of the paged HBM budget, otherwise
-// checkGroupResidencyBudget() rejects the topology.
-static void
-setDsv4PoolMemoryPlacement(ModelConfig& model_config, const std::string& tag, CacheMemoryPlacement placement) {
-    for (auto& descs : model_config.kv_cache_spec_descs) {
-        for (auto& desc : descs) {
-            if (desc.tag != tag) {
-                continue;
-            }
-            if (!desc.memory.has_value()) {
-                desc.memory = CacheMemoryPolicyDesc{};
-            }
-            desc.memory->placement = placement;
-            if (placement != CacheMemoryPlacement::DEVICE) {
-                if (!desc.capacity.has_value()) {
-                    desc.capacity = CacheCapacityPolicyDesc{};
-                }
-                desc.capacity->charge_to_paged_budget = false;
-            }
-        }
-    }
-}
-
 static std::vector<int> makeProLayerCompressRatios() {
     std::vector<int> ratios = {128, 128};
     for (int i = 2; i < 61; ++i) {
@@ -1051,7 +1026,7 @@ TEST(CacheConfigCreatorTest, HybridAttentionIndependentPoolBackingFitsBudgetExac
     ParallelismConfig pc;
     RuntimeConfig     runtime_config;
     KVCacheConfig     kv_cache_config;
-    kv_cache_config.kv_cache_mem_mb = 1;
+    kv_cache_config.kv_cache_mem_mb         = 1;
     kv_cache_config.reuse_cache_tail_blocks = 4;
 
     auto           created_config = CacheConfigCreator::createConfig(mc, pc, kv_cache_config);
@@ -1078,6 +1053,100 @@ TEST(CacheConfigCreatorTest, HybridAttentionIndependentPoolBackingFitsBudgetExac
     const auto       block_num    = static_cast<uint32_t>(config_candidate_block_num);
     EXPECT_LE(backing_bytes(block_num), budget_bytes);
     EXPECT_GT(backing_bytes(block_num + 1u), budget_bytes);
+}
+
+TEST(CacheConfigCreatorTest, LinearCacheReclaimDefaultsOffRegardlessOfModelCapability) {
+    ParallelismConfig pc;
+    KVCacheConfig     options;
+    // The sizing knob carried alongside reclaim switched to main #1574's
+    // reuse_cache_tail_blocks when the legacy linear_step field retired.
+    options.reuse_cache_tail_blocks = 3;
+    for (bool supported : {false, true}) {
+        auto mc                                                   = makeHybridAttentionModelConfig();
+        mc.linear_attention_config.supports_history_state_reclaim = supported;
+        const auto config                                         = CacheConfigCreator::createConfig(mc, pc, options);
+        EXPECT_FALSE(config.enable_linear_cache_reclaim);
+        EXPECT_EQ(config.reuse_cache_tail_blocks, 3);
+        EXPECT_EQ(config.group("linear").spec->cacheKeyTokenStride(), config.seq_size_per_block);
+    }
+}
+
+TEST(CacheConfigCreatorTest, LinearCacheReclaimRequiresOptInAndModelCapability) {
+    auto mc                                                   = makeHybridAttentionModelConfig();
+    mc.model_type                                             = "test_recurrent_model";
+    mc.linear_attention_config.supports_history_state_reclaim = true;
+    ParallelismConfig pc;
+    KVCacheConfig     options;
+    options.enable_linear_cache_reclaim = true;
+
+    EXPECT_TRUE(CacheConfigCreator::createConfig(mc, pc, options).enable_linear_cache_reclaim);
+    EXPECT_TRUE(CacheConfigCreator::createWarmupConfig(mc, pc, options, 0).enable_linear_cache_reclaim);
+
+    mc.linear_attention_config.supports_history_state_reclaim = false;
+    EXPECT_THROW((void)CacheConfigCreator::createConfig(mc, pc, options), std::exception);
+}
+
+TEST(CacheConfigCreatorTest, LinearCacheReclaimIsInactiveForFullOnlyDraft) {
+    auto mc = makeHybridAttentionModelConfig();
+    mc.hybrid_attention_config.hybrid_attention_types.assign(mc.num_layers, HybridAttentionType::NONE);
+    mc.linear_attention_config.supports_history_state_reclaim = false;
+    setHybridAttentionKvCacheSpecs(mc);
+    ParallelismConfig pc;
+    pc.tp_size                            = 2;
+    pc.prefill_cp_config.kv_cache_sharded = true;
+    KVCacheConfig options;
+    options.enable_linear_cache_reclaim = true;
+
+    const auto config = CacheConfigCreator::createConfig(mc, pc, options);
+    EXPECT_FALSE(config.enable_linear_cache_reclaim);
+    ASSERT_EQ(config.groupNums(), 1);
+    EXPECT_EQ(config.group("full").policy.group_type, CacheGroupType::FULL);
+}
+
+TEST(CacheConfigCreatorTest, LinearCacheReclaimRejectsCpShardingOnlyWhenEnabled) {
+    auto mc                                                   = makeHybridAttentionModelConfig();
+    mc.linear_attention_config.supports_history_state_reclaim = true;
+    ParallelismConfig pc;
+    pc.tp_size                            = 2;
+    pc.prefill_cp_config.kv_cache_sharded = true;
+    KVCacheConfig options;
+
+    EXPECT_FALSE(CacheConfigCreator::createConfig(mc, pc, options).enable_linear_cache_reclaim);
+    options.enable_linear_cache_reclaim = true;
+    EXPECT_THROW((void)CacheConfigCreator::createConfig(mc, pc, options), std::exception);
+}
+
+TEST(CacheConfigCreatorTest, LinearCacheReclaimRejectsProjectedKeySpan) {
+    ModelConfig mc;
+    mc.num_layers                                             = 1;
+    mc.attn_config.tokens_per_block                           = 8;
+    mc.linear_attention_config.supports_history_state_reclaim = true;
+    KVCacheSpecDesc desc;
+    desc.tag                  = "projected_state";
+    desc.cache_type           = KVCacheSpecType::OpaqueState;
+    desc.group_type           = CacheGroupType::LINEAR;
+    desc.entry_elems          = 4;
+    desc.entry_dtype          = DataType::TYPE_FP32;
+    desc.explicit_entry_count = 1;
+    desc.cp                   = CacheCpPolicyDesc{};
+    desc.cp->scale_seq_size   = true;
+    mc.kv_cache_spec_descs    = {{desc}};
+    ParallelismConfig pc;
+    pc.tp_size                            = 2;
+    pc.role_type                          = RoleType::PREFILL;
+    pc.prefill_cp_config.kv_cache_sharded = true;
+    KVCacheConfig options;
+
+    const auto original = CacheConfigCreator::createConfig(mc, pc, options);
+    EXPECT_FALSE(original.enable_linear_cache_reclaim);
+    ASSERT_EQ(original.group("projected_state").spec->cacheKeyTokenStride(), 2 * original.seq_size_per_block);
+    options.enable_linear_cache_reclaim = true;
+    try {
+        (void)CacheConfigCreator::createConfig(mc, pc, options);
+        FAIL() << "reclaim accepted a LINEAR group with a different cache-key span";
+    } catch (const std::exception& error) {
+        EXPECT_NE(std::string(error.what()).find("cache-key span"), std::string::npos);
+    }
 }
 
 TEST(CacheConfigCreatorTest, LinearValueHeadsMustDivideAttentionTp) {
@@ -2137,7 +2206,7 @@ TEST(CacheConfigTest, DSV4ExplicitHcaStatePoolBlocksIgnoreTailRetention) {
     runtime_config.fifo_scheduler_config.max_context_batch_size = 2;
 
     ParallelismConfig pc;
-    auto              config = CacheConfigCreator::createWarmupConfig(makeProModelConfig(), pc, 0);
+    auto              config       = CacheConfigCreator::createWarmupConfig(makeProModelConfig(), pc, 0);
     config.reuse_cache_tail_blocks = 4;
     config.finalizeBlockNums(100, runtime_config);
 
@@ -2157,9 +2226,9 @@ TEST(CacheConfigTest, DSV4StateSwaPoolsWithoutExplicitBlocksFollowBaseline) {
 
     ParallelismConfig pc;
     KVCacheConfig     kv_cache_config;
-    kv_cache_config.test_block_num = 100;
+    kv_cache_config.test_block_num          = 100;
     kv_cache_config.reuse_cache_tail_blocks = 4;
-    auto mc                        = makeProModelConfig();
+    auto mc                                 = makeProModelConfig();
     setDsv4ExplicitPoolBlocks(mc, "hca_state", 0);
 
     auto           created_config = CacheConfigCreator::createConfig(mc, pc, kv_cache_config);
@@ -2176,109 +2245,6 @@ TEST(CacheConfigTest, DSV4StateSwaPoolsWithoutExplicitBlocksFollowBaseline) {
 }
 
 // Ported from DEV CacheConfigTest.DSV4PinnedFixedPoolFallbackIsExcludedFromGpuBudget.
-// DEV flipped every fixed pool to pinned host memory with KVCacheConfig::dsv4_fixed_pool_use_memory
-// and asserted the device pool grew because those pools stopped charging the GPU budget.  On MAIN
-// budget exclusion is `charge_to_paged_budget = false`, which blockBudgetForConfig() only honours
-// for explicitly-sized pools (non-explicit pools always contribute marginal bytes regardless of
-// residency), so the pinned pools are sized explicitly here.
-TEST(CacheConfigTest, DSV4PinnedFixedPoolFallbackIsExcludedFromGpuBudget) {
-    ParallelismConfig pc;
-    RuntimeConfig     runtime_config;
-    runtime_config.max_generate_batch_size                      = 4;
-    runtime_config.fifo_scheduler_config.max_context_batch_size = 2;
-
-    constexpr uint32_t kFixedPoolBlocks = 64;
-
-    auto make_kv_config = [] {
-        KVCacheConfig kv_cache_config;
-        kv_cache_config.seq_size_per_block = 128;
-        kv_cache_config.kv_cache_mem_mb    = 65536;
-        kv_cache_config.reuse_cache_tail_blocks = 4;
-        return kv_cache_config;
-    };
-
-    auto gpu_fixed_mc = makeProModelConfig();
-    for (const auto& tag : dsv4StateSwaTags()) {
-        setDsv4ExplicitPoolBlocks(gpu_fixed_mc, tag, kFixedPoolBlocks);
-    }
-    auto pinned_fixed_mc = gpu_fixed_mc;
-    for (const auto& tag : dsv4StateSwaTags()) {
-        setDsv4PoolMemoryPlacement(pinned_fixed_mc, tag, CacheMemoryPlacement::HOST_PINNED);
-    }
-
-    auto           created_gpu_fixed = CacheConfigCreator::createConfig(gpu_fixed_mc, pc, make_kv_config());
-    const uint32_t gpu_fixed_candidate_block_num =
-        CacheConfigCreator::computeLocalBlockNum(created_gpu_fixed, gpu_fixed_mc, runtime_config, make_kv_config(), pc);
-    auto gpu_fixed = rtp_llm::test::finalizeCacheConfig(created_gpu_fixed, gpu_fixed_candidate_block_num);
-
-    auto           created_pinned_fixed = CacheConfigCreator::createConfig(pinned_fixed_mc, pc, make_kv_config());
-    const uint32_t pinned_fixed_candidate_block_num = CacheConfigCreator::computeLocalBlockNum(
-        created_pinned_fixed, pinned_fixed_mc, runtime_config, make_kv_config(), pc);
-    auto pinned_fixed = rtp_llm::test::finalizeCacheConfig(created_pinned_fixed, pinned_fixed_candidate_block_num);
-
-    // Device-resident fixed pools reserve HBM; pinned ones do not, so the paged pool is larger.
-    EXPECT_GT(test::explicitPoolReserveBytes(gpu_fixed), 0u);
-    EXPECT_EQ(test::explicitPoolReserveBytes(pinned_fixed), 0u);
-    EXPECT_GT(pinned_fixed_candidate_block_num, gpu_fixed_candidate_block_num);
-
-    for (const auto& group : pinned_fixed.groups()) {
-        const auto tag = group.tag;
-        if (group.policy.group_type != CacheGroupType::SWA) {
-            continue;
-        }
-        EXPECT_EQ(group.block_num, kFixedPoolBlocks) << "tag=" << tag;
-        EXPECT_EQ(group.policy.memory_placement, CacheMemoryPlacement::HOST_PINNED) << "tag=" << tag;
-        EXPECT_EQ(gpu_fixed.group(tag).block_num, kFixedPoolBlocks) << "tag=" << tag;
-    }
-}
-
-// Automatic pools use the same baseline regardless of memory placement.
-TEST(CacheConfigTest, DSV4PinnedFixedPoolFallbackFollowsFullPoolBaseline) {
-    ParallelismConfig pc;
-    RuntimeConfig     runtime_config;
-    runtime_config.max_generate_batch_size                      = 4;
-    runtime_config.fifo_scheduler_config.max_context_batch_size = 2;
-
-    auto make_kv_config = [] {
-        KVCacheConfig kv_cache_config;
-        kv_cache_config.seq_size_per_block = 128;
-        kv_cache_config.kv_cache_mem_mb    = 65536;
-        kv_cache_config.reuse_cache_tail_blocks = std::numeric_limits<int>::max();
-        return kv_cache_config;
-    };
-
-    auto gpu_fixed_mc = makeProModelConfig();
-    for (const auto& tag : dsv4StateSwaTags()) {
-        setDsv4ExplicitPoolBlocks(gpu_fixed_mc, tag, 0);
-    }
-    auto pinned_fixed_mc = gpu_fixed_mc;
-    for (const auto& tag : dsv4StateSwaTags()) {
-        setDsv4PoolMemoryPlacement(pinned_fixed_mc, tag, CacheMemoryPlacement::HOST_PINNED);
-    }
-
-    auto           created_gpu_fixed = CacheConfigCreator::createConfig(gpu_fixed_mc, pc, make_kv_config());
-    const uint32_t gpu_fixed_candidate_block_num =
-        CacheConfigCreator::computeLocalBlockNum(created_gpu_fixed, gpu_fixed_mc, runtime_config, make_kv_config(), pc);
-    auto gpu_fixed = rtp_llm::test::finalizeCacheConfig(created_gpu_fixed, gpu_fixed_candidate_block_num);
-
-    auto           created_pinned_fixed = CacheConfigCreator::createConfig(pinned_fixed_mc, pc, make_kv_config());
-    const uint32_t pinned_fixed_candidate_block_num = CacheConfigCreator::computeLocalBlockNum(
-        created_pinned_fixed, pinned_fixed_mc, runtime_config, make_kv_config(), pc);
-    auto pinned_fixed = rtp_llm::test::finalizeCacheConfig(created_pinned_fixed, pinned_fixed_candidate_block_num);
-
-    EXPECT_EQ(test::explicitPoolReserveBytes(gpu_fixed), 0u);
-    EXPECT_EQ(test::explicitPoolReserveBytes(pinned_fixed), 0u);
-    EXPECT_EQ(pinned_fixed_candidate_block_num, gpu_fixed_candidate_block_num);
-
-    ASSERT_EQ(gpu_fixed.topology().groups().size(), static_cast<size_t>(kDsv4PoolNum));
-    ASSERT_EQ(pinned_fixed.topology().groups().size(), static_cast<size_t>(kDsv4PoolNum));
-    for (const auto& group : pinned_fixed.groups()) {
-        EXPECT_EQ(gpu_fixed.group(group.tag).block_num, static_cast<uint32_t>(gpu_fixed_candidate_block_num))
-            << "tag=" << group.tag;
-        EXPECT_EQ(group.block_num, static_cast<uint32_t>(pinned_fixed_candidate_block_num)) << "tag=" << group.tag;
-    }
-}
-
 TEST(CacheConfigTest, DSV4MtpKeepsProposeLayerInSwaPool) {
     auto score_model_config                                  = makeFlashModelConfig();
     auto propose_model_config                                = makeFlashMtpModelConfig();
@@ -2682,7 +2648,7 @@ TEST_F(DSV4AllocatorTest, ReportedTokenCapacityIgnoresFixedTailPools) {
     for (const auto& tag : dsv4StateSwaTags()) {
         setDsv4ExplicitPoolBlocks(mc, tag, 11);
     }
-    auto config = CacheConfigCreator::createWarmupConfig(mc, pc, 0);
+    auto                  config = CacheConfigCreator::createWarmupConfig(mc, pc, 0);
     std::vector<uint32_t> block_nums;
     for (const auto& tag : config.groupTags()) {
         if (tag == "csa_kv") {
@@ -2756,14 +2722,14 @@ TEST_F(DSV4AllocatorTest, ChunkMallocSharesCommonSparseBanksAndKeepsPrivateTail)
         size_t         first_required_position;
     };
     for (const auto& test_case : {TestCase{CacheGroupType::LINEAR, 1, 20, 8, false, 3, 8, 2},
-                                 TestCase{CacheGroupType::SWA, 1, 20, 8, false, 4, 9, 1},
-                                 TestCase{CacheGroupType::LINEAR, 2, 20, 8, false, 3, 8, 2},
-                                 TestCase{CacheGroupType::LINEAR, 2, 18, 8, false, 4, 10, 2},
-                                 TestCase{CacheGroupType::SWA, 2, 20, 12, true, 5, 10, 0},
-                                 TestCase{CacheGroupType::SWA, 2, 20, 8, true, 4, 9, 1}}) {
-        const auto type = test_case.type;
-        auto config = makeSimpleHybridMhaCacheConfig(4, 10, 4, DataType::TYPE_FP16);
-        auto groups = config.topology().groups();
+                                  TestCase{CacheGroupType::SWA, 1, 20, 8, false, 4, 9, 1},
+                                  TestCase{CacheGroupType::LINEAR, 2, 20, 8, false, 3, 8, 2},
+                                  TestCase{CacheGroupType::LINEAR, 2, 18, 8, false, 4, 10, 2},
+                                  TestCase{CacheGroupType::SWA, 2, 20, 12, true, 5, 10, 0},
+                                  TestCase{CacheGroupType::SWA, 2, 20, 8, true, 4, 9, 1}}) {
+        const auto type   = test_case.type;
+        auto       config = makeSimpleHybridMhaCacheConfig(4, 10, 4, DataType::TYPE_FP16);
+        auto       groups = config.topology().groups();
         for (auto& group : groups) {
             if (group.policy.group_type == CacheGroupType::LINEAR && type == CacheGroupType::SWA) {
                 group.spec                       = makeMhaSpec(group.tag, 4, DataType::TYPE_FP16, 1, 1);
@@ -3881,13 +3847,338 @@ TEST(CacheConfigCreatorTest, LayoutAndBudgetCalculationLeaveGroupCapacityUnresol
     EXPECT_ANY_THROW(config.finalizeBlockNums(0, {}));
 }
 
+TEST(CacheConfigCreatorTest, PoolBlockWeightsScaleUnroundedGroupRuleBlocks) {
+    auto model        = makeCreationModel();
+    auto window       = model.kv_cache_spec_descs[0][0];
+    window.tag        = "window";
+    window.group_type = CacheGroupType::SWA;
+    model.kv_cache_spec_descs[0].push_back(window);
+    KVCacheConfig options;
+    options.test_block_num              = 9;
+    options.kv_cache_pool_block_weights = R"({"full":4,"window":2})";
+    auto       config                   = CacheConfigCreator::createConfig(model, {}, options);
+    const auto baseline                 = CacheConfigCreator::computeLocalBlockNum(config, model, {}, options, {});
+    EXPECT_EQ(baseline, 9u);
+    config.finalizeBlockNums(baseline, {});
+    EXPECT_EQ(config.group("full").block_num, 36u);
+    // Since #1574 SWA pools follow the unrounded baseline share.
+    EXPECT_EQ(config.group("window").block_num, 18u);
+    EXPECT_EQ(config.pool_block_weights.at("full"), 4u);
+    EXPECT_EQ(config.group("full").policy.explicit_block_num, 0u);
+    EXPECT_TRUE(config.group("full").policy.reservable);
+}
+
+TEST(CacheConfigCreatorTest, PoolBlockWeightsPreserveOmittedAndUnitDefaults) {
+    auto          model = makeHybridAttentionModelConfig();
+    KVCacheConfig options;
+    options.kv_cache_mem_mb    = 1;
+    const auto legacy          = CacheConfigCreator::createConfig(model, {}, options);
+    const auto legacy_baseline = CacheConfigCreator::computeLocalBlockNum(legacy, model, {}, options, {});
+    for (const std::string json : {"", "{}", R"({"full":1,"linear":1})"}) {
+        SCOPED_TRACE(json);
+        options.kv_cache_pool_block_weights = json;
+        auto config                         = CacheConfigCreator::createConfig(model, {}, options);
+        EXPECT_EQ(CacheConfigCreator::computeLocalBlockNum(config, model, {}, options, {}), legacy_baseline);
+        config.finalizeBlockNums(13, {});
+        EXPECT_EQ(config.group("full").block_num, 13u);
+        EXPECT_EQ(config.group("linear").block_num, 13u);
+    }
+    options.kv_cache_pool_block_weights = R"({"full":4})";
+    auto config                         = CacheConfigCreator::createConfig(model, {}, options);
+    config.finalizeBlockNums(13, {});
+    EXPECT_EQ(config.group("full").block_num, 52u);
+    EXPECT_EQ(config.group("linear").block_num, 13u);
+}
+
+TEST(CacheConfigCreatorTest, PoolBlockWeightsRejectInvalidJsonAndNonPositiveIntegerValues) {
+    const auto model = makeCreationModel();
+    for (const std::string json : {" ",
+                                   "null",
+                                   "[]",
+                                   "1",
+                                   "{",
+                                   R"({"full":0})",
+                                   R"({"full":-1})",
+                                   R"({"full":true})",
+                                   R"({"full":"2"})",
+                                   R"({"full":2.0})",
+                                   R"({"full":2e0})",
+                                   R"({"full":null})",
+                                   R"({"full":{}})",
+                                   R"({"full":NaN})",
+                                   R"({"full":4294967296})",
+                                   R"({"full":2} garbage)",
+                                   R"({"full":2,"full":3})",
+                                   R"({"full":2,"\u0066ull":3})"}) {
+        SCOPED_TRACE(json);
+        KVCacheConfig options;
+        options.kv_cache_pool_block_weights = json;
+        EXPECT_ANY_THROW(CacheConfigCreator::createConfig(model, {}, options));
+    }
+}
+
+TEST(CacheConfigCreatorTest, PoolBlockWeightsRejectUnknownExplicitAndHostPoolTargets) {
+    for (const bool host : {false, true}) {
+        auto model = makeCreationModel();
+        addCreationFixedPool(model, host);
+        for (const std::string json : {R"({"typo":2})", R"({"state":1})", R"({"state":2})"}) {
+            SCOPED_TRACE(json);
+            KVCacheConfig options;
+            options.kv_cache_pool_block_weights = json;
+            EXPECT_ANY_THROW(CacheConfigCreator::createConfig(model, {}, options));
+        }
+        KVCacheConfig options;
+        options.kv_cache_pool_block_weights = R"({"full":4})";
+        auto config                         = CacheConfigCreator::createConfig(model, {}, options);
+        config.finalizeBlockNums(9, {});
+        EXPECT_EQ(config.group("full").block_num, 36u);
+        EXPECT_EQ(config.group("state").block_num, 7u);
+    }
+    auto  host_model                      = makeCreationModel();
+    auto& desc                            = host_model.kv_cache_spec_descs[0][0];
+    desc.memory                           = CacheMemoryPolicyDesc{};
+    desc.memory->placement                = CacheMemoryPlacement::HOST_PINNED;
+    desc.capacity                         = CacheCapacityPolicyDesc{};
+    desc.capacity->charge_to_paged_budget = false;
+    KVCacheConfig options;
+    options.kv_cache_pool_block_weights = R"({"full":1})";
+    EXPECT_ANY_THROW(CacheConfigCreator::createConfig(host_model, {}, options));
+}
+
+TEST(CacheConfigCreatorTest, PoolBlockWeightsValidateMergedTargetAndPropagateToDraftViews) {
+    auto target                                          = makeHybridAttentionModelConfig();
+    auto draft                                           = target;
+    draft.num_layers                                     = 1;
+    draft.hybrid_attention_config.hybrid_attention_types = {HybridAttentionType::NONE};
+    setHybridAttentionKvCacheSpecs(draft);
+    KVCacheConfig options;
+    options.kv_cache_pool_block_weights = R"({"linear":2,"full":4})";
+    SpeculativeExecutionConfig sp;
+    sp.type              = SP_TYPE_MTP;
+    sp.gen_num_per_cycle = 2;
+    auto config          = CacheConfigCreator::createConfig(target, {}, options, sp, &draft, true);
+    config.finalizeBlockNums(9, {});
+    EXPECT_EQ(config.group("linear").block_num, 18u);
+    EXPECT_EQ(config.group("full").block_num, 36u);
+    ASSERT_EQ(config.mtp_sub_configs.size(), 2u);
+    for (const auto& sub : config.mtp_sub_configs) {
+        EXPECT_TRUE(sub->layerIdsForGroup("linear").empty());
+        EXPECT_EQ(sub->pool_block_weights, config.pool_block_weights);
+        EXPECT_EQ(sub->group("linear").block_num, 18u);
+        EXPECT_EQ(sub->group("full").block_num, 36u);
+    }
+}
+
+TEST(CacheConfigCreatorTest, PoolBlockWeightsBudgetIncludesScalesDraftSegmentsAndFixedResidency) {
+    for (const bool host : {false, true}) {
+        auto target                       = makeCreationModel(2, 2);
+        auto draft                        = makeCreationModel(2, 4);
+        target.attn_config.kv_cache_dtype = KvCacheDataType::FP8;
+        draft.attn_config.kv_cache_dtype  = KvCacheDataType::FP8;
+        addCreationFixedPool(target, host);
+        KVCacheConfig options;
+        options.kv_cache_mem_mb             = 1;
+        options.kv_cache_pool_block_weights = R"({"full":4})";
+        SpeculativeExecutionConfig sp;
+        sp.type              = SP_TYPE_MTP;
+        sp.gen_num_per_cycle = 2;
+        auto       config    = CacheConfigCreator::createConfig(target, {}, options, sp, &draft, true);
+        const auto baseline =
+            CacheConfigCreator::computeLocalBlockNum(config, target, {}, options, {}, std::nullopt, sp);
+        config.finalizeBlockNums(baseline, {});
+        ASSERT_EQ(config.group("full").block_num, 4u * baseline);
+        const auto pool = DeviceBlockPoolConfigHelper::createConfigForGroup(config, config.group("full"));
+        ASSERT_EQ(pool.memory_layouts.size(), 3u);
+        EXPECT_GT(pool.memory_layouts[0].kv_scale_stride_bytes, 0u);
+        EXPECT_GT(pool.memory_layouts[1].kv_block_stride_bytes, pool.memory_layouts[0].kv_block_stride_bytes);
+        const auto charged_bytes = [](const CacheConfig& candidate) {
+            size_t bytes = 0;
+            for (const auto& group : candidate.groups()) {
+                if (group.policy.explicit_block_num == 0 || group.policy.charge_to_paged_budget) {
+                    bytes += DeviceBlockPoolConfigHelper::createConfigForGroup(candidate, group).total_size_bytes;
+                }
+            }
+            return bytes;
+        };
+        EXPECT_LE(charged_bytes(config), 1024u * 1024u);
+        config.finalizeBlockNums(baseline + 1, {});
+        EXPECT_GT(charged_bytes(config), 1024u * 1024u);
+    }
+}
+
+TEST(CacheConfigCreatorTest, PoolBlockWeightsWarmupStaysSmallAndBlockIdOverflowIsRejected) {
+    const auto    model = makeCreationModel();
+    KVCacheConfig options;
+    options.kv_cache_pool_block_weights = R"({"full":2147483647})";
+    const auto warmup                   = CacheConfigCreator::createWarmupConfig(model, {}, options);
+    EXPECT_EQ(warmup.group("full").block_num, 2u);
+    auto config = CacheConfigCreator::createConfig(model, {}, options);
+    EXPECT_ANY_THROW(config.finalizeBlockNums(2, {}));
+    // The existing FFN sentinel-only baseline remains a legal sizing input.
+    options.kv_cache_pool_block_weights = R"({"full":1})";
+    config                              = CacheConfigCreator::createConfig(model, {}, options);
+    config.finalizeBlockNums(1, {});
+    EXPECT_EQ(config.group("full").block_num, 1u);
+}
+
+TEST(CacheConfigCreatorTest, PoolBlockWeightsBudgetRespectsWeightedPoolsAndIntegerCapacityLimit) {
+    auto model        = makeCreationModel();
+    auto window       = model.kv_cache_spec_descs[0][0];
+    window.tag        = "window";
+    window.group_type = CacheGroupType::SWA;
+    model.kv_cache_spec_descs[0].push_back(window);
+    KVCacheConfig options;
+    options.kv_cache_mem_mb             = 1;
+    options.kv_cache_pool_block_weights = R"({"full":4,"window":3})";
+    auto       config                   = CacheConfigCreator::createConfig(model, {}, options);
+    const auto baseline                 = CacheConfigCreator::computeLocalBlockNum(config, model, {}, options, {});
+    const auto actual_bytes             = [](const CacheConfig& candidate) {
+        size_t bytes = 0;
+        for (const auto& group : candidate.groups()) {
+            bytes += DeviceBlockPoolConfigHelper::createConfigForGroup(candidate, group).total_size_bytes;
+        }
+        return bytes;
+    };
+    config.finalizeBlockNums(baseline, {});
+    EXPECT_EQ(config.group("window").block_num, baseline * 3u);
+    EXPECT_LE(actual_bytes(config), 1024u * 1024u);
+    config.finalizeBlockNums(baseline + 1, {});
+    EXPECT_GT(actual_bytes(config), 1024u * 1024u);
+
+    // Huge memory budgets may be bounded by block IDs rather than bytes.
+    options.kv_cache_mem_mb             = std::numeric_limits<int32_t>::max();
+    options.kv_cache_pool_block_weights = R"({"full":4})";
+    config                              = CacheConfigCreator::createConfig(makeCreationModel(), {}, options);
+    const auto bounded = CacheConfigCreator::computeLocalBlockNum(config, makeCreationModel(), {}, options, {});
+    EXPECT_EQ(bounded, static_cast<uint32_t>(std::numeric_limits<int32_t>::max()) / 4);
+    config.finalizeBlockNums(bounded, {});
+    EXPECT_ANY_THROW(config.finalizeBlockNums(bounded + 1, {}));
+    options.test_block_num = std::numeric_limits<int32_t>::max();
+    EXPECT_ANY_THROW(CacheConfigCreator::computeLocalBlockNum(config, makeCreationModel(), {}, options, {}));
+}
+
+TEST(CacheConfigCreatorTest, PoolBlockWeightsRankSignaturesUseCanonicalDefaultsAndRejectMismatches) {
+    const auto    model = makeHybridAttentionModelConfig();
+    KVCacheConfig options;
+    auto          config                = CacheConfigCreator::createConfig(model, {}, options);
+    const auto    defaults              = CacheConfigCreator::sizingSignature(config);
+    options.kv_cache_pool_block_weights = R"({"linear":1,"full":1})";
+    config                              = CacheConfigCreator::createConfig(model, {}, options);
+    EXPECT_EQ(CacheConfigCreator::sizingSignature(config), defaults);
+    options.kv_cache_pool_block_weights = R"({"full":4,"linear":2})";
+    config                              = CacheConfigCreator::createConfig(model, {}, options);
+    const auto weighted                 = CacheConfigCreator::sizingSignature(config);
+    options.kv_cache_pool_block_weights = R"({"linear":2,"full":4})";
+    auto reordered                      = CacheConfigCreator::createConfig(model, {}, options);
+    EXPECT_EQ(CacheConfigCreator::sizingSignature(reordered), weighted);
+    EXPECT_NE(weighted, defaults);
+    std::vector<int32_t> ranks(weighted.begin(), weighted.end());
+    ranks.insert(ranks.end(), weighted.begin(), weighted.end());
+    EXPECT_NO_THROW(CacheConfigCreator::validateSizingSignatures(ranks.data(), 2));
+    std::copy(defaults.begin(), defaults.end(), ranks.begin() + weighted.size());
+    EXPECT_ANY_THROW(CacheConfigCreator::validateSizingSignatures(ranks.data(), 2));
+    EXPECT_ANY_THROW(CacheConfigCreator::validateSizingSignatures(nullptr, 0));
+    EXPECT_NE(CacheConfigCreator::sizingSignature(config, 13), CacheConfigCreator::sizingSignature(config, 12));
+    reordered.reuse_cache_tail_blocks = 13;
+    EXPECT_NE(CacheConfigCreator::sizingSignature(reordered), weighted);
+    auto groups                         = config.groups();
+    groups[0].policy.explicit_block_num = 7;
+    config.setTopology(std::move(groups), config.topology().layers());
+    EXPECT_NE(CacheConfigCreator::sizingSignature(config), weighted);
+}
+
+TEST(CacheConfigCreatorTest, PoolBlockWeightsRankAgreementPreservesFfnDisaggregationCohorts) {
+    const auto attention          = CacheConfigCreator::createConfig(makeHybridAttentionModelConfig(), {}, {});
+    const auto ffn                = CacheConfigCreator::createConfig(makeCreationModel(), {}, {});
+    const int  candidates[]       = {13, 21, 99};
+    const auto attention_baseline = CacheConfigCreator::selectConfirmedBlockNum(candidates, 3, false);
+    const auto ffn_baseline       = CacheConfigCreator::selectConfirmedBlockNum(candidates, 3, true);
+    ASSERT_EQ(attention_baseline, 13u);
+    ASSERT_EQ(ffn_baseline, 1u);
+    const auto attention_signature = CacheConfigCreator::sizingSignature(attention, attention_baseline, false);
+    const auto ffn_signature       = CacheConfigCreator::sizingSignature(ffn, ffn_baseline, true);
+    const auto validate            = [](std::initializer_list<CacheConfigCreator::SizingSignature> signatures) {
+        std::vector<int32_t> ranks;
+        for (const auto& signature : signatures) {
+            ranks.insert(ranks.end(), signature.begin(), signature.end());
+        }
+        CacheConfigCreator::validateSizingSignatures(ranks.data(), signatures.size());
+    };
+    // WORLD includes both roles. One role may contain zero, one or many ranks.
+    EXPECT_NO_THROW(validate({attention_signature, attention_signature, ffn_signature}));
+    EXPECT_NO_THROW(validate({ffn_signature, attention_signature, ffn_signature}));
+    EXPECT_NO_THROW(validate({attention_signature}));
+    EXPECT_NO_THROW(validate({ffn_signature, ffn_signature}));
+    EXPECT_NO_THROW(validate({attention_signature, attention_signature}));
+    const auto mismatched_attention = CacheConfigCreator::sizingSignature(attention, 12, false);
+    const auto mismatched_ffn       = CacheConfigCreator::sizingSignature(ffn, 2, true);
+    EXPECT_ANY_THROW(validate({attention_signature, ffn_signature, mismatched_attention}));
+    EXPECT_ANY_THROW(validate({ffn_signature, attention_signature, mismatched_ffn}));
+    auto invalid = attention_signature;
+    invalid[0]   = 2;
+    EXPECT_ANY_THROW(validate({invalid}));
+    invalid[0] = -1;
+    EXPECT_ANY_THROW(validate({attention_signature, invalid}));
+}
+
+TEST(CacheConfigCreatorTest, PoolBlockWeightsWarmupDefersJsonValidationUntilMergedRuntimeConfig) {
+    const auto model = makeCreationModel();
+    for (const std::string json : {"", "{}", R"({"full":1})", R"({"unknown":1})", "not-json"}) {
+        SCOPED_TRACE(json);
+        KVCacheConfig options;
+        options.kv_cache_pool_block_weights = json;
+        const auto warmup                   = CacheConfigCreator::createWarmupConfig(model, {}, options);
+        EXPECT_EQ(warmup.group("full").block_num, 2u);
+        EXPECT_TRUE(warmup.pool_block_weights.empty());
+    }
+    KVCacheConfig options;
+    options.kv_cache_pool_block_weights = R"({"unknown":1})";
+    EXPECT_ANY_THROW(CacheConfigCreator::createConfig(model, {}, options));
+    options.kv_cache_pool_block_weights = "not-json";
+    EXPECT_ANY_THROW(CacheConfigCreator::createConfig(model, {}, options));
+}
+
+TEST(CacheConfigCreatorTest, PoolBlockWeightsSolverMatchesDiscreteBudgetOracleAndSwaOnlyIdBounds) {
+    // Since #1574 the budget fit no longer rounds SWA blocks down by a step,
+    // so the oracle charges every baseline block at its full SWA share.
+    for (const size_t fixed : {0u, 11u}) {
+        for (const size_t paged : {0u, 3u, 12u}) {
+            const KVCacheBlockBudget budget{fixed, paged, 5u, 31u};
+            for (size_t bytes = 0; bytes <= 300; ++bytes) {
+                uint32_t expected = 0;
+                for (uint32_t next = 1; next <= budget.max_baseline_block_num; ++next) {
+                    if (fixed + next * paged + next * 5u <= bytes) {
+                        expected = next;
+                    }
+                }
+                EXPECT_EQ(maxKVCacheBlockNumForBudget(bytes, budget), expected)
+                    << " fixed=" << fixed << " paged=" << paged << " bytes=" << bytes;
+            }
+        }
+    }
+    const KVCacheBlockBudget overflow_budget{1u, std::numeric_limits<size_t>::max() - 1, 0u};
+    EXPECT_EQ(maxKVCacheBlockNumForBudget(std::numeric_limits<size_t>::max(), overflow_budget), 1u);
+
+    // N is an abstract baseline; only physical block IDs require int32. Since
+    // #1574 SWA pools keep the unrounded baseline, their baseline range is the
+    // plain int32 bound instead of the legacy step-compensated slack.
+    auto model                                 = makeCreationModel();
+    model.kv_cache_spec_descs[0][0].group_type = CacheGroupType::SWA;
+    KVCacheConfig options;
+    auto          config = CacheConfigCreator::createConfig(model, {}, options);
+    const auto    bound  = static_cast<uint32_t>(std::numeric_limits<int32_t>::max());
+    EXPECT_EQ(config.maxBaselineBlockNum(), bound);
+    config.finalizeBlockNums(bound, {});
+    EXPECT_EQ(config.group("full").block_num, bound);
+}
+
 TEST(CacheConfigCreatorTest, WarmupUsesMinimalCapacityAndPreservesExplicitPoolPolicy) {
     auto model = makeCreationModel();
     addCreationFixedPool(model, true);
     KVCacheConfig options;
-    options.test_block_num = 99;
+    options.test_block_num          = 99;
     options.reuse_cache_tail_blocks = 4;
-    auto config            = CacheConfigCreator::createWarmupConfig(model, {}, options);
+    auto config                     = CacheConfigCreator::createWarmupConfig(model, {}, options);
     EXPECT_EQ(config.group("full").block_num, 2u);
     EXPECT_EQ(config.group("state").block_num, 2u);
     EXPECT_EQ(config.group("state").policy.explicit_block_num, 7u);
@@ -3909,7 +4200,7 @@ TEST(CacheConfigCreatorTest, MergedBudgetUsesEachPhysicalSegmentOnce) {
             }
             addCreationFixedPool(target, host);
             KVCacheConfig options;
-            options.kv_cache_mem_mb = 1;
+            options.kv_cache_mem_mb         = 1;
             options.reuse_cache_tail_blocks = 3;
             SpeculativeExecutionConfig sp;
             sp.type              = SP_TYPE_MTP;
@@ -4057,7 +4348,7 @@ TEST(CacheConfigCreatorTest, RejectsInvalidMtpBudgetSegmentsBeforeIndexing) {
     layout.mtp_sub_configs.push_back(nullptr);
     EXPECT_ANY_THROW(CacheConfigCreator::computeLocalBlockNum(layout, model, {}, options, {}));
 
-    auto sub = std::make_shared<CacheConfig>();
+    auto sub       = std::make_shared<CacheConfig>();
     sub->layer_num = 1;
     sub->setTopology({layout.group("full")}, {{0, {"full"}}});
     layout.mtp_sub_configs.back() = sub;

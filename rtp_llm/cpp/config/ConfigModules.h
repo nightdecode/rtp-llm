@@ -41,8 +41,8 @@ enum class CPAllGatherImpl {
 };
 struct PrefillCPConfig {
     CPAllGatherImpl all_gather_impl  = CPAllGatherImpl::LEGACY;
-    CPRotateMethod method           = CPRotateMethod::DISABLED;
-    size_t         comm_buffer_size = 512 * 1024 * 1024;  // 512MB
+    CPRotateMethod  method           = CPRotateMethod::DISABLED;
+    size_t          comm_buffer_size = 512 * 1024 * 1024;  // 512MB
     // When true + tp_size > 1, KV cache uses page-level round-robin sharding
     // across the CP (== TP) group. Each rank physically holds only owned blocks
     // (block_idx % cp_size == cp_rank); see rtp_llm/cpp/cache/CPSlotMapper.h.
@@ -164,27 +164,37 @@ struct KVCacheConfig {
     std::string                             multi_task_prompt     = "";
     std::string                             multi_task_prompt_str = "";
     std::map<std::string, std::vector<int>> multi_task_prompt_tokens;
-    int64_t                                 reserve_block_ratio                             = 5;
-    int64_t                                 memory_cache_size_mb                            = 0;
-    int64_t                                 memory_cache_sync_timeout_ms                    = 10000;
-    std::string                             disk_cache_paths                                = "";
-    int64_t                                 disk_cache_size_mb                              = 0;
-    bool                                    disk_cache_buffered_io                          = true;
-    int64_t                                 disk_cache_sync_timeout_ms                      = 30000;
-    int64_t                                 disk_cache_staging_block_count                  = 128;
-    int64_t                                 memory_cache_max_descriptors_per_transfer_batch = 8;
-    int64_t                                 block_tree_transfer_worker_count                = 4;
-    int64_t                                 block_tree_business_queue_max_size              = 10000;
-    int64_t                                 block_tree_transfer_queue_max_size              = 10000;
-    double   block_tree_device_evict_low_watermark_ratio  = kDefaultDeviceLowWatermarkRatio;
-    double   block_tree_device_evict_high_watermark_ratio = kDefaultDeviceHighWatermarkRatio;
-    double   block_tree_memory_evict_low_watermark_ratio  = kDefaultMemoryLowWatermarkRatio;
-    double   block_tree_memory_evict_high_watermark_ratio = kDefaultMemoryHighWatermarkRatio;
-    double   block_tree_disk_evict_low_watermark_ratio    = kDefaultDiskLowWatermarkRatio;
-    double   block_tree_disk_evict_high_watermark_ratio   = kDefaultDiskHighWatermarkRatio;
-    int      reuse_cache_tail_blocks                      = std::numeric_limits<int>::max();
-    uint32_t linear_pool_blocks                           = 0;
-    uint32_t swa_pool_blocks                              = 0;
+    int64_t                                 reserve_block_ratio          = 5;
+    int64_t                                 memory_cache_size_mb         = 0;
+    int64_t                                 memory_cache_sync_timeout_ms = 10000;
+    std::string                             disk_cache_paths             = "";
+    int64_t                                 disk_cache_size_mb           = 0;
+    bool                                    disk_cache_buffered_io       = true;
+    int64_t                                 disk_cache_sync_timeout_ms   = 3000;
+    // Evict/store override; -1 inherits the load timeout above.
+    int64_t  disk_cache_evict_timeout_ms                     = 3000;
+    int64_t  disk_cache_evict_max_pending_bytes              = 100 * 1024 * 1024;
+    int64_t  disk_cache_staging_block_count                  = 128;
+    int64_t  memory_cache_max_descriptors_per_transfer_batch = 32;
+    int      block_tree_task_pool_size                       = 4;
+    int64_t  block_tree_transfer_worker_count                = 2;
+    int64_t  block_tree_business_queue_max_size              = 10000;
+    int64_t  block_tree_transfer_queue_max_size              = 10000;
+    int64_t  block_tree_frozen_force_release_timeout_ms      = 300000;
+    double   block_tree_device_evict_low_watermark_ratio     = kDefaultDeviceLowWatermarkRatio;
+    double   block_tree_device_evict_high_watermark_ratio    = kDefaultDeviceHighWatermarkRatio;
+    double   block_tree_memory_evict_low_watermark_ratio     = kDefaultMemoryLowWatermarkRatio;
+    double   block_tree_memory_evict_high_watermark_ratio    = kDefaultMemoryHighWatermarkRatio;
+    double   block_tree_disk_evict_low_watermark_ratio       = kDefaultDiskLowWatermarkRatio;
+    double   block_tree_disk_evict_high_watermark_ratio      = kDefaultDiskHighWatermarkRatio;
+    int      reuse_cache_tail_blocks                         = std::numeric_limits<int>::max();
+    uint32_t linear_pool_blocks                              = 0;
+    uint32_t swa_pool_blocks                                 = 0;
+    // Opt-in request policy; only models declaring history-state reclaim support may enable it.
+    bool enable_linear_cache_reclaim = false;
+    // Optional JSON map from cache-group tags to positive pool block-count weights.
+    // Empty preserves the existing pool sizing policy.
+    std::string kv_cache_pool_block_weights = "";
     // Fields merged from PyKvCacheConfig
     int fp8_kv_cache = 0;
     // "auto" preserves a model-declared recurrent-state dtype. Models
@@ -203,12 +213,18 @@ struct KVCacheConfig {
     bool        enable_crc                = true;
     std::string device_eviction_policy    = "lru";
     std::string memory_eviction_policy    = "lru";
-    std::string disk_eviction_policy      = "fifo";
+    std::string disk_eviction_policy      = "lru";
 
     // DSV4 fixed-allocation pool block count. 0 means the fixed regions
     // (INDEXER_STATE / CSA_STATE / HCA_STATE / SWA_KV) use the normal
     // automatically derived block count.
     uint32_t dsv4_fixed_pool_blocks = 0;
+
+    // Optional V4.1 decoder-only SWA override, including reserved block zero.
+    uint32_t dsv41_decoder_swa_pool_blocks = 0;
+
+    // Usable HOST SWA blocks per FULL block; does not change checkpoint spacing.
+    double memory_cache_swa_block_ratio = 1.0;
 
     // Optional DSV4 HCA_STATE pool block count override. 0 means HCA_STATE
     // follows dsv4_fixed_pool_blocks or the normal automatically derived count.
@@ -216,23 +232,25 @@ struct KVCacheConfig {
 
     // DSV4 fixed-pool residency switch. false = GPU BlockPool; true = pinned
     // CPU BlockPool for INDEXER_STATE / CSA_STATE / HCA_STATE / SWA_KV.
-    bool dsv4_fixed_pool_use_memory = false;
 
     // HBM cache event publishing. Only tp_rank=0 with pp_size=1 creates an active publisher for each DP replica.
-    std::string kv_cache_event_publisher_type   = "none";  // none | kvcm
-    std::string kv_cache_event_manager_endpoint = "";      // KVCM Meta HTTP endpoint
-    std::string kv_cache_event_instance_group   = "";
-    std::string kv_cache_event_instance_id      = "";
-    std::string kv_cache_event_host_ip_port     = "";
-    // BlockTreeCache FULL prefix invariant scanner; interval 0 disables the scanner thread.
+    std::string kv_cache_event_publisher_type       = "none";  // none | kvcm
+    std::string kv_cache_event_manager_endpoint     = "";      // KVCM Meta HTTP endpoint
+    std::string kv_cache_event_instance_group       = "";
+    std::string kv_cache_event_instance_id          = "";
+    std::string kv_cache_event_host_ip_port         = "";
+    int         kv_cache_event_snapshot_interval_ms = 300000;
+    // BlockTreeCache FULL prefix invariant scanner; defaults to 30 seconds.
+    // An interval of 0 disables the scanner thread.
     // Batch size and detail cap are scanner-internal constants, not user-tunable.
-    int64_t block_tree_full_prefix_scan_interval_ms = 0;
+    int64_t block_tree_full_prefix_scan_interval_ms = 30000;
 
     // KVCM storage backend configuration fields
     bool        kvcm_enable_vipserver                = false;
     std::string kvcm_vipserver_domain                = "";
     std::string kvcm_server_address                  = "";
     std::string kvcm_instance_group                  = "default";
+    int         kvcm_task_timeout_ms                 = 5000;
     uint32_t    kvcm_meta_channel_retry_time         = 3;
     uint32_t    kvcm_meta_channel_connection_timeout = 6000;
     uint32_t    kvcm_meta_channel_call_timeout       = 1500;
@@ -245,10 +263,11 @@ struct KVCacheConfig {
     std::string kvcm_model_extra_info                = "";
     std::string kvcm_instance_id_salt                = "";
     size_t      kvcm_asyncwrapper_thread_num         = 16;
-    size_t      kvcm_asyncwrapper_queue_size         = 1000;
-    int         kvcm_get_broadcast_timeout           = 15000;
-    int         kvcm_put_broadcast_timeout           = 15000;
-    std::string kvcm_client_config                   = "";
+    size_t      kvcm_asyncwrapper_queue_size         = 10000;
+    // Retained for parsing compatibility; BTC remote broadcasts inherit the task deadline.
+    int         kvcm_get_broadcast_timeout = 15000;
+    int         kvcm_put_broadcast_timeout = 15000;
+    std::string kvcm_client_config         = "";
     // Append configuration fields to preserve existing C++ aggregate callers.
     // -1: model policy; 0: independent pools; 1: require shared hybrid arenas.
     int         shared_hybrid_cache = -1;
@@ -351,8 +370,13 @@ enum SpeculativeType {
     SP_TYPE_EAGLE3        = 3,  // EAGLE-3
     SP_TYPE_EAGLE         = 4,  // EAGLE
     SP_TYPE_DETERMINISTIC = 5,  // Deterministic (Prompt-Lookup)
-    SP_TYPE_DSPARK        = 6   // DSpARK block-diffusion draft
+    SP_TYPE_DSPARK        = 6,  // DSpARK block-diffusion draft
+    SP_TYPE_DFLASH        = 7   // DFlash parallel block draft
 };
+
+inline bool isBlockDraftType(SpeculativeType type) {
+    return type == SP_TYPE_DSPARK || type == SP_TYPE_DFLASH;
+}
 
 struct SpeculativeExecutionConfig {
     std::string     model_type         = "";
@@ -462,10 +486,16 @@ struct FIFOSchedulerConfig {
     //   "N"   -> 1 prefill : N decode (decode-heavy); "1" = strict alternation.
     //   "1/X" -> X prefill : 1 decode (prefill-heavy).
     //   invalid input falls back to "1".
-    std::string decode_prefill_ratio           = "1";
-    bool        cp_force_single_prefill        = true;
-    int64_t     max_inited_kv_cache_streams    = 0;
-    int64_t     max_batch_tokens_without_cache = 0;
+    std::string decode_prefill_ratio    = "1";
+    bool        cp_force_single_prefill = true;
+    // Unconditional single-stream prefill rounds: at most one stream per
+    // prefill forward regardless of the context-parallel setup. Used by the
+    // deterministic batched serving mode to pin the prefill batch-total M to
+    // each request's own length.
+    bool    force_single_prefill           = false;
+    int64_t max_inited_kv_cache_streams    = 0;
+    int64_t max_batch_tokens_without_cache = 0;
+    int64_t max_batch_kv_len               = 0;
     // Global real-context token budget per chunked-prefill forward; <=0 disables, >0 enables.
     // Config injection requires at least one seq_size_per_block and floor-aligns larger values.
     int64_t     prefill_chunk_size  = 0;
@@ -535,6 +565,8 @@ struct PDSepConfig {
     int64_t  max_rpc_timeout_ms              = 2 * 3600 * 1000;  // 2h default
     int64_t  worker_port_offset              = 0;
     bool     decode_entrance                 = false;
+    // Only PD handoff streams may omit historical linear states; ordinary prefill still needs them.
+    bool decode_linear_tail_only = false;
     // ========== Prefill Thread Pool Configuration ==========
     // prepare-resource pool size. 0 = concurrency_limit * 2; effective minimum is 128.
     int64_t prefill_prepare_resource_pool_size = 0;
@@ -691,13 +723,16 @@ struct DashScGrpcConfig: GrpcMapsConfig {
 };
 
 struct LinearAttentionConfig {
-    int         linear_conv_kernel_dim = 0;
-    int         linear_key_head_dim    = 0;
-    int         linear_num_key_heads   = 0;
-    int         linear_num_value_heads = 0;
-    int         linear_value_head_dim  = 0;
-    DataType    ssm_state_dtype        = DataType::TYPE_BF16;
-    DataType    conv_state_dtype       = DataType::TYPE_BF16;
+    int      linear_conv_kernel_dim = 0;
+    int      linear_key_head_dim    = 0;
+    int      linear_num_key_heads   = 0;
+    int      linear_num_value_heads = 0;
+    int      linear_value_head_dim  = 0;
+    DataType ssm_state_dtype        = DataType::TYPE_BF16;
+    DataType conv_state_dtype       = DataType::TYPE_BF16;
+    // Execution accepts null historical checkpoint slots. Active and speculative
+    // rollback state slots must still be retained by the cache manager.
+    bool        supports_history_state_reclaim = false;
     std::string to_string() const;
 };
 

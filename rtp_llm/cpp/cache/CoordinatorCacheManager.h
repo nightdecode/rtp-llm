@@ -1,5 +1,7 @@
 #pragma once
 
+#include "rtp_llm/cpp/cache/metrics/CachePoolMetrics.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -34,27 +36,10 @@ struct KVCacheTokenCapacity {
     size_t available_tokens = 0;
 };
 
-struct KVCachePoolMetricsSnapshot {
-    size_t      pool_index                 = 0;
-    std::string pool_name                  = "unnamed";
-    size_t      block_size_bytes           = 0;
-    size_t      free_blocks                = 0;
-    size_t      used_blocks                = 0;
-    size_t      active_blocks              = 0;
-    size_t      available_blocks           = 0;
-    size_t      total_blocks               = 0;
-    size_t      reserve_blocks             = 0;
-    size_t      request_ref_blocks         = 0;
-    size_t      block_cache_ref_blocks     = 0;
-    size_t      load_ref_blocks            = 0;
-    size_t      eviction_target_ref_blocks = 0;
-    size_t      store_ref_blocks           = 0;
-    size_t      frozen_ref_blocks          = 0;
-    float       used_ratio                 = 0.0f;
-    // Shared block counts are namespace capacities; only arena metrics are
-    // additive physical byte counts. Append to preserve aggregate callers.
-    bool                                     shared_namespace = false;
-    std::optional<SharedBlockArena::Metrics> shared_arena_metrics;
+struct KVCachePoolCapacity {
+    std::string tag;
+    size_t      available_blocks = 0;
+    size_t      reserve_blocks   = 0;
 };
 
 class CoordinatorCacheManager: public std::enable_shared_from_this<CoordinatorCacheManager> {
@@ -72,9 +57,10 @@ public:
 
     virtual ~CoordinatorCacheManager();
 
-    bool                           init();
-    virtual void                   free(const FreeInfo& free_info);
-    virtual void                   insertIntoCache(const InsertInfo& insert_info, size_t& resident_prefix_length);
+    bool         init();
+    virtual void free(const FreeInfo& free_info);
+    void         reclaimLinearHistory(const BatchKVCacheResourcePtr& resource, int committed_tokens, bool reuse_cache);
+    virtual void insertIntoCache(const InsertInfo& insert_info, size_t& resident_prefix_length);
     virtual BlockAddrInfo          convertIndexToAddr(int layer_id, int block_id) const;
     virtual std::vector<BlockInfo> convertIndexToBuffer(int layer_id, int block_id) const;
     virtual std::vector<BlockInfo>
@@ -100,7 +86,9 @@ public:
                                     int                            remaining_tokens,
                                     int                            reserve_step,
                                     bool                           enable_reuse_cache,
-                                    int                            target_batch_size) const;
+                                    int                            target_batch_size,
+                                    LinearCachePolicy  linear_cache_policy = LinearCachePolicy::KEEP_HISTORY,
+                                    const std::string& pool_tag            = {}) const;
 
     MallocResult malloc(const MallocInfo& malloc_info);
     bool         abortPendingLoad(const std::shared_ptr<AsyncContext>& context);
@@ -138,6 +126,10 @@ public:
         use_device_malloc_block_pool_ = use_device_malloc_block_pool;
     }
 
+    void setSkipRemoteReusedWrite(bool skip_remote_reused_write) {
+        skip_remote_reused_write_ = skip_remote_reused_write;
+    }
+
     void setCPSlotMapper(std::shared_ptr<CPSlotMapper> cp_slot_mapper) {
         cp_slot_mapper_ = std::move(cp_slot_mapper);
     }
@@ -154,21 +146,22 @@ public:
         return reserve_block_num_;
     }
 
-    virtual void                 regUserMr(size_t model_id, std::shared_ptr<CacheStore> cache_store = nullptr);
-    virtual int64_t              getMrCostTimeMs() const;
-    virtual size_t               freeBlocksNum() const;
-    virtual size_t               availableBlocksNum() const;
-    virtual size_t               availableTokensNum() const;
-    virtual size_t               totalTokensNum() const;
-    virtual size_t               totalBlocksNum() const;
-    virtual size_t               maxAvailableTokensNum() const;
-    virtual KVCacheTokenCapacity tokenCapacity(size_t default_seq_size_per_block) const;
-    virtual std::vector<KVCachePoolMetricsSnapshot> poolMetricsSnapshots() const;
+    virtual void                          regUserMr(size_t model_id, std::shared_ptr<CacheStore> cache_store = nullptr);
+    virtual int64_t                       getMrCostTimeMs() const;
+    virtual size_t                        freeBlocksNum() const;
+    virtual size_t                        availableBlocksNum() const;
+    virtual size_t                        availableTokensNum() const;
+    virtual size_t                        totalTokensNum() const;
+    virtual size_t                        totalBlocksNum() const;
+    virtual size_t                        maxAvailableTokensNum() const;
+    virtual KVCacheTokenCapacity          tokenCapacity(size_t default_seq_size_per_block) const;
+    virtual std::vector<CachePoolMetrics> poolMetrics() const;
+    std::vector<KVCachePoolCapacity>      poolCapacities() const;
     /// Returns global layer id; std::numeric_limits<uint32_t>::max() indicates invalid (caller must check).
     uint32_t convertToGlobalLayerId(size_t model_id, int local_layer_id) const;
 
 protected:
-    // Which capacity snapshots evaluateInitCapacity() is allowed to consult.
+    // Which capacity metrics_list evaluateInitCapacity() is allowed to consult.
     // TOTAL_ONLY answers "can this request ever fit"; TOTAL_AND_AVAILABLE also
     // answers "can it fit right now".
     enum class InitCapacityMode {
@@ -200,21 +193,27 @@ protected:
     static size_t heldRequestBlocks(const MallocInfo& malloc_info, std::string_view tag);
     // Reuse-aware interpretation of planner output: reuse planners report
     // additional demand; no-reuse planners report the full footprint.
-    static InitBlockDemand initBlockDemand(const MallocInfo& malloc_info, size_t planned_blocks, std::string_view tag);
+    static InitBlockDemand
+    initBlockDemand(const MallocInfo& malloc_info, size_t planned_blocks, std::string_view tag, bool reuse_enabled);
+    // Shared runtime/forecast guard. Request-specific ownership and execution checks remain in the stream.
+    bool canReclaimLinearHistory(int batch_size, bool reuse_cache) const;
     // Estimate peak additional blocks for one sequence resource.
-    virtual int   estimatePeakNeedBlocks(const KVCacheResource& kv_cache_resource,
-                                         int                    seq_len,
-                                         int                    remaining_tokens,
-                                         int                    reserve_step,
-                                         bool                   enable_reuse_cache) const;
-    virtual int   estimateInitialBatchPeakNeedBlocks(int  seq_len,
-                                                     int  common_seq_len,
-                                                     int  remaining_tokens,
-                                                     int  reserve_step,
-                                                     bool enable_reuse_cache,
-                                                     int  target_batch_size) const;
+    virtual int estimatePeakNeedBlocks(const KVCacheResource& kv_cache_resource,
+                                       int                    seq_len,
+                                       int                    remaining_tokens,
+                                       int                    reserve_step,
+                                       bool                   enable_reuse_cache,
+                                       LinearCachePolicy linear_cache_policy = LinearCachePolicy::KEEP_HISTORY) const;
+    virtual int
+                  estimateInitialBatchPeakNeedBlocks(int               seq_len,
+                                                     int               common_seq_len,
+                                                     int               remaining_tokens,
+                                                     int               reserve_step,
+                                                     bool              enable_reuse_cache,
+                                                     int               target_batch_size,
+                                                     LinearCachePolicy linear_cache_policy = LinearCachePolicy::KEEP_HISTORY) const;
     virtual void  checkCPShardedMallocResult(const MallocInfo&) const;
-    virtual void  decrKVCacheRef(const KVCacheResource& kvcache_resource);
+    void          decrKVCacheRef(const KVCacheResource& kvcache_resource, DeviceBlockRefType ref_type);
     size_t        logicalSeqSizePerBlockForCapacity(const std::string& tag) const;
     int           deviceCacheMetricTokensPerBlock() const;
     static size_t maxReusableMatchKeys(int seq_len, int reuse_unit_tokens) {
@@ -256,7 +255,10 @@ protected:
                                                      BatchKVCacheResource&                kv_resource,
                                                      const std::shared_ptr<CPSlotMapper>& cp_mapper,
                                                      PreparedKVCache&                     prepared,
-                                                     const std::function<bool(size_t)>&   valid_prefix = {});
+                                                     const std::function<bool(size_t)>&   valid_prefix           = {},
+                                                     bool                                 enable_storage_backend = true,
+                                                     std::optional<int64_t>               request_id             = {},
+                                                     bool                                 skip_linear = false);
     bool                              materializeInitialBlocks(const MallocInfo& malloc_info,
                                                                PreparedKVCache&  prepared,
                                                                LoadAsyncContext* context,
@@ -305,6 +307,7 @@ protected:
     int                                    equivalentSharedBlocks(const std::vector<size_t>& demand) const;
     std::vector<DeviceBlockPoolPtr>        group_block_pools_;
     RoleType                               role_type_{RoleType::PDFUSION};
+    bool                                   skip_remote_reused_write_{false};
     // Drain pending copies before releasing the cache groups and pools.
     std::unique_ptr<GpuBlockCopy> gpu_block_copy_;
 

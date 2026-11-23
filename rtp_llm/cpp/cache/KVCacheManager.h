@@ -15,6 +15,7 @@
 #include "rtp_llm/cpp/cache/AsyncContext.h"
 #include "rtp_llm/cpp/cache/CoordinatorCacheManager.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeCache.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/transfer/TransferCompletionQuery.h"
 #include "rtp_llm/cpp/config/ConfigModules.h"
 #include "rtp_llm/cpp/model_rpc/proto/model_rpc_service.grpc.pb.h"
 #include "kmonitor/client/MetricsReporter.h"
@@ -28,6 +29,9 @@ struct BlockTreeCacheLayout;
 using BlockTreeCacheLayoutConstPtr = std::shared_ptr<const BlockTreeCacheLayout>;
 class PrefillCacheHitMetricsReporter;
 class KVCacheAllocationWaitState;
+class KVCacheEventReporter;
+class FrozenTaskRecovery;
+class TransferCompletionCleanup;
 
 class KVCacheManager {
 public:
@@ -64,6 +68,7 @@ public:
     bool         abortPendingLoad(const std::shared_ptr<AsyncContext>& context);
     bool         detachSharedBlocksForRecompute(const BatchKVCacheResourcePtr& resource, int device_ready_reuse_length);
     // Outputs the resident key-prefix count; ordinary inserts report zero.
+    void reclaimLinearHistory(const BatchKVCacheResourcePtr& resource, int committed_tokens, bool reuse_cache);
     void insertIntoCache(const InsertInfo& insert_info, size_t& resident_prefix_length);
 
     // Decode-side P/D admission allocates destination blocks before cache handoff.  When pools are
@@ -76,13 +81,19 @@ public:
     int
     singleBatchNeedBlocks(const BatchKVCacheResourcePtr& batch_kv_cache_resource, int seq_len, int reserve_step) const;
 
+    std::vector<KVCachePoolCapacity> poolCapacities() const {
+        return coordinator_manager_->poolCapacities();
+    }
+
     int estimatePeakNeedBlocks(const BatchKVCacheResourcePtr& batch_kv_cache_resource,
                                int                            seq_len,
                                int                            common_seq_len,
                                int                            remaining_tokens,
                                int                            reserve_step,
                                bool                           enable_reuse_cache,
-                               int                            target_batch_size) const;
+                               int                            target_batch_size,
+                               LinearCachePolicy              linear_cache_policy = LinearCachePolicy::KEEP_HISTORY,
+                               const std::string&             pool_tag            = {}) const;
 
     // 块操作相关
     void blockCopy(int src_block_index, int dest_block_index);
@@ -138,6 +149,17 @@ public:
     // succeeded; the transfer outcome is reported through mem_response.code.
     bool executeFunction(const FunctionRequestPB& request, FunctionResponsePB& response);
 
+    // One observation of the original execution; does not release frozen references.
+    TransferCompletionQueryResult queryTransferCompletion(const FrozenTask::ExecutionInfo& execution,
+                                                          int                              timeout_ms) const;
+
+    TransferCompletionForgetResult forgetTransferCompletion(const TransferCompletionTarget&            target,
+                                                            const std::vector<TransferExecutionTrace>& traces,
+                                                            int timeout_ms) const;
+
+    // Snapshot both existing owners; taking a snapshot does not transfer custody.
+    std::vector<std::shared_ptr<FrozenTask>> frozenTasks() const;
+
     BlockTreeCachePtr blockTreeCache() const {
         return block_tree_cache_;
     }
@@ -154,10 +176,16 @@ public:
     }
 
 private:
-    std::function<void()> allocationChangeCallback() const;
-    void                  reportMetricsLoop();
-    void reportPrefillCacheHitMetrics(const MallocInfo& malloc_info, bool is_first_malloc);
+    std::function<void()>             allocationChangeCallback() const;
+    void                              reportMetricsLoop();
+    void                              missingCleanupLoop();
+    void                              stopMissingCleanup();
+    void                              reportPrefillCacheHitMetrics(const MallocInfo& malloc_info, bool is_first_malloc);
     std::shared_ptr<BroadcastManager> createMultiRankBlockTransferManager() const;
+    TransferTaskRegistry::State       localTransferCompletion(const TransferExecutionTrace& trace_id) const;
+    TransferTaskRegistry::ForgetResult localForgetTransferCompletion(const TransferExecutionTrace& trace_id) const;
+    bool                               startFrozenTaskRecovery();
+    void                               stopFrozenTaskRecovery() noexcept;
 
     // 成员变量
     CacheConfig                config_;
@@ -173,9 +201,8 @@ private:
     const bool                         warmup_;
     const BlockTreeCacheLayoutConstPtr block_tree_layout_;
     KVCacheEventPublisherPtr           cache_event_publisher_;
-    bool                               hasTailSparseReuseGroup() const;
-    void                               initCacheEventPublisher();
-    void                               stopCacheEventPublisher();
+    void initCacheEventPublisher(std::shared_ptr<KVCacheEventReporter> reporter = nullptr);
+    void stopCacheEventPublisher();
 
     std::shared_ptr<CPSlotMapper>                   cp_slot_mapper_;
     std::unique_ptr<PrefillCacheHitMetricsReporter> prefill_cache_hit_metrics_reporter_;
@@ -183,7 +210,15 @@ private:
     std::atomic<bool> stop_{false};
     std::thread       metrics_reporter_thread_;
 
+    std::mutex              missing_cleanup_mutex_;
+    std::condition_variable missing_cleanup_cv_;
+    bool                    missing_cleanup_stopped_{false};
+    std::thread             missing_cleanup_thread_;
+
     BlockTreeCachePtr                           block_tree_cache_;
+    std::shared_ptr<BroadcastManager>           transfer_broadcast_manager_;
+    std::unique_ptr<FrozenTaskRecovery>         frozen_task_recovery_;
+    std::shared_ptr<TransferCompletionCleanup>  completion_cleanup_;
     std::shared_ptr<KVCacheAllocationWaitState> allocation_wait_state_;
 
     mutable std::mutex          cache_store_mutex_;

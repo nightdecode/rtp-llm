@@ -268,14 +268,31 @@ class SharedHybridCacheArgumentsTest(TestCase):
         config.linear_pool_blocks = 8
         config.swa_pool_blocks = 16
         state = list(config.__getstate__())
-        self.assertEqual(state[0:2], ["KVCacheConfig", 10])
-        state[1] = 9
+        self.assertEqual(state[0:2], ["KVCacheConfig", 26])
+        state[1] = 25
         legacy = KVCacheConfig.__new__(KVCacheConfig)
         legacy.__setstate__(tuple(state[:-1]))
         self.assertEqual(legacy.shared_hybrid_cache, 0)
         self.assertTrue(legacy.reuse_cache)
         self.assertEqual(legacy.linear_pool_blocks, 8)
         self.assertEqual(legacy.swa_pool_blocks, 16)
+
+    def test_glm_port_v10_pickle_retains_shared_policy_and_pool_budgets(self):
+        from rtp_llm.ops import KVCacheConfig
+
+        config = KVCacheConfig()
+        config.enable_crc = False
+        config.linear_pool_blocks = 8
+        config.swa_pool_blocks = 16
+        state = config.__getstate__()
+        previous = (state[0], 10, *state[2:53], True, *state[53:71], 1)
+        restored = KVCacheConfig.__new__(KVCacheConfig)
+        restored.__setstate__(previous)
+        self.assertEqual(previous[1], 10)
+        self.assertFalse(restored.enable_crc)
+        self.assertEqual(restored.linear_pool_blocks, 8)
+        self.assertEqual(restored.swa_pool_blocks, 16)
+        self.assertEqual(restored.shared_hybrid_cache, 1)
 
     def test_invalid_policy_is_rejected_by_parser_and_transport(self):
         from rtp_llm.ops import KVCacheConfig
@@ -361,6 +378,33 @@ class CPRotateMethodArgumentsTest(TestCase):
                     server_args.setup_args(args)
 
 
+class PDLinearTailArgumentsTest(TestCase):
+    def test_default_env_cli_and_pickle(self):
+        from rtp_llm.server.server_args import server_args
+
+        with patch.dict(os.environ, {}, clear=True):
+            default = server_args.setup_args([]).pd_separation_config
+            self.assertFalse(default.decode_linear_tail_only)
+            enabled = server_args.setup_args(
+                ["--decode_linear_tail_only", "true"]
+            ).pd_separation_config
+            self.assertTrue(enabled.decode_linear_tail_only)
+            self.assertTrue(pickle.loads(pickle.dumps(enabled)).decode_linear_tail_only)
+            config_type = type(enabled)
+            legacy = config_type.__new__(config_type)
+            legacy.__setstate__(enabled.__getstate__()[:19])
+            self.assertFalse(legacy.decode_linear_tail_only)
+            self.assertEqual(legacy.role_type, enabled.role_type)
+
+        with patch.dict(os.environ, {"DECODE_LINEAR_TAIL_ONLY": "1"}, clear=True):
+            from_env = server_args.setup_args([]).pd_separation_config
+            overridden = server_args.setup_args(
+                ["--decode_linear_tail_only", "false"]
+            ).pd_separation_config
+            self.assertTrue(from_env.decode_linear_tail_only)
+            self.assertFalse(overridden.decode_linear_tail_only)
+
+
 class DynamicDecodeArgumentsTest(TestCase):
     def test_dynamic_decode_backend_parser_and_default(self):
         from rtp_llm.server.server_args import server_args
@@ -402,11 +446,184 @@ class DynamicDecodeArgumentsTest(TestCase):
             )
 
 
+class KVCacheControlArgumentsTest(TestCase):
+    def test_kvcm_address_selects_connection_mode(self):
+        from rtp_llm.server.server_args import server_args
+
+        cases = (
+            (
+                {"RECO_SERVER_ADDRESS": "10.0.0.8:19001"},
+                "10.0.0.8:19001",
+                "",
+            ),
+            ({"RECO_SERVER_ADDRESS": "vipserver://kvcm.example"}, "", "kvcm.example"),
+            (
+                {"RECO_SERVER_ADDRESS": "kvcm.example.vipserver"},
+                "",
+                "kvcm.example.vipserver",
+            ),
+            (
+                {"RECO_SERVER_ADDRESS": "kvcm.example.vipserver:19001"},
+                "kvcm.example.vipserver:19001",
+                "",
+            ),
+            (
+                {
+                    "RECO_VIPSERVER_DOMAIN": "legacy.example",
+                    "RECO_SERVER_ADDRESS": "vipserver://other.example",
+                    "RECO_ENABLE_VIPSERVER": "0",
+                },
+                "",
+                "other.example",
+            ),
+            ({"RECO_ENABLE_VIPSERVER": "1"}, "", ""),
+        )
+        for environ, expected_address, expected_domain in cases:
+            with (
+                self.subTest(environ=environ),
+                patch.dict(os.environ, environ, clear=True),
+            ):
+                config = server_args.setup_args([]).kv_cache_config
+                self.assertEqual(config.kvcm_server_address, expected_address)
+                self.assertEqual(config.kvcm_vipserver_domain, expected_domain)
+                self.assertIs(config.kvcm_enable_vipserver, bool(expected_domain))
+
+    def test_event_instance_id_falls_back_to_deployment_name(self):
+        from rtp_llm.server.server_args import server_args
+
+        cases = (
+            ({"DEPLOYMENT_NAME": "whale-deploy"}, "whale-deploy"),
+            (
+                {
+                    "SPECTRUM_DEPLOYMENT_NAME": " spectrum-deploy ",
+                    "DEPLOYMENT_NAME": "whale-deploy",
+                },
+                "spectrum-deploy",
+            ),
+            (
+                {"DEPLOYMENT_NAME": "whale-deploy", "KV_CACHE_EVENT_INSTANCE_ID": ""},
+                "whale-deploy",
+            ),
+            (
+                {
+                    "SPECTRUM_DEPLOYMENT_NAME": "spectrum-deploy",
+                    "KV_CACHE_EVENT_INSTANCE_ID": "configured-id",
+                },
+                "configured-id",
+            ),
+            ({"BIZ_NAME": "example-biz"}, ""),
+        )
+        for environ, expected in cases:
+            with (
+                self.subTest(environ=environ),
+                patch.dict(
+                    os.environ,
+                    {"KV_CACHE_EVENT_PUBLISHER_TYPE": "kvcm", **environ},
+                    clear=True,
+                ),
+            ):
+                config = server_args.setup_args([]).kv_cache_config
+                self.assertEqual(config.kv_cache_event_instance_id, expected)
+
+    def test_remote_control_accepts_unused_nonpositive_snapshot_interval(self):
+        from rtp_llm.server.server_args import server_args
+
+        for publisher in ("none", "kvcm"):
+            for interval in ("0", "-1"):
+                with self.subTest(publisher=publisher, interval=interval):
+                    with patch.dict(os.environ, {}, clear=True):
+                        configs = server_args.setup_args(
+                            [
+                                "--kv_cache_event_snapshot_interval_ms",
+                                interval,
+                                "--kv_cache_event_publisher_type",
+                                publisher,
+                                "--enable_remote_cache",
+                                "true",
+                            ]
+                        )
+                    self.assertTrue(configs.kv_cache_config.enable_remote_cache)
+                    self.assertEqual(
+                        configs.kv_cache_config.kv_cache_event_snapshot_interval_ms,
+                        int(interval),
+                    )
+
+    def test_remote_control_env_accepts_unused_snapshot_interval(self):
+        from rtp_llm.server.server_args import server_args
+
+        with patch.dict(
+            os.environ,
+            {
+                "ENABLE_REMOTE_CACHE": "1",
+                "KV_CACHE_EVENT_PUBLISHER_TYPE": "none",
+                "KV_CACHE_EVENT_SNAPSHOT_INTERVAL_MS": "0",
+            },
+            clear=True,
+        ):
+            configs = server_args.setup_args([])
+        self.assertTrue(configs.kv_cache_config.enable_remote_cache)
+        self.assertEqual(configs.kv_cache_config.kv_cache_event_snapshot_interval_ms, 0)
+
+    def test_nonpositive_snapshot_interval_without_remote_is_rejected(self):
+        from rtp_llm.server.server_args import server_args
+
+        with patch.dict(os.environ, {}, clear=True), self.assertRaises(SystemExit):
+            server_args.setup_args(["--kv_cache_event_snapshot_interval_ms", "0"])
+
+    def test_snapshot_interval_still_requires_int32(self):
+        from rtp_llm.server.server_args import server_args
+
+        with patch.dict(os.environ, {}, clear=True), self.assertRaises(SystemExit):
+            server_args.setup_args(
+                [
+                    "--enable_remote_cache",
+                    "true",
+                    "--kv_cache_event_snapshot_interval_ms",
+                    str(2**31),
+                ]
+            )
+
+
 class CacheConfigArgumentsTest(TestCase):
+    def test_pool_block_weights_default_env_and_cli_precedence(self):
+        from_env = '{"full":8,"linear":1}'
+        from_cli = '{"full": 5, "linear": 2, "draft-linear": 1}'
+        for args, env, expected in (
+            ([], {}, ""),
+            (["--kv_cache_pool_block_weights", from_cli], {}, from_cli),
+            ([], {"KV_CACHE_POOL_BLOCK_WEIGHTS": from_env}, from_env),
+            (
+                ["--kv_cache_pool_block_weights", from_cli],
+                {"KV_CACHE_POOL_BLOCK_WEIGHTS": from_env},
+                from_cli,
+            ),
+            (
+                ["--kv_cache_pool_block_weights", ""],
+                {"KV_CACHE_POOL_BLOCK_WEIGHTS": from_env},
+                "",
+            ),
+        ):
+            with self.subTest(args=args, env=env):
+                config = self.parse_cache_config(args, env)
+                self.assertEqual(config.kv_cache_pool_block_weights, expected)
+
+    def test_linear_cache_reclaim_is_opt_in_and_cli_overrides_environment(self):
+        for args, env, expected in (
+            ([], {}, False),
+            (["--enable_linear_cache_reclaim", "1"], {}, True),
+            ([], {"ENABLE_LINEAR_CACHE_RECLAIM": "1"}, True),
+            (
+                ["--enable_linear_cache_reclaim", "0"],
+                {"ENABLE_LINEAR_CACHE_RECLAIM": "1"},
+                False,
+            ),
+        ):
+            with self.subTest(args=args, env=env):
+                config = self.parse_cache_config(args, env)
+                self.assertEqual(config.enable_linear_cache_reclaim, expected)
+
     # Keep the supported startup fields explicit, independently of parser registration.
     samples = {
-        "enable_vipserver": True,
-        "vipserver_domain": "vip.example",
         "server_address": "127.0.0.1:1234",
         "instance_group": "legacy-group",
         "meta_channel_retry_time": 7,
@@ -487,6 +704,141 @@ class CacheConfigArgumentsTest(TestCase):
         with patch.dict(os.environ, env, clear=True), patch.object(sys, "argv", argv):
             parser.parse_args(None if use_sys_argv else args)
         return config
+
+    def test_disk_timeouts_support_independent_env_and_cli_overrides(self):
+        cases = (
+            ([], {}, (3000, 3000)),
+            ([], {"DISK_CACHE_SYNC_TIMEOUT_MS": "4321"}, (4321, 3000)),
+            (
+                [],
+                {
+                    "DISK_CACHE_SYNC_TIMEOUT_MS": "4321",
+                    "DISK_CACHE_EVICT_TIMEOUT_MS": "-1",
+                },
+                (4321, -1),
+            ),
+            (
+                [],
+                {
+                    "DISK_CACHE_SYNC_TIMEOUT_MS": "200",
+                    "DISK_CACHE_EVICT_TIMEOUT_MS": "45000",
+                },
+                (200, 45000),
+            ),
+            (
+                ["--disk_cache_sync_timeout_ms", "100"],
+                {
+                    "DISK_CACHE_SYNC_TIMEOUT_MS": "200",
+                    "DISK_CACHE_EVICT_TIMEOUT_MS": "45000",
+                },
+                (100, 45000),
+            ),
+            (
+                ["--disk_cache_evict_timeout_ms", "60000"],
+                {
+                    "DISK_CACHE_SYNC_TIMEOUT_MS": "200",
+                    "DISK_CACHE_EVICT_TIMEOUT_MS": "45000",
+                },
+                (200, 60000),
+            ),
+        )
+        for args, env, expected in cases:
+            with self.subTest(args=args, env=env):
+                config = self.parse_cache_config(args, env)
+                config = pickle.loads(pickle.dumps(config))
+                self.assertEqual(
+                    (
+                        config.disk_cache_sync_timeout_ms,
+                        config.disk_cache_evict_timeout_ms,
+                    ),
+                    expected,
+                )
+
+    def test_remote_task_budget_is_independent_of_host_and_sdk(self):
+        cases = (
+            ([], {}, 5000),
+            ([], {"KVCM_TASK_TIMEOUT_MS": "23000"}, 23000),
+            (
+                ["--kvcm_task_timeout_ms", "24000"],
+                {"KVCM_TASK_TIMEOUT_MS": "23000"},
+                24000,
+            ),
+        )
+        for args, env, expected in cases:
+            with self.subTest(args=args, env=env):
+                config = self.parse_cache_config(args, env)
+                self.assertEqual(config.kvcm_task_timeout_ms, expected)
+                self.assertEqual(config.memory_cache_sync_timeout_ms, 10000)
+                self.assertEqual(config.disk_cache_sync_timeout_ms, 3000)
+                self.assertEqual(config.kvcm_get_timeout_ms, 12000)
+                self.assertEqual(config.kvcm_put_timeout_ms, 12000)
+
+    def test_retired_cache_options_are_absent_at_startup_and_in_workers(self):
+        options = (
+            ("kvcm_read_backend_type", "3"),
+            ("kvcm_min_replica_count", "4"),
+            ("btc_transfer_engine_async", "false"),
+            ("dsv4_fixed_pool_use_memory", "true"),
+            ("btc_crc_slot_count", "3"),
+            ("disk_cache_read_thread_count", "4"),
+            ("disk_cache_write_thread_count", "6"),
+            ("block_tree_frozen_recovery_interval_ms", "0"),
+            ("block_tree_frozen_recovery_query_timeout_ms", "750"),
+            ("block_pool_frozen_abort_lower_ratio", "0.35"),
+            ("block_pool_frozen_abort_upper_ratio", "0.45"),
+            ("block_tree_full_device_evict_low_watermark_ratio", "0.90"),
+            ("block_tree_full_device_evict_high_watermark_ratio", "0.95"),
+            ("block_tree_full_memory_evict_low_watermark_ratio", "0.94"),
+            ("block_tree_full_memory_evict_high_watermark_ratio", "0.97"),
+            ("block_tree_full_disk_evict_low_watermark_ratio", "0.96"),
+            ("block_tree_full_disk_evict_high_watermark_ratio", "0.98"),
+        )
+        env = {name.upper(): value for name, value in options}
+        for args in (None, []):
+            config = self.parse_cache_config(args, env)
+            restored = pickle.loads(pickle.dumps(config))
+            for name, _ in options:
+                with self.subTest(name=name, args=args):
+                    self.assertFalse(hasattr(config, name))
+                    self.assertFalse(hasattr(restored, name))
+
+        for name, value in options:
+            with self.subTest(name=name), self.assertRaises(SystemExit):
+                self.parse_cache_config([f"--{name}={value}"], {})
+
+    def test_frozen_force_release_timeout_cli_environment_and_worker_pickle(self):
+        name = "block_tree_frozen_force_release_timeout_ms"
+        env_name = name.upper()
+        for args, env, expected in (
+            ([], {}, 300000),
+            (None, {}, 300000),
+            ([], {env_name: "120000"}, 120000),
+            (None, {env_name: "1200000"}, 1200000),
+            ([f"--{name}", "0"], {env_name: "120000"}, 0),
+            ([f"--{name}", "1"], {}, 1),
+            ([], {env_name: "0"}, 0),
+            ([f"--{name}", str(2**31 - 1)], {}, 2**31 - 1),
+        ):
+            with self.subTest(args=args, env=env):
+                config = self.parse_cache_config(args, env)
+                self.assertEqual(getattr(config, name), expected)
+                restored = pickle.loads(pickle.dumps(config))
+                self.assertEqual(getattr(restored, name), expected)
+
+    def test_frozen_force_release_timeout_rejects_invalid_cli_and_environment(self):
+        name = "block_tree_frozen_force_release_timeout_ms"
+        for value in ("-1", str(2**31), "1.5", "invalid"):
+            with (
+                self.subTest(value=value, source="cli"),
+                self.assertRaises(SystemExit),
+            ):
+                self.parse_cache_config([f"--{name}", value], {})
+            for args in (None, []):
+                with (
+                    self.subTest(value=value, source="env", args=args),
+                    self.assertRaises(SystemExit),
+                ):
+                    self.parse_cache_config(args, {name.upper(): value})
 
     def test_crc_default_and_environment(self):
         for args in (None, []):
@@ -600,6 +952,47 @@ class CacheConfigArgumentsTest(TestCase):
             for name in samples:
                 with self.subTest(name=name, args=args):
                     self.assertEqual(getattr(config, name), getattr(defaults, name))
+
+    def test_retired_kvcm_settings_have_no_startup_override(self):
+        retired_options = (
+            (
+                "kv_cache_event_manager_endpoint",
+                "KV_CACHE_EVENT_MANAGER_ENDPOINT",
+                "http://127.0.0.1:18000",
+            ),
+            (
+                "kv_cache_event_instance_group",
+                "KV_CACHE_EVENT_INSTANCE_GROUP",
+                "old-group",
+            ),
+            (
+                "kv_cache_event_host_ip_port",
+                "KV_CACHE_EVENT_HOST_IP_PORT",
+                "127.0.0.1:18000",
+            ),
+            ("kvcm_enable_vipserver", "RECO_ENABLE_VIPSERVER", "1"),
+            ("kvcm_vipserver_domain", "RECO_VIPSERVER_DOMAIN", "legacy.example"),
+        )
+        defaults = self.parse_cache_config([], {})
+        environ = {env_name: value for _, env_name, value in retired_options}
+        for args in (None, []):
+            with self.subTest(args=args):
+                config = self.parse_cache_config(args, environ)
+                for field_name, _, _ in retired_options:
+                    self.assertEqual(
+                        getattr(config, field_name), getattr(defaults, field_name)
+                    )
+
+        for field_name, _, value in retired_options:
+            flag = f"--{field_name}"
+            with (
+                self.subTest(flag=flag),
+                patch("sys.stderr", new_callable=io.StringIO) as stderr,
+            ):
+                with self.assertRaises(SystemExit) as raised:
+                    self.parse_cache_config([flag, value], {})
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn(f"unrecognized arguments: {flag}", stderr.getvalue())
 
     def test_removed_sm_copy_cli_is_rejected(self):
         # This copy optimization was removed with the old connector. It is
@@ -738,6 +1131,44 @@ class DecodeGraphCapacityArgumentsTest(TestCase):
 
 class ServerArgsPyEnvConfigsTest(TestCase):
     """Test that environment variables and command line arguments are correctly set to py_env_configs structure."""
+
+    def test_vit_proxy_health_threshold_default_environment_and_cli(self):
+        from rtp_llm.server.server_args import server_args
+
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                server_args.setup_args([]).vit_config.vit_proxy_min_healthy_workers, 0
+            )
+        with patch.dict(os.environ, {"VIT_PROXY_MIN_HEALTHY_WORKERS": "3"}, clear=True):
+            self.assertEqual(
+                server_args.setup_args([]).vit_config.vit_proxy_min_healthy_workers, 3
+            )
+            config = server_args.setup_args(["--vit_proxy_min_healthy_workers", "4"])
+            self.assertEqual(config.vit_config.vit_proxy_min_healthy_workers, 4)
+            self.assertIn(
+                "vit_proxy_min_healthy_workers: 4", config.vit_config.to_string()
+            )
+
+    def test_vit_proxy_health_threshold_rejects_invalid_cli_and_environment(self):
+        from rtp_llm.server.server_args import server_args
+
+        for value in ("-1", "1.5", "nan", "abc"):
+            with (
+                self.subTest(value=value),
+                patch.dict(os.environ, {}, clear=True),
+                patch("sys.stderr", new_callable=io.StringIO),
+            ):
+                with self.assertRaises(SystemExit):
+                    server_args.setup_args(["--vit_proxy_min_healthy_workers", value])
+            with (
+                self.subTest(env=value),
+                patch.dict(
+                    os.environ, {"VIT_PROXY_MIN_HEALTHY_WORKERS": value}, clear=True
+                ),
+                patch("sys.stderr", new_callable=io.StringIO),
+            ):
+                with self.assertRaises(SystemExit):
+                    server_args.setup_args([])
 
     def test_dsv4_mega_moe_public_choices(self):
         from rtp_llm.server.server_args import server_args
@@ -1002,6 +1433,7 @@ class ServerArgsSetTest(TestCase):
         os.environ["PREFILL_PREPARE_RESOURCE_POOL_SIZE"] = "256"
         os.environ["MAX_CONTEXT_BATCH_SIZE"] = "32"
         os.environ["MAX_BATCH_TOKENS_WITHOUT_CACHE"] = "2048"
+        os.environ["MAX_BATCH_KV_LEN"] = "16384"
         os.environ["CP_FORCE_SINGLE_PREFILL"] = "0"
         os.environ["PREFILL_CHUNK_SIZE"] = "256"
         os.environ["WARM_UP"] = "1"
@@ -1081,6 +1513,11 @@ class ServerArgsSetTest(TestCase):
         )
         self.assertEqual(restored_fifo_config.max_batch_tokens_without_cache, 2048)
         self.assertEqual(restored_fifo_config.prefill_chunk_size, 256)
+        self.assertEqual(
+            py_env_configs.runtime_config.fifo_scheduler_config.max_batch_kv_len,
+            16384,
+        )
+        self.assertEqual(restored_fifo_config.max_batch_kv_len, 16384)
         # Old pickles carry only the two original slots; every field added later
         # must fall back to its default instead of raising.
         fifo_config_type = type(py_env_configs.runtime_config.fifo_scheduler_config)
@@ -1094,6 +1531,35 @@ class ServerArgsSetTest(TestCase):
         seven_slot_fifo_config.__setstate__((32, 8192, "ratio", "2", False, 16, 2048))
         self.assertEqual(seven_slot_fifo_config.max_batch_tokens_without_cache, 2048)
         self.assertEqual(seven_slot_fifo_config.prefill_chunk_size, 0)
+        self.assertEqual(seven_slot_fifo_config.max_batch_kv_len, 0)
+        eight_slot_fifo_config = fifo_config_type.__new__(fifo_config_type)
+        eight_slot_fifo_config.__setstate__(
+            (32, 8192, "ratio", "2", False, 16, 2048, 256)
+        )
+        self.assertEqual(eight_slot_fifo_config.prefill_chunk_size, 256)
+        self.assertEqual(eight_slot_fifo_config.max_batch_kv_len, 0)
+
+        for single_prefill in (False, True):
+            current_fifo_config = fifo_config_type()
+            current_fifo_config.force_single_prefill = single_prefill
+            current_fifo_config.max_batch_kv_len = 16384
+            restored = pickle.loads(pickle.dumps(current_fifo_config))
+            self.assertEqual(restored.force_single_prefill, single_prefill)
+            self.assertEqual(restored.max_batch_kv_len, 16384)
+        for slot, single_prefill, kv_limit in (
+            (False, False, 0),
+            (True, True, 0),
+            (0, False, 0),
+            (1, False, 1),
+            (16384, False, 16384),
+        ):
+            with self.subTest(legacy_fifo_slot=slot):
+                restored = fifo_config_type.__new__(fifo_config_type)
+                restored.__setstate__(
+                    (32, 8192, "ratio", "2", False, 16, 2048, 256, slot)
+                )
+                self.assertEqual(restored.force_single_prefill, single_prefill)
+                self.assertEqual(restored.max_batch_kv_len, kv_limit)
 
         # Verify frontend and DashSc pre-stop windows are configured independently.
         self.assertEqual(
@@ -1175,6 +1641,8 @@ class ServerArgsSetTest(TestCase):
             "64",
             "--max_batch_tokens_without_cache",
             "4096",
+            "--max_batch_kv_len",
+            "32768",
             "--prefill_chunk_size",
             "512",
             "--cp_force_single_prefill",
@@ -1256,6 +1724,10 @@ class ServerArgsSetTest(TestCase):
             16,
         )
 
+        self.assertEqual(
+            py_env_configs.runtime_config.fifo_scheduler_config.max_batch_kv_len,
+            32768,
+        )
         # Verify runtime_config (warm_up is now in RuntimeConfig)
         self.assertEqual(py_env_configs.runtime_config.warm_up, False)  # bool in C++
         self.assertEqual(py_env_configs.runtime_config.warm_up_with_loss, False)
@@ -2264,6 +2736,59 @@ class ServerArgsGrammarConfigTest(TestCase):
                 sys.argv = ["prog", flag, "0"]
                 with self.assertRaises(SystemExit):
                     self._setup()
+
+
+class MaxGenerateBatchSizeArgumentsTest(TestCase):
+    """--max_generate_batch_size: scheduler-side decode running-batch cap.
+
+    The arg is a tri-state override (None = not provided) stored on
+    PyEnvConfigs; EngineConfig.create derives max_generate_batch_size from
+    concurrency_limit first, then applies the explicit override.
+    """
+
+    def _create_engine_config(self, args):
+        from rtp_llm.config.engine_config import EngineConfig
+        from rtp_llm.server.server_args import server_args
+
+        with patch.dict(os.environ, {}, clear=True):
+            configs = server_args.setup_args(args)
+        return configs, EngineConfig.create(configs)
+
+    def test_unspecified_value_keeps_concurrency_limit_derivation(self):
+        configs, engine_config = self._create_engine_config(
+            ["--concurrency_limit", "16"]
+        )
+        self.assertIsNone(configs.max_generate_batch_size_override)
+        self.assertEqual(engine_config.runtime_config.max_generate_batch_size, 16)
+
+    def test_explicit_cli_value_overrides_derivation(self):
+        configs, engine_config = self._create_engine_config(
+            ["--concurrency_limit", "32", "--max_generate_batch_size", "8"]
+        )
+        self.assertEqual(configs.max_generate_batch_size_override, 8)
+        self.assertEqual(engine_config.runtime_config.max_generate_batch_size, 8)
+
+    def test_explicit_env_value_overrides_derivation(self):
+        from rtp_llm.server.server_args import server_args
+
+        with patch.dict(
+            os.environ,
+            {"CONCURRENCY_LIMIT": "32", "MAX_GENERATE_BATCH_SIZE": "8"},
+            clear=True,
+        ):
+            configs = server_args.setup_args([])
+
+        self.assertEqual(configs.max_generate_batch_size_override, 8)
+
+    def test_non_positive_value_is_rejected(self):
+        from rtp_llm.config.engine_config import EngineConfig
+        from rtp_llm.server.server_args import server_args
+
+        with patch.dict(os.environ, {}, clear=True):
+            configs = server_args.setup_args(["--max_generate_batch_size", "0"])
+
+        with self.assertRaises(ValueError):
+            EngineConfig.create(configs)
 
 
 class GenerateArgsFromEnvTest(TestCase):

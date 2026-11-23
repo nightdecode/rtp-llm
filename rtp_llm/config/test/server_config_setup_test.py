@@ -5,17 +5,32 @@ import re
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
 
 from rtp_llm.config.engine_config import EngineConfig, setup_pd_sep_config
-from rtp_llm.config.py_config_modules import PyEnvConfigs, ServerConfig
+from rtp_llm.config.model_config import ModelConfig
+from rtp_llm.config.py_config_modules import PyEnvConfigs
+from rtp_llm.config.py_config_modules import QuantizationConfig as PyQuantizationConfig
+from rtp_llm.config.py_config_modules import ServerConfig
+from rtp_llm.config.quant_config import (
+    CompressedW8A8Int8PerChannelQuantConfig,
+    Fp8BlockWiseQuantConfig,
+    init_quant_config,
+)
 from rtp_llm.config.server_config_setup import (
     configure_kv_cache_event_host_ip_port,
     set_parallelism_config,
     setup_and_configure_server,
 )
-from rtp_llm.ops import CPAllGatherImpl, CPRotateMethod, NcclCommConfig, RoleType
+from rtp_llm.ops import (
+    CPAllGatherImpl,
+    CPRotateMethod,
+    KvCacheDataType,
+    NcclCommConfig,
+    RoleType,
+)
 from rtp_llm.server.server_args.server_args import setup_args
 from rtp_llm.start_backend_server import start_backend_server
 
@@ -29,6 +44,173 @@ _PINNED_DEVICES = {
 
 def _jit_env(**values):
     return {**_PINNED_DEVICES, "MODEL_TYPE": "fake_model", **values}
+
+
+class _W8A8QuantAlgo:
+    def setQuantAlgo(self, *args):
+        self.args = args
+
+
+class _W8A8ModelConfig:
+    def __init__(self, quantization, model_type="qwen35_moe", chunk_rows=1024):
+        self.ckpt_path = "/checkpoint"
+        self.quantization = quantization
+        self.model_type = model_type
+        self.w8a8_quant_chunk_rows = chunk_rows
+        self.quant_algo = _W8A8QuantAlgo()
+        self.config_dtype = None
+        self.attn_config = SimpleNamespace(kv_cache_dtype=KvCacheDataType.BASE)
+        self.data_type = None
+        self.quant_config = None
+
+
+class W8A8OnlineQuantConfigTest(TestCase):
+    def test_online_preset_is_fresh_and_has_validated_chunk_rows(self):
+        first = init_quant_config("W8A8_INT8_PER_CHANNEL")
+        second = init_quant_config("W8A8_INT8_PER_CHANNEL")
+
+        self.assertIsInstance(first, CompressedW8A8Int8PerChannelQuantConfig)
+        self.assertFalse(first.is_quanted())
+        self.assertIsNot(first, second)
+        self.assertEqual(first.get_method(), "W8A8_INT8_PER_CHANNEL_COMPRESSED")
+        self.assertEqual(first.load_chunk_rows, 1024)
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            first.load_chunk_rows = 0
+
+    def test_explicit_online_w8a8_uses_configured_chunk_rows(self):
+        model_config = _W8A8ModelConfig("W8A8_INT8_PER_CHANNEL", chunk_rows=256)
+        with patch(
+            "rtp_llm.config.model_config.QuantizationConfig.load_from_ckpt",
+            return_value=None,
+        ):
+            ModelConfig.init_precision_config(
+                model_config, SimpleNamespace(fp8_kv_cache=False), "BF16"
+            )
+
+        self.assertIsInstance(
+            model_config.quant_config, CompressedW8A8Int8PerChannelQuantConfig
+        )
+        self.assertFalse(model_config.quant_config.is_quanted())
+        self.assertEqual(model_config.quant_config.load_chunk_rows, 256)
+
+    def test_explicit_online_w8a8_preserves_prequantized_checkpoint(self):
+        checkpoint_quant = CompressedW8A8Int8PerChannelQuantConfig(is_quanted=True)
+        model_config = _W8A8ModelConfig("W8A8_INT8_PER_CHANNEL", chunk_rows=128)
+        with patch(
+            "rtp_llm.config.model_config.QuantizationConfig.load_from_ckpt",
+            return_value=checkpoint_quant,
+        ):
+            ModelConfig.init_precision_config(
+                model_config, SimpleNamespace(fp8_kv_cache=False), "BF16"
+            )
+
+        self.assertIs(model_config.quant_config, checkpoint_quant)
+        self.assertTrue(model_config.quant_config.is_quanted())
+        self.assertEqual(model_config.quant_config.load_chunk_rows, 128)
+
+    def test_explicit_online_w8a8_rejects_other_checkpoint_quantization(self):
+        model_config = _W8A8ModelConfig("W8A8_INT8_PER_CHANNEL")
+        checkpoint_quant = Fp8BlockWiseQuantConfig(
+            bits=8, group_size=128, is_quanted=True
+        )
+
+        with patch(
+            "rtp_llm.config.model_config.QuantizationConfig.load_from_ckpt",
+            return_value=checkpoint_quant,
+        ), self.assertRaisesRegex(ValueError, "checkpoint quantization is"):
+            ModelConfig.init_precision_config(
+                model_config, SimpleNamespace(fp8_kv_cache=False), "BF16"
+            )
+
+    def test_online_w8a8_checks_resolved_model_identity(self):
+        model_config = _W8A8ModelConfig(
+            "W8A8_INT8_PER_CHANNEL", model_type="qwen_3_moe"
+        )
+
+        with patch(
+            "rtp_llm.config.model_config.QuantizationConfig.load_from_ckpt",
+            return_value=None,
+        ), self.assertRaisesRegex(ValueError, "qwen35_moe"):
+            ModelConfig.init_precision_config(
+                model_config, SimpleNamespace(fp8_kv_cache=False), "BF16"
+            )
+
+    def test_json_w8a8_request_passes_the_model_gate_for_qwen35_moe(self):
+        model_config = _W8A8ModelConfig(
+            '{"method": "W8A8_INT8_PER_CHANNEL_COMPRESSED", "is_quanted": false}'
+        )
+        with patch(
+            "rtp_llm.config.model_config.QuantizationConfig.load_from_ckpt",
+            return_value=None,
+        ):
+            ModelConfig.init_precision_config(
+                model_config, SimpleNamespace(fp8_kv_cache=False), "BF16"
+            )
+
+        self.assertIsInstance(
+            model_config.quant_config, CompressedW8A8Int8PerChannelQuantConfig
+        )
+        self.assertFalse(model_config.quant_config.is_quanted())
+
+    def test_json_w8a8_request_is_gated_to_qwen35_moe_models(self):
+        # init_quant_config constructs the same online W8A8 config from a
+        # JSON dict, so the JSON spelling must not bypass the model gate:
+        # a stacked-MoE layout (e.g. qwen3_vl_moe) would reach the load-time
+        # W8A8 quantizer with a permute merge it silently drops.
+        model_config = _W8A8ModelConfig(
+            '{"method": "W8A8_INT8_PER_CHANNEL_COMPRESSED", "is_quanted": false}',
+            model_type="qwen3_vl_moe",
+        )
+
+        with patch(
+            "rtp_llm.config.model_config.QuantizationConfig.load_from_ckpt",
+            return_value=None,
+        ), self.assertRaisesRegex(ValueError, "qwen35_moe"):
+            ModelConfig.init_precision_config(
+                model_config, SimpleNamespace(fp8_kv_cache=False), "BF16"
+            )
+
+    def test_json_w8a8_prequest_with_other_method_is_not_gated(self):
+        model_config = _W8A8ModelConfig(
+            '{"method": "FP8_PER_CHANNEL_COMPRESSED", "is_quanted": false}',
+            model_type="qwen3_vl_moe",
+        )
+        with patch(
+            "rtp_llm.config.model_config.QuantizationConfig.load_from_ckpt",
+            return_value=None,
+        ):
+            ModelConfig.init_precision_config(
+                model_config, SimpleNamespace(fp8_kv_cache=False), "BF16"
+            )
+        # Non-W8A8 JSON requests keep their normal request path; only the
+        # W8A8 method spellings are subject to the qwen35_moe gate.
+        self.assertIsNotNone(model_config.quant_config)
+
+    def test_legacy_int8_settings_conflict_with_explicit_online_w8a8(self):
+        config = PyQuantizationConfig()
+        config.quantization = "W8A8_INT8_PER_CHANNEL"
+        config.int8_mode = 1
+        with self.assertRaisesRegex(ValueError, "INT8_MODE=1"):
+            config.get_quantization()
+
+        config.int8_mode = 0
+        with patch.dict(os.environ, {"WEIGHT_TYPE": "INT8"}, clear=False):
+            with self.assertRaisesRegex(ValueError, "WEIGHT_TYPE=INT8"):
+                config.get_quantization()
+
+    def test_cli_and_environment_bind_chunk_rows_to_py_config(self):
+        with patch.dict(
+            os.environ,
+            _jit_env(W8A8_QUANT_CHUNK_ROWS="96"),
+            clear=True,
+        ):
+            self.assertEqual(setup_args().quantization_config.w8a8_quant_chunk_rows, 96)
+            self.assertEqual(
+                setup_args(
+                    ["--w8a8_quant_chunk_rows", "64"]
+                ).quantization_config.w8a8_quant_chunk_rows,
+                64,
+            )
 
 
 class ServerConfigPortLayoutTest(TestCase):
@@ -108,6 +290,40 @@ class KVCacheEventHostIdentityTest(TestCase):
         configure_kv_cache_event_host_ip_port(py_env_configs)
 
         self.assertEqual(py_env_configs.kv_cache_config.kv_cache_event_host_ip_port, "")
+
+    def test_remote_control_derives_identity_when_hbm_events_are_disabled(self):
+        configs = self._dp_publisher_configs()
+        configs.kv_cache_config.kv_cache_event_publisher_type = "none"
+        configs.kv_cache_config.enable_remote_cache = True
+        configure_kv_cache_event_host_ip_port(configs)
+        self.assertEqual(
+            configs.kv_cache_config.kv_cache_event_host_ip_port, "10.0.0.8:20027"
+        )
+
+    def test_remote_control_preserves_explicit_identity(self):
+        configs = self._dp_publisher_configs()
+        configs.kv_cache_config.kv_cache_event_publisher_type = "none"
+        configs.kv_cache_config.enable_remote_cache = True
+        configs.kv_cache_config.kv_cache_event_host_ip_port = "replica-1:19000"
+        configure_kv_cache_event_host_ip_port(configs)
+        self.assertEqual(
+            configs.kv_cache_config.kv_cache_event_host_ip_port, "replica-1:19000"
+        )
+
+    def test_disabled_remote_and_hbm_events_do_not_derive_identity(self):
+        configs = self._dp_publisher_configs()
+        configs.kv_cache_config.kv_cache_event_publisher_type = "none"
+        configs.kv_cache_config.enable_remote_cache = False
+        configure_kv_cache_event_host_ip_port(configs)
+        self.assertEqual(configs.kv_cache_config.kv_cache_event_host_ip_port, "")
+
+    def test_remote_control_does_not_derive_identity_on_nonzero_tp_rank(self):
+        configs = self._dp_publisher_configs()
+        configs.kv_cache_config.kv_cache_event_publisher_type = "none"
+        configs.kv_cache_config.enable_remote_cache = True
+        configs.parallelism_config.tp_rank = 1
+        configure_kv_cache_event_host_ip_port(configs)
+        self.assertEqual(configs.kv_cache_config.kv_cache_event_host_ip_port, "")
 
 
 class SingleGpuBackendRankTest(TestCase):
@@ -207,14 +423,17 @@ class GenerateConfigTest(TestCase):
             "DISK_CACHE_SIZE_MB": "4096",
             "DISK_CACHE_BUFFERED_IO": "0",
             "DISK_CACHE_SYNC_TIMEOUT_MS": "12345",
+            "DISK_CACHE_EVICT_TIMEOUT_MS": "45000",
             "DISK_CACHE_STAGING_BLOCK_COUNT": "8",
             "ENABLE_MEMORY_CACHE": "1",
             "MEMORY_CACHE_SIZE_MB": "2048",
             "MEMORY_CACHE_SYNC_TIMEOUT_MS": "6789",
-            "BLOCK_TREE_FULL_PREFIX_SCAN_INTERVAL_MS": "30000",
+            "BLOCK_TREE_FULL_PREFIX_SCAN_INTERVAL_MS": "5000",
+            "BLOCK_TREE_TASK_POOL_SIZE": "6",
             "BLOCK_TREE_TRANSFER_WORKER_COUNT": "7",
             "BLOCK_TREE_BUSINESS_QUEUE_MAX_SIZE": "211",
             "BLOCK_TREE_TRANSFER_QUEUE_MAX_SIZE": "307",
+            "DISK_CACHE_EVICT_MAX_PENDING_BYTES": "83886080",
             "BLOCK_TREE_DEVICE_EVICT_LOW_WATERMARK_RATIO": "0.71",
             "BLOCK_TREE_DEVICE_EVICT_HIGH_WATERMARK_RATIO": "0.81",
             "BLOCK_TREE_MEMORY_EVICT_LOW_WATERMARK_RATIO": "0.72",
@@ -233,14 +452,17 @@ class GenerateConfigTest(TestCase):
         self.assertEqual(config.disk_cache_size_mb, 4096)
         self.assertFalse(config.disk_cache_buffered_io)
         self.assertEqual(config.disk_cache_sync_timeout_ms, 12345)
+        self.assertEqual(config.disk_cache_evict_timeout_ms, 45000)
         self.assertEqual(config.disk_cache_staging_block_count, 8)
         self.assertTrue(config.enable_memory_cache)
         self.assertEqual(config.memory_cache_size_mb, 2048)
         self.assertEqual(config.memory_cache_sync_timeout_ms, 6789)
-        self.assertEqual(config.block_tree_full_prefix_scan_interval_ms, 30000)
+        self.assertEqual(config.block_tree_full_prefix_scan_interval_ms, 5000)
+        self.assertEqual(config.block_tree_task_pool_size, 6)
         self.assertEqual(config.block_tree_transfer_worker_count, 7)
         self.assertEqual(config.block_tree_business_queue_max_size, 211)
         self.assertEqual(config.block_tree_transfer_queue_max_size, 307)
+        self.assertEqual(config.disk_cache_evict_max_pending_bytes, 80 * 1024 * 1024)
         self.assertEqual(config.block_tree_device_evict_low_watermark_ratio, 0.71)
         self.assertEqual(config.block_tree_device_evict_high_watermark_ratio, 0.81)
         self.assertEqual(config.block_tree_memory_evict_low_watermark_ratio, 0.72)
@@ -252,14 +474,76 @@ class GenerateConfigTest(TestCase):
         config = PyEnvConfigs().kv_cache_config
 
         self.assertTrue(config.enable_crc)
+        self.assertEqual(config.block_tree_task_pool_size, 4)
+        self.assertEqual(config.block_tree_transfer_worker_count, 2)
         self.assertFalse(config.enable_memory_cache)
         self.assertEqual(config.disk_cache_staging_block_count, 128)
         self.assertEqual(config.device_eviction_policy, "lru")
         self.assertEqual(config.memory_eviction_policy, "lru")
-        self.assertEqual(config.disk_eviction_policy, "fifo")
+        self.assertEqual(config.disk_eviction_policy, "lru")
         self.assertEqual(config.reserve_block_ratio, 5)
-        self.assertEqual(config.block_tree_full_prefix_scan_interval_ms, 0)
+        self.assertEqual(config.block_tree_full_prefix_scan_interval_ms, 30000)
         self.assertFalse(hasattr(config, "write_cache_sync"))
+
+    def test_full_prefix_scan_interval_default_and_disable(self):
+        with patch.dict("os.environ", _jit_env(), clear=True):
+            self.assertEqual(
+                setup_args([]).kv_cache_config.block_tree_full_prefix_scan_interval_ms,
+                30000,
+            )
+            config = setup_args(
+                ["--block_tree_full_prefix_scan_interval_ms", "0"]
+            ).kv_cache_config
+            self.assertEqual(config.block_tree_full_prefix_scan_interval_ms, 0)
+        with patch.dict(
+            "os.environ",
+            _jit_env(BLOCK_TREE_FULL_PREFIX_SCAN_INTERVAL_MS="0"),
+            clear=True,
+        ):
+            self.assertEqual(
+                setup_args([]).kv_cache_config.block_tree_full_prefix_scan_interval_ms,
+                0,
+            )
+
+    def test_transfer_pool_defaults_and_worker_cli_overrides(self):
+        with patch.dict("os.environ", _jit_env(), clear=True):
+            config = setup_args([]).kv_cache_config
+            self.assertEqual(config.block_tree_task_pool_size, 4)
+            self.assertEqual(config.block_tree_transfer_worker_count, 2)
+            self.assertEqual(
+                config.disk_cache_evict_max_pending_bytes, 100 * 1024 * 1024
+            )
+        with patch.dict(
+            "os.environ",
+            _jit_env(
+                BLOCK_TREE_TASK_POOL_SIZE="6",
+                BLOCK_TREE_TRANSFER_WORKER_COUNT="7",
+            ),
+            clear=True,
+        ):
+            config = setup_args(
+                [
+                    "--block_tree_task_pool_size=8",
+                    "--block_tree_transfer_worker_count=2",
+                ]
+            ).kv_cache_config
+            self.assertEqual(config.block_tree_task_pool_size, 8)
+            self.assertEqual(config.block_tree_transfer_worker_count, 2)
+
+    @patch.dict(
+        "os.environ",
+        _jit_env(KV_CACHE_POOL_BLOCK_WEIGHTS='{"full":8,"linear":1}'),
+        clear=True,
+    )
+    def test_pool_block_weights_reach_python_runtime_config(self):
+        from_env = setup_args([]).kv_cache_config
+        self.assertEqual(from_env.kv_cache_pool_block_weights, '{"full":8,"linear":1}')
+        raw = '{"full": 3, "linear": 2}'
+        overridden = setup_args(["--kv_cache_pool_block_weights", raw]).kv_cache_config
+        self.assertEqual(overridden.kv_cache_pool_block_weights, raw)
+        disabled = setup_args(["--kv_cache_pool_block_weights", ""]).kv_cache_config
+        self.assertEqual(disabled.kv_cache_pool_block_weights, "")
+        self.assertEqual(PyEnvConfigs().kv_cache_config.kv_cache_pool_block_weights, "")
 
     def test_disabled_crc_survives_worker_pickle_and_engine_config(self):
         import pickle
@@ -424,9 +708,9 @@ class GenerateConfigTest(TestCase):
         config.reserve_block_ratio = 7
         config.dsv4_fixed_pool_blocks = 512
         config.dsv4_hca_state_pool_blocks = 256
-        config.dsv4_fixed_pool_use_memory = True
         config.memory_cache_max_descriptors_per_transfer_batch = 17
         config.block_tree_full_prefix_scan_interval_ms = 5000
+        config.block_tree_task_pool_size = 6
         config.block_tree_transfer_worker_count = 7
         config.block_tree_business_queue_max_size = 211
         config.block_tree_transfer_queue_max_size = 307
@@ -438,8 +722,8 @@ class GenerateConfigTest(TestCase):
         config.block_tree_disk_evict_high_watermark_ratio = 0.83
 
         state = config.__getstate__()
-        self.assertEqual(len(state), 73)
-        self.assertEqual(state[:2], ("KVCacheConfig", 10))
+        self.assertEqual(len(state), 82)
+        self.assertEqual(state[:2], ("KVCacheConfig", 26))
 
         restored = pickle.loads(pickle.dumps(config))
         self.assertEqual(restored.disk_cache_staging_block_count, 8)
@@ -451,9 +735,9 @@ class GenerateConfigTest(TestCase):
         self.assertEqual(restored.reserve_block_ratio, 7)
         self.assertEqual(restored.dsv4_fixed_pool_blocks, 512)
         self.assertEqual(restored.dsv4_hca_state_pool_blocks, 256)
-        self.assertTrue(restored.dsv4_fixed_pool_use_memory)
         self.assertEqual(restored.memory_cache_max_descriptors_per_transfer_batch, 17)
         self.assertEqual(restored.block_tree_full_prefix_scan_interval_ms, 5000)
+        self.assertEqual(restored.block_tree_task_pool_size, 6)
         self.assertEqual(restored.block_tree_transfer_worker_count, 7)
         self.assertEqual(restored.block_tree_business_queue_max_size, 211)
         self.assertEqual(restored.block_tree_transfer_queue_max_size, 307)
@@ -474,10 +758,17 @@ class GenerateConfigTest(TestCase):
             value.__setstate__(pickle_state)
             return value
 
-        # Historical workers did not opt into the shared allocator. Their
-        # events/eviction fields survive while the new policy remains disabled.
-        event_state = (*state[:-1], 0)
-        state = (state[0], 6, *state[2:64])
+        # Legacy payloads share the load deadline for eviction and omit later fields.
+        legacy_defaults = KVCacheConfig()
+        legacy_defaults.disk_cache_evict_timeout_ms = -1
+        legacy_defaults.shared_hybrid_cache = 0
+        # Legacy state carries none of the current tail fields.
+        event_state = (
+            *state[:63],
+            *legacy_defaults.__getstate__()[63:],
+        )
+        # Version 6 carried the retired host-placement flag at index 53.
+        state = (state[0], 6, *state[2:53], True, *state[53:63])
         self.assertEqual(restore(state).__getstate__(), event_state)
         version_five_state = (state[0], 5, *state[2:], True)
         self.assertEqual(restore(version_five_state).__getstate__(), event_state)
@@ -528,6 +819,10 @@ class GenerateConfigTest(TestCase):
             restored_write_sync,
         ):
             self.assertTrue(legacy_config.enable_crc)
+            self.assertEqual(
+                legacy_config.disk_cache_evict_max_pending_bytes,
+                default_config.disk_cache_evict_max_pending_bytes,
+            )
 
     def test_kv_cache_config_pickle_rejects_incompatible_states(self):
         from rtp_llm.ops import KVCacheConfig
@@ -552,9 +847,13 @@ class GenerateConfigTest(TestCase):
 
         expected_fields = {
             "enable_crc": "bool",
+            "kv_cache_pool_block_weights": "str",
+            "enable_linear_cache_reclaim": "bool",
+            "block_tree_task_pool_size": "int",
             "block_tree_transfer_worker_count": "int",
             "block_tree_business_queue_max_size": "int",
             "block_tree_transfer_queue_max_size": "int",
+            "block_tree_frozen_force_release_timeout_ms": "int",
             "block_tree_device_evict_low_watermark_ratio": "float",
             "block_tree_device_evict_high_watermark_ratio": "float",
             "block_tree_memory_evict_low_watermark_ratio": "float",

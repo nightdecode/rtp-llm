@@ -127,17 +127,22 @@ std::string KVCacheConfig::to_string() const {
         << "multi_task_prompt_tokens: " << (multi_task_prompt_tokens.empty() ? "empty" : "non-empty") << "\n"
         << "reserve_block_ratio: " << reserve_block_ratio << "\n"
         << "memory_cache_size_mb: " << memory_cache_size_mb << "\n"
+        << "memory_cache_swa_block_ratio: " << memory_cache_swa_block_ratio << "\n"
         << "memory_cache_sync_timeout_ms: " << memory_cache_sync_timeout_ms << "\n"
         << "disk_cache_paths: " << disk_cache_paths << "\n"
         << "disk_cache_size_mb: " << disk_cache_size_mb << "\n"
         << "disk_cache_buffered_io: " << disk_cache_buffered_io << "\n"
         << "disk_cache_sync_timeout_ms: " << disk_cache_sync_timeout_ms << "\n"
+        << "disk_cache_evict_timeout_ms: " << disk_cache_evict_timeout_ms << "\n"
+        << "disk_cache_evict_max_pending_bytes: " << disk_cache_evict_max_pending_bytes << "\n"
         << "disk_cache_staging_block_count: " << disk_cache_staging_block_count << "\n"
         << "memory_cache_max_descriptors_per_transfer_batch: " << memory_cache_max_descriptors_per_transfer_batch
         << "\n"
+        << "block_tree_task_pool_size: " << block_tree_task_pool_size << "\n"
         << "block_tree_transfer_worker_count: " << block_tree_transfer_worker_count << "\n"
         << "block_tree_business_queue_max_size: " << block_tree_business_queue_max_size << "\n"
         << "block_tree_transfer_queue_max_size: " << block_tree_transfer_queue_max_size << "\n"
+        << "block_tree_frozen_force_release_timeout_ms: " << block_tree_frozen_force_release_timeout_ms << "\n"
         << "block_tree_device_evict_low_watermark_ratio: " << block_tree_device_evict_low_watermark_ratio << "\n"
         << "block_tree_device_evict_high_watermark_ratio: " << block_tree_device_evict_high_watermark_ratio << "\n"
         << "block_tree_memory_evict_low_watermark_ratio: " << block_tree_memory_evict_low_watermark_ratio << "\n"
@@ -147,6 +152,8 @@ std::string KVCacheConfig::to_string() const {
         << "reuse_cache_tail_blocks: " << reuse_cache_tail_blocks << "\n"
         << "linear_pool_blocks: " << linear_pool_blocks << "\n"
         << "swa_pool_blocks: " << swa_pool_blocks << "\n"
+        << "enable_linear_cache_reclaim: " << enable_linear_cache_reclaim << "\n"
+        << "kv_cache_pool_block_weights: " << kv_cache_pool_block_weights << "\n"
         << "fp8_kv_cache: " << fp8_kv_cache << "\n"
         << "ssm_state_dtype: " << ssm_state_dtype << "\n"
         << "kv_cache_mem_mb: " << kv_cache_mem_mb << "\n"
@@ -163,13 +170,16 @@ std::string KVCacheConfig::to_string() const {
         << "memory_eviction_policy: " << memory_eviction_policy << "\n"
         << "disk_eviction_policy: " << disk_eviction_policy << "\n"
         << "dsv4_fixed_pool_blocks: " << dsv4_fixed_pool_blocks << "\n"
+        << "dsv41_decoder_swa_pool_blocks: " << dsv41_decoder_swa_pool_blocks << "\n"
         << "dsv4_hca_state_pool_blocks: " << dsv4_hca_state_pool_blocks << "\n"
-        << "dsv4_fixed_pool_use_memory: " << dsv4_fixed_pool_use_memory << "\n"
         << "kv_cache_event_publisher_type: " << kv_cache_event_publisher_type << "\n"
         << "kv_cache_event_manager_endpoint: " << kv_cache_event_manager_endpoint << "\n"
         << "kv_cache_event_instance_group: " << kv_cache_event_instance_group << "\n"
         << "kv_cache_event_instance_id: " << kv_cache_event_instance_id << "\n"
         << "kv_cache_event_host_ip_port: " << kv_cache_event_host_ip_port << "\n"
+        << "kv_cache_event_snapshot_interval_ms: " << kv_cache_event_snapshot_interval_ms << "\n"
+        << "kvcm_asyncwrapper_thread_num: " << kvcm_asyncwrapper_thread_num << "\n"
+        << "kvcm_asyncwrapper_queue_size: " << kvcm_asyncwrapper_queue_size << "\n"
         << "block_tree_full_prefix_scan_interval_ms: " << block_tree_full_prefix_scan_interval_ms << "\n";
     return oss.str();
 }
@@ -205,7 +215,8 @@ std::string LinearAttentionConfig::to_string() const {
         << "linear_num_value_heads: " << linear_num_value_heads << "\n"
         << "linear_value_head_dim: " << linear_value_head_dim << "\n"
         << "ssm_state_dtype: " << getDataTypeStr(ssm_state_dtype) << "\n"
-        << "conv_state_dtype: " << getDataTypeStr(conv_state_dtype);
+        << "conv_state_dtype: " << getDataTypeStr(conv_state_dtype) << "\n"
+        << "supports_history_state_reclaim: " << supports_history_state_reclaim;
     return oss.str();
 }
 // HybridAttentionConfig
@@ -262,8 +273,10 @@ size_t SpeculativeExecutionConfig::speculativeReserveStep() const {
     const int64_t gamma = gen_num_per_cycle;
     const int64_t limit = std::numeric_limits<int>::max();
     RTP_LLM_CHECK_WITH_INFO(gamma >= 0, "speculative gen_num_per_cycle must be non-negative: %ld", gamma);
-    if (type == SP_TYPE_DSPARK) {
-        RTP_LLM_CHECK_WITH_INFO(gamma <= limit / 3, "DSpARK gen_num_per_cycle is too large: %ld", gamma);
+    // Block-draft models (DSpARK/DFlash) can expose one extra accepted window
+    // before host bookkeeping catches up, then seed the next gamma-wide block.
+    if (isBlockDraftType(type)) {
+        RTP_LLM_CHECK_WITH_INFO(gamma <= limit / 3, "block draft gen_num_per_cycle is too large: %ld", gamma);
         return static_cast<size_t>(3 * gamma);
     }
     RTP_LLM_CHECK_WITH_INFO(gamma < limit, "gen_num_per_cycle is too large: %ld", gamma);
@@ -285,6 +298,8 @@ SpeculativeType SpeculativeExecutionConfig::from_string(const std::string& str) 
         return SP_TYPE_DETERMINISTIC;
     } else if (str == "dspark") {
         return SP_TYPE_DSPARK;
+    } else if (str == "dflash") {
+        return SP_TYPE_DFLASH;
     } else {
         return SP_TYPE_NONE;  // Default to NONE for unknown values
     }
@@ -306,6 +321,8 @@ std::string SpeculativeExecutionConfig::to_string(SpeculativeType type) {
             return "deterministic";
         case SP_TYPE_DSPARK:
             return "dspark";
+        case SP_TYPE_DFLASH:
+            return "dflash";
         default:
             return "none";
     }
@@ -402,7 +419,9 @@ std::string FIFOSchedulerConfig::to_string() const {
         << "max_batch_tokens_size: " << max_batch_tokens_size << "\n"
         << "pdfusion_scheduler_mode: " << pdfusion_scheduler_mode << "\n"
         << "decode_prefill_ratio: " << decode_prefill_ratio << "\n"
+        << "max_batch_kv_len: " << max_batch_kv_len << "\n"
         << "cp_force_single_prefill: " << cp_force_single_prefill << "\n"
+        << "force_single_prefill: " << force_single_prefill << "\n"
         << "max_inited_kv_cache_streams: " << max_inited_kv_cache_streams << "\n"
         << "async_cache_prepare: " << async_cache_prepare << "\n"
         << "max_batch_tokens_without_cache: " << max_batch_tokens_without_cache << "\n"
@@ -589,6 +608,7 @@ std::string PDSepConfig::to_string() const {
         << "max_rpc_timeout_ms: " << max_rpc_timeout_ms << "\n"
         << "worker_port_offset: " << worker_port_offset << "\n"
         << "decode_entrance: " << decode_entrance << "\n"
+        << "decode_linear_tail_only: " << decode_linear_tail_only << "\n"
         << "prefill_prepare_resource_pool_size: " << prefill_prepare_resource_pool_size << "\n"
         << "prefill_stop_stream_wait_timeout_ms: " << prefill_stop_stream_wait_timeout_ms;
     return oss.str();

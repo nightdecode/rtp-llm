@@ -125,8 +125,8 @@ protected:
     absl::Status        rendezvousSpeculativeTargetSamplingStatus(const absl::Status& local_status);
     absl::Status
     prepareAndCommitSpeculativeTargetState(torch::Tensor& accept_len, size_t batch_size, bool is_fake_stream = false);
-    void                rollbackSpeculativeTargetStateOrFailStop(const char* phase);
-    void                rollbackSpeculativeTargetStateBestEffort(const char* phase) noexcept;
+    void rollbackSpeculativeTargetStateOrFailStop(const char* phase);
+    void rollbackSpeculativeTargetStateBestEffort(const char* phase) noexcept;
 
     void maybePrintModelInput(const GptModelInputs& model_input, const std::string& prefix) const;
     void beginProfiledWork();
@@ -297,7 +297,8 @@ private:
     size_t   propose_step_;
     // Fixed-width block diffusion: one draft forward emits gamma proposals;
     // unlike MTP there is no autoregressive draft loop or hidden-state chain.
-    bool    is_dspark_                           = false;
+    bool    is_block_draft_                      = false;
+    bool    is_dflash_                           = false;
     bool    mtp_indexer_share_enabled_           = false;
     bool    mtp_indexer_prefill_seed_enabled_    = false;
     bool    mtp_indexer_graph_choice_world_sync_ = false;

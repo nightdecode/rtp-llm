@@ -741,11 +741,12 @@ class KVCacheConfig:
     disk_eviction_policy: str
     dsv4_fixed_pool_blocks: int
     dsv4_hca_state_pool_blocks: int
-    dsv4_fixed_pool_use_memory: bool
     block_tree_full_prefix_scan_interval_ms: int
+    block_tree_task_pool_size: int
     block_tree_transfer_worker_count: int
     block_tree_business_queue_max_size: int
     block_tree_transfer_queue_max_size: int
+    block_tree_frozen_force_release_timeout_ms: int
     block_tree_device_evict_low_watermark_ratio: float
     block_tree_device_evict_high_watermark_ratio: float
     block_tree_memory_evict_low_watermark_ratio: float
@@ -757,12 +758,19 @@ class KVCacheConfig:
     reuse_cache_tail_blocks: int
     linear_pool_blocks: int
     swa_pool_blocks: int
+    enable_linear_cache_reclaim: bool
+    kv_cache_pool_block_weights: str
+    max_block_size_per_item: int
     memory_cache_size_mb: int
+    memory_cache_swa_block_ratio: float
+    dsv41_decoder_swa_pool_blocks: int
     memory_cache_sync_timeout_ms: int
     disk_cache_paths: str
     disk_cache_size_mb: int
     disk_cache_buffered_io: bool
     disk_cache_sync_timeout_ms: int
+    disk_cache_evict_timeout_ms: int
+    disk_cache_evict_max_pending_bytes: int
     disk_cache_staging_block_count: int
     memory_cache_max_descriptors_per_transfer_batch: int
     multi_task_prompt: str
@@ -787,6 +795,7 @@ class KVCacheConfig:
     kvcm_server_address: str
     kvcm_storage_queue_size: int
     kvcm_storage_thread_num: int
+    kvcm_task_timeout_ms: int
     kvcm_vipserver_domain: str
     # Legacy aliases of the canonical KVCM members.
     reco_asyncwrapper_queue_size: int
@@ -818,6 +827,7 @@ class KVCacheConfig:
     kv_cache_event_instance_group: str
     kv_cache_event_instance_id: str
     kv_cache_event_host_ip_port: str
+    kv_cache_event_snapshot_interval_ms: int
     ssm_state_dtype: str
     test_block_num: int
     def __getstate__(self) -> tuple:
@@ -915,8 +925,9 @@ class LinearAttentionConfig:
     linear_value_head_dim: int
     ssm_state_dtype: DataType
     conv_state_dtype: DataType
+    supports_history_state_reclaim: bool
 
-    def __init__(self, linear_conv_kernel_dim: int = 0, linear_key_head_dim: int = 0, linear_num_key_heads: int = 0, linear_num_value_heads: int = 0, linear_value_head_dim: int = 0, ssm_state_dtype: DataType = DataType.TYPE_BF16, conv_state_dtype: DataType = DataType.TYPE_BF16) -> None:
+    def __init__(self, linear_conv_kernel_dim: int = 0, linear_key_head_dim: int = 0, linear_num_key_heads: int = 0, linear_num_value_heads: int = 0, linear_value_head_dim: int = 0, ssm_state_dtype: DataType = DataType.TYPE_BF16, conv_state_dtype: DataType = DataType.TYPE_BF16, supports_history_state_reclaim: bool = False) -> None:
         ...
     def to_string(self) -> str:
         ...
@@ -1265,6 +1276,7 @@ class PDSepConfig:
     cache_store_rdma_listen_port: int
     cache_store_rdma_mode: bool
     decode_entrance: bool
+    decode_linear_tail_only: bool
     decode_polling_kv_cache_step_ms: int
     decode_retry_interval_ms: int
     load_cache_timeout_ms: int

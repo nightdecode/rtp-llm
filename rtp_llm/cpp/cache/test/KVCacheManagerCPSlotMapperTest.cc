@@ -60,7 +60,7 @@ TEST_F(KVCacheManagerCPSlotMapperTest, DecodeTpReplicatesFullPagesWhilePrefillCp
     model.attn_config.kernel_tokens_per_block = 128;
     model.attn_config.sliding_window          = 128;
     KVCacheSpecDesc full;
-    full.tag               = "global_kv_2";
+    full.tag               = "csa_kv";
     full.cache_type        = KVCacheSpecType::OpaqueKV;
     full.entry_dtype       = DataType::TYPE_UINT8;
     full.entry_elems       = 288;
@@ -181,6 +181,25 @@ TEST_F(KVCacheManagerCPSlotMapperTest, CPShardingEnabled_ReturnsValidMapper) {
     }
 }
 
+TEST_F(KVCacheManagerCPSlotMapperTest, PrefillCPShardingEnabled_ReturnsValidMapper) {
+    auto config = makeTestConfig(/*block_num=*/20, /*seq_size_per_block=*/4);
+
+    ParallelismConfig par;
+    par.role_type                          = RoleType::PREFILL;
+    par.prefill_cp_config.method           = CPRotateMethod::PREFILL_CP;
+    par.prefill_cp_config.kv_cache_sharded = true;
+    par.prefill_cp_config.prefill_cp_size  = 2;
+    par.tp_rank                            = 1;
+    par.tp_size                            = 2;
+
+    auto mgr = std::make_shared<KVCacheManager>(config, /*warmup=*/true, nullptr, KVCacheConfig{}, par);
+    ASSERT_TRUE(mgr->init());
+    const auto mapper = mgr->cpSlotMapper();
+    ASSERT_NE(mapper, nullptr);
+    EXPECT_EQ(mapper->cpRank(), 1);
+    EXPECT_EQ(mapper->cpSize(), 2);
+}
+
 TEST_F(KVCacheManagerCPSlotMapperTest, CPShardingEnabled_CacheInfoReportsVirtualBlockSize) {
     const int seq_size_per_block = 4;
     auto      config             = makeTestConfig(/*block_num=*/20, seq_size_per_block);
@@ -230,6 +249,58 @@ TEST_F(KVCacheManagerCPSlotMapperTest, CPShardedMallocAllowsPartialTailWithoutCa
     ASSERT_TRUE(result.success);
     EXPECT_EQ(resource->blocksNum(0, "default"), 1);
     EXPECT_EQ(resource->cacheKeys(0).size(), 0);
+}
+
+TEST_F(KVCacheManagerCPSlotMapperTest, WeightedPoolAdmissionCountsCpBeamTailCopiesFromLogicalSequenceLength) {
+    constexpr int block_size = 4;
+    for (const int rank : {0, 1}) {
+        for (const int seq_len : {5, 8}) {
+            SCOPED_TRACE(::testing::Message() << "rank=" << rank << " seq_len=" << seq_len);
+            auto config               = makeTestConfig(/*block_num=*/20, block_size);
+            config.pool_block_weights = {{"default", 2}};
+            config.finalizeBlockNums(20, RuntimeConfig{});
+            ParallelismConfig par;
+            par.role_type                          = RoleType::PREFILL;
+            par.tp_size                            = 2;
+            par.tp_rank                            = rank;
+            par.prefill_cp_config.method           = CPRotateMethod::ALL_GATHER;
+            par.prefill_cp_config.kv_cache_sharded = true;
+            auto manager = std::make_shared<KVCacheManager>(config, /*warmup=*/true, nullptr, KVCacheConfig{}, par);
+            ASSERT_TRUE(manager->init());
+            ASSERT_NE(manager->cpSlotMapper(), nullptr);
+            auto       resource = makeResource(1, config);
+            auto       tokens   = makeTokenIds(1, seq_len, block_size);
+            MallocInfo allocation{resource, tokens};
+            allocation.reuse_cache         = false;
+            allocation.enable_cache_lookup = false;
+            ASSERT_TRUE(manager->malloc(allocation).success);
+            ASSERT_EQ(resource->blocksNum(0, "default"), 1u);
+            ASSERT_EQ(manager->cpSlotMapper()->effectiveSeqLenForAlloc(seq_len), block_size);
+
+            // CP allocation rounds the local token count to a whole block,
+            // but beam forking uses the original logical tail alignment.
+            const int  predicted       = manager->estimatePeakNeedBlocks(resource,
+                                                                  seq_len,
+                                                                  seq_len,
+                                                                  /*remaining_tokens=*/0,
+                                                                  /*reserve_step=*/0,
+                                                                  /*enable_reuse_cache=*/false,
+                                                                  /*target_batch_size=*/2,
+                                                                  LinearCachePolicy::KEEP_HISTORY,
+                                                                  "default");
+            const bool copy_last_block = seq_len % block_size != 0;
+            EXPECT_EQ(predicted, copy_last_block ? 1 : 0);
+            const auto                     available_before = manager->poolCapacities().front().available_blocks;
+            std::vector<TaggedBlockIdPair> copies;
+            ASSERT_TRUE(manager->updateKVBlock(resource, {0, 0}, copy_last_block, copies));
+            const auto available_after = manager->poolCapacities().front().available_blocks;
+            EXPECT_EQ(available_before - available_after, copy_last_block ? 1u : 0u);
+            EXPECT_EQ(predicted, static_cast<int>(available_before - available_after));
+            EXPECT_EQ(copies.size(), copy_last_block ? 1u : 0u);
+            manager->free(FreeInfo{resource, tokens});
+            EXPECT_EQ(manager->poolCapacities().front().available_blocks, config.group("default").block_num - 1);
+        }
+    }
 }
 
 // malloc() should use the manager-level cpSlotMapper.
