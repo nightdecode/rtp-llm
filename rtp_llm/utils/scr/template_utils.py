@@ -221,7 +221,6 @@ def _engine_kv_cache_tensors(engine: Any) -> tuple[Any, ...]:
 class ScrRegistration:
     """Diagnostic result retained by the caller after registration."""
 
-    epsilon: Any
     tensors: tuple[Any, ...]
     cache_result: int | None
     hook_result: int | None
@@ -283,6 +282,8 @@ def build_scr_participant_manifest(
 _registration_lock = threading.Lock()
 _registrations: dict[int, ScrRegistration] = {}
 _registration_locks: dict[int, threading.Lock] = {}
+# Pin engine objects so id(engine) cannot be reused while a registration
+# record still refers to it.
 _registration_engines: dict[int, Any] = {}
 _before_checkpoint_hooks: set[int] = set()
 _scr_prepare_local = threading.local()
@@ -357,19 +358,23 @@ def _prepare_cuda_for_arrival(device: Any | None = None) -> None:
     torch.cuda.empty_cache()
 
 
-def _cuda_synchronize() -> None:
-    """Best-effort callback retained for Epsilon compatibility.
+def _make_cuda_synchronize(device: Any | None) -> Callable[[], None]:
+    """Build the before-checkpoint callback for the captured rank device."""
 
-    The arrival path performs a result-bearing synchronization immediately
-    before calling Epsilon.  This callback is still installed for providers
-    that invoke it on their own thread, but an exception is logged here because
-    the legacy callback API has no failure channel.
-    """
+    def callback() -> None:
+        # External SCR invokes this callback synchronously from
+        # snapstart_checkpoint. Avoid doing the same CUDA synchronization twice
+        # after the arrival path's result-bearing prepare step; a provider
+        # callback running on another thread still synchronizes.
+        if getattr(_scr_prepare_local, "skip_next", False):
+            _scr_prepare_local.skip_next = False
+            return
+        try:
+            _synchronize_cuda(device)
+        except Exception:
+            LOGGER.exception("sCR CUDA synchronize callback failed")
 
-    try:
-        _synchronize_cuda()
-    except Exception:
-        LOGGER.exception("default sCR CUDA synchronize callback failed")
+    return callback
 
 
 def _capture_cuda_device() -> Any | None:
@@ -393,33 +398,6 @@ def _capture_cuda_device() -> Any | None:
     except Exception:
         LOGGER.exception("unable to capture CUDA device for sCR callback")
     return None
-
-
-def _make_cuda_synchronize(device: Any | None) -> Callable[[], None]:
-    """Build a callback that synchronizes the captured rank device."""
-
-    if device is None:
-        callback = _cuda_synchronize
-    else:
-
-        def callback() -> None:
-            try:
-                _synchronize_cuda(device)
-            except Exception:
-                LOGGER.exception("captured sCR CUDA synchronize callback failed")
-
-    def _supplementary_callback() -> None:
-        # External SCR currently invokes this callback synchronously from
-        # snapstart_checkpoint.  Avoid doing the same CUDA synchronization
-        # twice after the arrival path's result-bearing prepare step.  A
-        # provider callback running on another thread simply performs the
-        # supplementary synchronization.
-        if getattr(_scr_prepare_local, "skip_next", False):
-            _scr_prepare_local.skip_next = False
-            return
-        callback()
-
-    return _supplementary_callback
 
 
 def register_for_scr(
@@ -527,7 +505,6 @@ def _register_for_scr_once(
         ok = False
 
     registration = ScrRegistration(
-        epsilon=epsilon,
         tensors=tensors,
         cache_result=cache_result,
         hook_result=hook_result,

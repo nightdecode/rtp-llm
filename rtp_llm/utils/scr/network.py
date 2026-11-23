@@ -23,6 +23,7 @@ import time
 from pathlib import Path
 
 from rtp_llm.utils.gang_info import GangInfoReader, get_gang_member
+from rtp_llm.utils.scr.lifecycle import template_phase_active
 
 VIP_INTERFACE = "scr_vxlan0"
 NETWORK_READY_SOCKET = Path("/scr-share/snm/daemon.sock")
@@ -38,8 +39,6 @@ class ScrNetworkConfigurationError(RuntimeError):
 
 
 def enabled(pc) -> bool:
-    from rtp_llm.utils.scr.lifecycle import template_phase_active
-
     return template_phase_active() and pc.world_size > pc.local_world_size
 
 
@@ -215,8 +214,6 @@ def validate_world_info(current, pc, gang_info: GangInfoReader):
 def local_comm_enabled(
     world_size: int, local_world_size: int, num_nodes: int = 1
 ) -> bool:
-    from rtp_llm.utils.scr.lifecycle import template_phase_active
-
     return (
         template_phase_active()
         and world_size > 0
