@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import pickle
+from dataclasses import replace
 from typing import Optional
 
 from typing_extensions import override
@@ -62,7 +64,41 @@ class EmbeddingCppEngine(BaseEngine):
             )
         self.cpp_engine.init(
             self.model,
-            self.engine_config,
+            self._graph_gated_engine_config(),
             self.model.vit_config,
             self.mm_process_engine,
         )
+
+    def _graph_gated_engine_config(self) -> EngineConfig:
+        """Gate the cache-less embedding prefill CUDA graph on model support.
+
+        The embedding prefill CUDA graph is opt-in per model family: only
+        wrappers declaring ``support_embedding_prefill_graph`` may capture.
+        Everything else keeps the eager path even when the server was started
+        with ``--enable_cuda_graph`` (for example qwen2-gte, whose flashinfer
+        paged-prefill attention cannot even instantiate at capture-warmup
+        bucket shapes). The multimodal engine and any other consumer keep the
+        original config; only the config handed to the embedding engine is a
+        copy with graphs disabled.
+        """
+        hw_kernel_config = self.engine_config.hw_kernel_config
+        if not hw_kernel_config.enable_cuda_graph:
+            return self.engine_config
+        if _declares_embedding_prefill_graph(self.model):
+            return self.engine_config
+        logging.warning(
+            "model %s does not declare support_embedding_prefill_graph; "
+            "embedding prefill CUDA graph disabled, using eager path",
+            type(self.model).__name__,
+        )
+        gated = replace(self.engine_config)
+        gated.hw_kernel_config = pickle.loads(pickle.dumps(hw_kernel_config))
+        gated.hw_kernel_config.enable_cuda_graph = False
+        return gated
+
+
+def _declares_embedding_prefill_graph(model) -> bool:
+    flag = getattr(model, "support_embedding_prefill_graph", None)
+    if flag is None:
+        return False
+    return bool(flag() if callable(flag) else flag)
