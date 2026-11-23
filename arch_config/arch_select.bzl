@@ -134,8 +134,6 @@ def subscribe_deps():
         }),
     )
 
-_CUDA13_X86_FLASH_MLA = "flash-mla==1.0.0+49e2000.cu132"
-
 def whl_deps():
     return select({
         "@rtp_llm//:using_ppu": [
@@ -275,9 +273,9 @@ def whl_deps():
     }) + select({
         "@rtp_llm//:using_glm53_cuda13_x86": [
             "deep-gemm @ {}#sha256={}".format(DEEP_GEMM_WHEEL.url, DEEP_GEMM_WHEEL.sha256),
-            FLASH_MLA_REQUIREMENT or _CUDA13_X86_FLASH_MLA,
+            FLASH_MLA_REQUIREMENT or "flash-mla==1.0.0+49e2000.cu132",
         ] + LINEAR_ATTENTION_REQUIREMENTS,
-        "@rtp_llm//:using_cuda13_x86": ["deep-gemm==2.8.0+6d6aaad.cu132", _CUDA13_X86_FLASH_MLA],
+        "@rtp_llm//:using_cuda13_x86": ["deep-gemm==2.8.0+122e18b.cu132", "flash-mla==1.0.0+9241ae3"],
         "//conditions:default": [],
     })
 
