@@ -1,5 +1,7 @@
 #include "rtp_llm/cpp/cache/connector/p2p/P2PWorkerDecodeRead.h"
 
+#include <unordered_set>
+
 #include "rtp_llm/cpp/cache/connector/p2p/P2PConnectorMetrics.h"
 #include "rtp_llm/cpp/cache/connector/p2p/P2PKeyUtil.h"
 #include "rtp_llm/cpp/cache/connector/p2p/LayerCacheBufferUtil.h"
@@ -412,6 +414,22 @@ ErrorInfo P2PWorkerDecodeRead::read(int64_t                   request_id,
         return ErrorInfo(recv_result.error_code, recv_result.error_msg);
     }
 
+    if (layer_block_converter_->tracksWriteGenerations()) {
+        // Every local receiver, including TP replicas, has its own pinned arena.
+        // Publish the logical generation only after all layer copies are complete.
+        std::unordered_set<int32_t> blocks;
+        for (const auto& route : worker_plan.routes) {
+            if (route.cache_tag != "default") {
+                continue;
+            }
+            for (const auto& layer : route.layer_buffers) {
+                for (const auto& entry : layer->blockIdMap()) {
+                    blocks.insert(entry.second);
+                }
+            }
+        }
+        layer_block_converter_->notifyCacheBlocksWritten(std::vector<int32_t>(blocks.begin(), blocks.end()));
+    }
     RTP_LLM_LOG_DEBUG("read end, request_id: %ld, unique_key: %s, success: true", request_id, unique_key.c_str());
     return ErrorInfo::OkStatus();
 }

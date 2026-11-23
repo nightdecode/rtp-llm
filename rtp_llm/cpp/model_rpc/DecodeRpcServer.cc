@@ -1190,6 +1190,8 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCache(const LoadKVCacheCon
     }
     RegisteredCacheStagingPool    staging_pool(resource_.cache_store->getMemoryUtil());
     std::vector<PendingCacheCopy> pending_cache_copies;
+    const bool                       track_generations = cache_manager->cacheConfig().mla_host_cache.pinnedDecode();
+    std::unordered_set<BlockIdxType> overwritten_mla_blocks;
     std::unordered_map<void*, std::shared_ptr<RegisteredCacheStaging>> staging_owners;
     auto requireTypedTp = [](bool valid, const std::string& message) {
         if (!valid) {
@@ -1446,6 +1448,9 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCache(const LoadKVCacheCon
                             addBufBlock("v_scale_" + cache_key, parts[3]);
                         }
                     }
+                    if (track_generations && tag == "default") {
+                        overwritten_mla_blocks.insert(block_id);
+                    }
                     markCacheKeyRange(
                         transferred_cache_key_counts, cache_key_index, block_pos, cache_keys_per_physical_block);
                 }
@@ -1592,6 +1597,9 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCache(const LoadKVCacheCon
                                         addBufBlock("v_scale_" + cache_key, parts[3]);
                                     }
                                 }
+                                if (track_generations && tag == "default") {
+                                    overwritten_mla_blocks.insert(block_id);
+                                }
                                 markCacheKeyRange(transferred_cache_key_counts,
                                                   cache_key_index,
                                                   block_pos,
@@ -1730,6 +1738,10 @@ DecodeRpcServer::LoadCacheResult DecodeRpcServer::loadCache(const LoadKVCacheCon
     }
 
     reassembleCacheTransfers(pending_cache_copies, maga_init_params_.parallelism_config.local_rank);
+    if (track_generations) {
+        cache_manager->notifyCacheBlocksWritten(
+            BlockIdList(overwritten_mla_blocks.begin(), overwritten_mla_blocks.end()));
+    }
 
     const size_t already_reused_blocks = static_cast<size_t>(std::max<int64_t>(load_context.reuse_block_size, 0));
     /** Later PP stages may have only tail-cache layers and need no data for early keys.
