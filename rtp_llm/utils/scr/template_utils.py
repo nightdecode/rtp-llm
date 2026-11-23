@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 from typing import Mapping as TypingMapping
 
@@ -178,6 +178,14 @@ def _epsilon_is_active(epsilon: Any) -> bool:
         return False
 
 
+def _resolve_epsilon() -> Any | None:
+    """Load the provider and require it to be active for the current phase."""
+    epsilon = _load_epsilon()
+    if epsilon is None or not _epsilon_is_active(epsilon):
+        return None
+    return epsilon
+
+
 def _is_tensor(value: Any) -> bool:
     # Import torch lazily so the feature gate remains cheap and does not touch
     # CUDA merely because this utility module was imported.
@@ -277,13 +285,22 @@ def build_scr_participant_manifest(
     return manifest
 
 
+@dataclass
+class _EngineRegistration:
+    """One engine's SCR registration state.
+
+    ``engine`` pins the object so ``id(engine)`` cannot be reused while a
+    record still refers to it.
+    """
+
+    engine: Any
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    record: ScrRegistration | None = None
+    before_checkpoint_hook: bool = False
+
+
 _registration_lock = threading.Lock()
-_registrations: dict[int, ScrRegistration] = {}
-_registration_locks: dict[int, threading.Lock] = {}
-# Pin engine objects so id(engine) cannot be reused while a registration
-# record still refers to it.
-_registration_engines: dict[int, Any] = {}
-_before_checkpoint_hooks: set[int] = set()
+_engine_registrations: dict[int, _EngineRegistration] = {}
 _scr_prepare_local = threading.local()
 
 
@@ -339,7 +356,8 @@ def _prepare_cuda_for_arrival(device: Any | None = None) -> None:
 
     with _registration_lock:
         gpu_state_registered = any(
-            bool(record.tensors) for record in _registrations.values()
+            entry.record is not None and bool(entry.record.tensors)
+            for entry in _engine_registrations.values()
         )
     torch = sys.modules.get("torch")
     cuda_initialized = bool(
@@ -409,17 +427,19 @@ def register_for_scr(
         return False
     engine_key = id(engine)
     with _registration_lock:
-        _registration_engines[engine_key] = engine
-        registration_lock = _registration_locks.setdefault(engine_key, threading.Lock())
-    with registration_lock:
+        entry = _engine_registrations.get(engine_key)
+        if entry is None:
+            entry = _EngineRegistration(engine=engine)
+            _engine_registrations[engine_key] = entry
+    with entry.lock:
         return _register_for_scr_once(
-            engine,
+            entry,
             local_rank=local_rank,
         )
 
 
 def _register_for_scr_once(
-    engine: Any,
+    entry: _EngineRegistration,
     *,
     local_rank: int | None = None,
 ) -> bool:
@@ -433,18 +453,18 @@ def _register_for_scr_once(
     if not is_scr_enabled():
         return False
 
+    engine = entry.engine
     if engine is None:
         return False
 
-    epsilon = _load_epsilon()
-    if epsilon is None or not _epsilon_is_active(epsilon):
+    epsilon = _resolve_epsilon()
+    if epsilon is None:
         return False
 
     # Registration may be retried when the cache is initialized lazily. Avoid
     # registering the Epsilon callback twice for the same engine object.
-    engine_key = id(engine)
     with _registration_lock:
-        previous = _registrations.get(engine_key)
+        previous = entry.record
         if previous is not None and previous.ok:
             return True
 
@@ -471,7 +491,7 @@ def _register_for_scr_once(
             ok = False
 
         with _registration_lock:
-            hook_registered = engine_key in _before_checkpoint_hooks
+            hook_registered = entry.before_checkpoint_hook
         if hook_registered:
             # A lazy KV-cache retry must not append another callback to the
             # external shim's process-global callback list.
@@ -489,7 +509,7 @@ def _register_for_scr_once(
             )
             if hook_result in (None, 0):
                 with _registration_lock:
-                    _before_checkpoint_hooks.add(engine_key)
+                    entry.before_checkpoint_hook = True
             ok = ok and hook_result in (None, 0)
         else:
             LOGGER.warning(
@@ -508,7 +528,7 @@ def _register_for_scr_once(
         registration_duration_ms=(time.monotonic() - started) * 1000.0,
     )
     with _registration_lock:
-        _registrations[engine_key] = registration
+        entry.record = registration
     LOGGER.info(
         "sCR registration completed phase=%s tensors=%d cache_result=%s "
         "hook_result=%s ok=%s elapsed_ms=%.3f kv_bytes=%d",
@@ -565,12 +585,6 @@ def arrive_scr_checkpoint_barrier(
 
     if not is_scr_enabled():
         return None
-    if not _external_shim_phase_active():
-        LOGGER.info(
-            "sCR external shim inactive for phase=%s; skipping arrival",
-            os.environ.get(SCR_PHASE_ENV, "<unset>"),
-        )
-        return _raise_if_strict("sCR arrival requested in an inactive phase")
 
     global _scr_barrier_return_time
     _scr_barrier_return_time = None
@@ -598,8 +612,8 @@ def arrive_scr_checkpoint_barrier(
             f"invalid sCR worker mapping worker_id={worker_id} worker_num={worker_num}"
         )
 
-    epsilon = _load_epsilon()
-    if epsilon is None or not _epsilon_is_active(epsilon):
+    epsilon = _resolve_epsilon()
+    if epsilon is None:
         return _raise_if_strict("sCR Epsilon provider is unavailable or inactive")
     checkpoint = getattr(epsilon, "snapstart_checkpoint", None)
     if not callable(checkpoint):
@@ -736,10 +750,7 @@ def _reset_for_test() -> None:
     global _scr_barrier_return_time
     _scr_barrier_return_time = None
     with _registration_lock:
-        _registrations.clear()
-        _registration_locks.clear()
-        _registration_engines.clear()
-        _before_checkpoint_hooks.clear()
+        _engine_registrations.clear()
     if hasattr(_scr_prepare_local, "skip_next"):
         del _scr_prepare_local.skip_next
 

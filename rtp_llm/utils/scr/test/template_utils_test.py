@@ -237,7 +237,7 @@ class ScrTemplateUtilsTest(unittest.TestCase):
 
         self.assertEqual([call[0] for call in epsilon.calls], ["cache", "before"])
         self.assertEqual(epsilon.calls[0][1], [base, indexer, hbm])
-        self.assertEqual(scr._registrations[id(engine)].tensors, (base, indexer, hbm))
+        self.assertEqual(scr._engine_registrations[id(engine)].record.tensors, (base, indexer, hbm))
         self.assertTrue(any("kv_bytes=104" in line for line in logs.output))
 
     def test_invalid_native_allocation_rejects_entire_registration(self) -> None:
@@ -271,7 +271,7 @@ class ScrTemplateUtilsTest(unittest.TestCase):
                 ):
                     self.assertFalse(scr.register_for_scr(engine))
                 self.assertEqual(epsilon.calls, [])
-                self.assertFalse(scr._registrations[id(engine)].ok)
+                self.assertFalse(scr._engine_registrations[id(engine)].record.ok)
 
     def test_missing_native_export_does_not_fall_back_to_model_field_names(
         self,
@@ -304,7 +304,9 @@ class ScrTemplateUtilsTest(unittest.TestCase):
         ):
             self.assertFalse(scr.register_for_scr(engine))
         self.assertEqual(epsilon.calls, [])
-        self.assertNotIn(id(engine), scr._registrations)
+        # The per-engine entry holds the serialization lock, but an inert
+        # provider must not leave a registration record behind.
+        self.assertIsNone(scr._engine_registrations[id(engine)].record)
 
     def test_registration_failure_can_retry_when_cache_becomes_ready(self) -> None:
         allocations = []
@@ -321,7 +323,7 @@ class ScrTemplateUtilsTest(unittest.TestCase):
         self.assertEqual([call[0] for call in epsilon.calls], ["before", "cache"])
 
     def test_initialized_cuda_is_quiesced_without_registered_tensors(self) -> None:
-        with mock.patch.object(scr, "_registrations", {}), mock.patch(
+        with mock.patch.object(scr, "_engine_registrations", {}), mock.patch(
             "torch.cuda.is_initialized", return_value=True
         ), mock.patch("torch.cuda.is_available", return_value=True), mock.patch(
             "torch.cuda.synchronize"
