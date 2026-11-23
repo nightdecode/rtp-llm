@@ -425,30 +425,16 @@ class FrontendApp(object):
         )
         self.shutdown_manager = FrontendShutdownManager()
         self.separated_frontend = separated_frontend
-
-        # Compute all DP addresses for broadcast operations (e.g. update_scheduler_info)
-        world_info = get_frontend_world_info(
-            server_config=py_env_configs.server_config,
-            distribute_config=py_env_configs.distribute_config,
-            parallelism_config=py_env_configs.parallelism_config,
-        )
-        dp_addresses = get_dp_addrs_from_world_info(
-            world_info=world_info,
-            parallelism_config=py_env_configs.parallelism_config,
-        )
-        client_config = self.py_env_configs.grpc_config.get_client_config()
+        self.client_config = self.py_env_configs.grpc_config.get_client_config()
         # Resolve stage roots only on PP EPLB updates, after backend bootstrap.
-        eplb_address_resolver = None
+        self.eplb_address_resolver = None
         if py_env_configs.parallelism_config.pp_size > 1:
-            eplb_address_resolver = lambda: get_eplb_stage_root_addresses(
+            self.eplb_address_resolver = lambda: get_eplb_stage_root_addresses(
                 py_env_configs
             )
-        self.grpc_client = GrpcClientWrapper(
-            self.server_config.rpc_server_port,
-            dp_addresses=dp_addresses,
-            client_config=client_config,
-            eplb_address_resolver=eplb_address_resolver,
-        )
+        # Built after the SCR prebind barrier: the restored pod must resolve
+        # backend addresses from the refreshed config, not from the snapshot.
+        self.grpc_client: Optional[GrpcClientWrapper] = None
 
         logging.info(
             f"frontend app rank_id = {self.server_config.rank_id}, "
@@ -483,6 +469,30 @@ class FrontendApp(object):
             "Backend health_check did not become ready within %ds" % timeout_s
         )
 
+    def _init_grpc_client(self) -> None:
+        """Resolve backend addresses and build the RPC client.
+
+        Deferred until after ``on_prebind`` so a restored pod uses the
+        addresses refreshed by the SCR fixup hook instead of the ones frozen
+        into the snapshot.
+        """
+        # Compute all DP addresses for broadcast operations (e.g. update_scheduler_info)
+        world_info = get_frontend_world_info(
+            server_config=self.py_env_configs.server_config,
+            distribute_config=self.py_env_configs.distribute_config,
+            parallelism_config=self.py_env_configs.parallelism_config,
+        )
+        dp_addresses = get_dp_addrs_from_world_info(
+            world_info=world_info,
+            parallelism_config=self.py_env_configs.parallelism_config,
+        )
+        self.grpc_client = GrpcClientWrapper(
+            self.server_config.rpc_server_port,
+            dp_addresses=dp_addresses,
+            client_config=self.client_config,
+            eplb_address_resolver=self.eplb_address_resolver,
+        )
+
     def start(
         self,
         on_ready: Optional[Callable[[], None]] = None,
@@ -504,6 +514,7 @@ class FrontendApp(object):
         self._on_ready = on_ready
         if on_prebind is not None:
             on_prebind()
+        self._init_grpc_client()
         self.frontend_server.start()
         app = self.create_app()
         init_telemetry("frontend", 0)
