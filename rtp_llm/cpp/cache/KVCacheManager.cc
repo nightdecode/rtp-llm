@@ -409,6 +409,9 @@ bool KVCacheManager::startServices() {
     }
     coordinator_manager_->attachBlockTreeCache(block_tree_cache_);
     const std::weak_ptr<BlockTreeCache> weak_cache = block_tree_cache_;
+    // The capacity callback is installed once in prepare() and re-installed here
+    // with the BlockTreeCache hook, so it must be rebuilt in this scope.
+    const auto capacity_changed = allocationChangeCallback();
     for (const auto& pool : coordinator_manager_->groupBlockPools()) {
         pool->setCapacityChangeCallback([capacity_changed, weak_cache] {
             capacity_changed();
