@@ -130,7 +130,12 @@ def _stable_topk_small(logits, starts, ends, output):
             columns,
             logits.stride(0),
             logits.stride(1),
-            2048,
+            # 选多少个由输出宽度决定，不写死。kernel 里 K 只用来开 tl.arange、
+            # 做计数比较和定位输出，对取值没有别的假设，所以只要是 2 的幂就行。
+            # GLM-5.3-Flash 的 indexer 对「池」打分，预算是 index_topk // index_kpool
+            # = 512，写死 2048 的话它永远落到后面那条 torch.topk 的慢路
+            # （实测每个 DSA 层 181 微秒，11 层合计每步 2 毫秒）。
+            output.shape[1],
             a,
             b,
             num_warps=16,
@@ -195,7 +200,15 @@ def stable_topk(logits, row_starts, row_ends, output, max_seq_len=None):
     ):
         all_token_indices(row_starts, row_ends, output, columns)
         return
-    if rows <= 64 and 8192 <= columns <= 34816 and output.shape[1] == 2048:
+    width = output.shape[1]
+    if (
+        rows <= 64
+        and 8192 <= columns <= 34816
+        # 2 的幂即可（tl.arange 的要求），不限定具体值；下界 256 是避免给极窄的
+        # 输出也走这条按列全展开的路，那时后面的 torch.topk 更合算。
+        and 256 <= width <= 4096
+        and (width & (width - 1)) == 0
+    ):
         # Per-row device bounds skip score selection for short decode rows,
         # including when one Graph bucket also serves longer rows. The exact
         # threshold and token-order tie break stay on device for long rows.
