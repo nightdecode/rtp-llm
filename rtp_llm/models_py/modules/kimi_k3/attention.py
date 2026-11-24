@@ -36,6 +36,95 @@ class _KimiK3AttentionQuantization:
     _decode_nvfp4_ag = None
     decode_head_gate_columns: int = 0
 
+    def set_fp8_input_collective(self, collective) -> None:
+        self._fp8_input_collective = collective
+
+    def forward_with_residual(
+        self,
+        hidden,
+        anchors,
+        fmha,
+        cache,
+        attention_inputs,
+        metadata,
+        *,
+        residual,
+        norm,
+        layer_index: int,
+        num_blocks: int,
+        block_write_idx: int,
+        delta,
+        shared_delta,
+    ):
+        """Produce and consume the residual activation in the attention's layout."""
+        fp8_ag = self._fp8_input_collective
+        produce_fp8 = (
+            fp8_ag is not None
+            and fp8_ag.enable_ag
+            and self.supports_fp8_activation
+            and hidden.is_cuda
+            and hidden.shape[0] >= 4096
+            and attention_inputs.is_prefill
+            and not metadata.is_target_verify
+            and not attention_inputs.is_mtp_draft_update
+            and fp8_ag.eligible_ag(hidden, attention_inputs, metadata)
+        )
+        natural_fp8, natural_nvfp4 = self.natural_residual_formats(
+            hidden, attention_inputs, metadata
+        )
+        decode_nvfp4 = self.uses_decode_nvfp4_ag(
+            hidden.shape[0], attention_inputs, metadata
+        )
+        produce_fp4 = (
+            (decode_nvfp4 or self.eligible_nvfp4_ag(hidden, attention_inputs, metadata))
+            and hidden.shape[1] == 7168
+            and torch.cuda.get_device_capability(hidden.device)[0] == 10
+        )
+        residual_scope = (
+            "attention_residual_nvfp4"
+            if produce_fp4 or natural_nvfp4
+            else "attention_residual"
+        )
+        with profile_scope(f"RTP::layers.{layer_index}.{residual_scope}"):
+            residual_forward = residual.forward_fp8 if produce_fp8 else residual
+            attn_input = residual_forward(
+                hidden,
+                anchors,
+                delta=delta,
+                shared_delta=shared_delta,
+                num_blocks=num_blocks,
+                block_write_idx=block_write_idx,
+                output_norm_weight=norm.weight,
+                output_norm_eps=norm.variance_epsilon,
+                metadata=metadata,
+                **({"also_quantize": True} if natural_fp8 else {}),
+                **(
+                    {"quantize_nvfp4": True, "split_nvfp4_quant": not decode_nvfp4}
+                    if produce_fp4 or natural_nvfp4
+                    else {}
+                ),
+                **({"rowwise_nvfp4": True} if produce_fp4 else {}),
+                **(
+                    {"decode_head_gate_columns": self.decode_head_gate_columns}
+                    if decode_nvfp4 and self.decode_head_gate_columns
+                    else {}
+                ),
+            )
+            if natural_nvfp4:
+                attn_input, encoded, packed = attn_input
+            elif natural_fp8:
+                attn_input, encoded = attn_input
+        with profile_scope(f"RTP::layers.{layer_index}.attention"):
+            return self(
+                attn_input,
+                fmha,
+                cache,
+                attention_inputs,
+                metadata,
+                **({"natural_fp8": encoded} if natural_fp8 else {}),
+                **({"natural_nvfp4": packed} if natural_nvfp4 else {}),
+            )
+
     def natural_residual_formats(
         self, hidden: torch.Tensor, inputs: PyAttentionInputs, metadata: KdaMetadata
     ) -> tuple[bool, bool]:

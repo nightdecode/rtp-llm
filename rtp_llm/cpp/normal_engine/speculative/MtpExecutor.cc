@@ -851,7 +851,8 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
         && std::any_of(cache_config.topology().groups().begin(),
                        cache_config.topology().groups().end(),
                        [](const GroupBase& group) { return group.policy.group_type == CacheGroupType::LINEAR; });
-    const bool request_lanes = readMtpDraftPrefillRequestLanes(params.py_sp_model);
+    const bool request_lanes =
+        draft_config.mtp_draft_prefill_uses_request_lanes && params.py_sp_model && !params.py_sp_model.is_none();
     batch_stream_processor_.reset(new MtpBatchStreamProcessor(params.model_config_,
                                                               params.pd_sep_config,
                                                               params.profiling_debug_logging_config,

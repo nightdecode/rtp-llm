@@ -34,26 +34,24 @@ class KimiK31CapacityContractTest(unittest.TestCase):
             mm_model_config=SimpleNamespace(is_multimodal=False),
             k3_runtime_config=SimpleNamespace(dsa=object()),
         )
-        owner = SimpleNamespace(
-            _uses_native_mtp_model=False,
-            model_config=config,
-            runtime_config=runtime,
-            parallelism_config=parallel,
-            max_generate_batch_size=runtime.max_generate_batch_size,
-            hw_kernel_config=SimpleNamespace(enable_cuda_graph=False),
-            kv_cache_config=SimpleNamespace(multi_task_prompt_tokens={}),
-            weight=object(),
-            fmha_config=object(),
-            moe_config=object(),
-            _configure_prefill_kv_workspace=lambda: None,
-        )
+        owner = object.__new__(KimiK3)
+        owner.model_config = config
+        owner.runtime_config = runtime
+        owner.parallelism_config = parallel
+        owner.max_generate_batch_size = runtime.max_generate_batch_size
+        owner.hw_kernel_config = SimpleNamespace(enable_cuda_graph=False)
+        owner.kv_cache_config = SimpleNamespace(multi_task_prompt_tokens={})
+        owner.weight = object()
+        owner.fmha_config = object()
+        owner.moe_config = object()
         # Only model/workspace allocation is replaced. The production startup
         # capacity calculation and production row planner/validator run intact.
         with (
             patch("rtp_llm.models_py.model_desc.kimi_k3.KimiK3Model") as construct,
             patch("torch.cuda.empty_cache"),
+            patch.object(owner, "_configure_prefill_kv_workspace"),
         ):
-            KimiK3._create_python_model(owner)
+            owner._create_python_model()
         capacity = construct.call_args.kwargs["prefill_staging_tokens"]
         lengths = (8449,) * 31
         self.assertLessEqual(sum(lengths), scheduler.max_batch_tokens_size)

@@ -22,16 +22,6 @@ enum class CudaGraphCheckMode : uint8_t {
     PREPARE,
 };
 
-// Resolve the Python model's draft layout at the entry point shared by batch building and graph capture.
-inline bool readMtpDraftPrefillRequestLanes(pybind11::handle model) {
-    if (!Py_IsInitialized() || !model) {
-        return false;
-    }
-    pybind11::gil_scoped_acquire gil;
-    constexpr const char*        hook = "cuda_graph_draft_prefill_uses_request_lanes";
-    return !model.is_none() && pybind11::hasattr(model, hook) && model.attr(hook)().cast<bool>();
-}
-
 // Current state of CUDA graph execution (used when calling canRun/forward with graph runner)
 struct CudaGraphState {
     int                              current_batch_size{1};

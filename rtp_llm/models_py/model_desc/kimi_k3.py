@@ -226,88 +226,21 @@ class KimiK3DecoderLayer(nn.Module):
         if self.block_size:
             previous = (self.index + self.block_size - 1) // self.block_size
             writes = self.index % self.block_size == 0
-            fp8_ag = self.attention._fp8_input_collective
-            produce_fp8 = (
-                fp8_ag is not None
-                and fp8_ag.enable_ag
-                and self.attention.supports_fp8_activation
-                and hidden.is_cuda
-                and hidden.shape[0] >= 4096
-                and attention_inputs.is_prefill
-                and not metadata.is_target_verify
-                and not attention_inputs.is_mtp_draft_update
-                and fp8_ag.eligible_ag(hidden, attention_inputs, metadata)
+            attended = self.attention.forward_with_residual(
+                hidden,
+                anchors,
+                fmha,
+                cache,
+                attention_inputs,
+                metadata,
+                residual=self.attention_residual,
+                norm=self.attention_norm,
+                layer_index=self.index,
+                num_blocks=previous,
+                block_write_idx=previous if writes else -1,
+                delta=mlp_delta,
+                shared_delta=mlp_shared_delta,
             )
-            natural_fp8, natural_nvfp4 = self.attention.natural_residual_formats(
-                hidden, attention_inputs, metadata
-            )
-            decode_nvfp4 = self.attention.uses_decode_nvfp4_ag(
-                hidden.shape[0], attention_inputs, metadata
-            )
-            produce_fp4 = (
-                (
-                    decode_nvfp4
-                    or self.attention.eligible_nvfp4_ag(
-                        hidden, attention_inputs, metadata
-                    )
-                )
-                and hidden.shape[1] == 7168
-                and torch.cuda.get_device_capability(hidden.device)[0] == 10
-            )
-            residual_scope = (
-                "attention_residual_nvfp4"
-                if produce_fp4 or natural_nvfp4
-                else "attention_residual"
-            )
-            with profile_scope(f"RTP::layers.{self.index}.{residual_scope}"):
-                residual = (
-                    self.attention_residual.forward_fp8
-                    if produce_fp8
-                    else self.attention_residual
-                )
-                attn_input = residual(
-                    hidden,
-                    anchors,
-                    delta=mlp_delta,
-                    shared_delta=mlp_shared_delta,
-                    num_blocks=previous,
-                    block_write_idx=previous if writes else -1,
-                    output_norm_weight=self.attention_norm.weight,
-                    output_norm_eps=self.attention_norm.variance_epsilon,
-                    metadata=metadata,
-                    **({"also_quantize": True} if natural_fp8 else {}),
-                    **(
-                        {"quantize_nvfp4": True, "split_nvfp4_quant": not decode_nvfp4}
-                        if produce_fp4 or natural_nvfp4
-                        else {}
-                    ),
-                    **({"rowwise_nvfp4": True} if produce_fp4 else {}),
-                    **(
-                        {
-                            "decode_head_gate_columns": self.attention.decode_head_gate_columns
-                        }
-                        if decode_nvfp4 and self.attention.decode_head_gate_columns
-                        else {}
-                    ),
-                )
-                if natural_nvfp4:
-                    attn_input, encoded, packed = attn_input
-                elif natural_fp8:
-                    attn_input, encoded = attn_input
-            with profile_scope(f"RTP::layers.{self.index}.attention"):
-                attended = self.attention(
-                    attn_input,
-                    fmha,
-                    cache,
-                    attention_inputs,
-                    metadata,
-                    **({"natural_fp8": encoded} if natural_fp8 else {}),
-                    **({"natural_nvfp4": packed} if natural_nvfp4 else {}),
-                )
-            if natural_fp8:
-                del encoded
-            if natural_nvfp4:
-                del packed
             delta = None
             if writes:
                 hidden = attended
@@ -626,7 +559,7 @@ class KimiK3Model(KimiK31ModelAdapter, GptModelBase):
         for layer in fp8_rs_layers:
             layer.attention._fp8_collective = collective
         for layer in fp8_ag_layers:
-            layer.attention._fp8_input_collective = collective
+            layer.attention.set_fp8_input_collective(collective)
             if layer.block_size:
                 layer.attention_residual.configure_verify_fp8(
                     decode_staging and layer.attention.supports_fp8_activation

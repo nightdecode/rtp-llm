@@ -139,7 +139,6 @@ class KimiK3(BaseModel):
     CONFIG_CLASS = KimiK3ModelConfig
     TARGET_MODEL_CLASS = None
     ENABLE_MULTIMODAL = True
-    _uses_native_mtp_model = False
 
     @classmethod
     def _post_build_model_config(cls, model_config):
@@ -553,15 +552,11 @@ class KimiK3(BaseModel):
         config.prefill_kv_workspace_budget_bytes = max(budget, required)
 
     def _create_python_model(self):
-        if self._uses_native_mtp_model:
-            from rtp_llm.models_py.model_desc.kimi_k3_mtp import KimiK3MtpModel
+        from rtp_llm.models_py.model_desc.kimi_k3 import KimiK3Model
 
-            model_cls = KimiK3MtpModel
-        else:
-            from rtp_llm.models_py.model_desc.kimi_k3 import KimiK3Model
+        return self._build_python_model(KimiK3Model, release_weight_loading_cache=True)
 
-            model_cls = KimiK3Model
-
+    def _build_python_model(self, model_cls, *, release_weight_loading_cache: bool):
         config = self.model_config
         runtime = self.runtime_config
         hw = self.hw_kernel_config
@@ -666,7 +661,7 @@ class KimiK3(BaseModel):
 
         # Release inactive blocks left by checkpoint loading before the expert
         # weight transform allocates its large temporary buffer.
-        if not self._uses_native_mtp_model:
+        if release_weight_loading_cache:
             torch.cuda.empty_cache()
 
         self.py_model = model_cls(
@@ -682,7 +677,7 @@ class KimiK3(BaseModel):
         )
         # Release rank-dependent inactive blocks before the native engine
         # allocates KV cache and workspaces.
-        if not self._uses_native_mtp_model:
+        if release_weight_loading_cache:
             torch.cuda.empty_cache()
         return self.py_model
 
@@ -695,7 +690,13 @@ class KimiK3Mtp(KimiK3):
     """The independent, recurrent K3 MTP layer from a draft-only checkpoint."""
 
     MODEL_TYPE = "kimi_k3_mtp"
-    _uses_native_mtp_model = True
+
+    def _create_python_model(self):
+        from rtp_llm.models_py.model_desc.kimi_k3_mtp import KimiK3MtpModel
+
+        return self._build_python_model(
+            KimiK3MtpModel, release_weight_loading_cache=False
+        )
 
     @classmethod
     def speculative_weight_alias_names(cls, target_model, draft_model_config):
@@ -764,6 +765,7 @@ class KimiK3Mtp(KimiK3):
         config.tokenizer_path = ckpt_path
         config.model_type = cls.MODEL_TYPE
         config.is_mtp = True
+        config.mtp_draft_prefill_uses_request_lanes = True
         cls._parse_basic_config(config_json, text, config)
         cls._parse_attention_config(text, config)
         cls._parse_moe_config(text, config)

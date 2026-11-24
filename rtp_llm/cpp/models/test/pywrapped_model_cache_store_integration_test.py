@@ -4031,9 +4031,6 @@ class NativeLogitsBoundaryTest(unittest.TestCase):
 
 
 class MtpDecodeForwardModel(SuccessfulGenerationPrefillCaptureModel):
-    def cuda_graph_draft_prefill_uses_request_lanes(self):
-        return True
-
     def __init__(self, inspect_padding=False, inspect_metadata=False):
         super().__init__()
         self.forward_calls = 0

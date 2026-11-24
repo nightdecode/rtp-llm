@@ -4164,7 +4164,7 @@ TEST_F(MtpExecutorTest, ReviewTransactionalPreviousBookkeepingFailureReachesCons
     runDSparkSpecLogitsWorkerScenario(true, true);
 }
 
-TEST_F(MtpExecutorTest, ReviewDraftPrefillLayoutUsesTheWrappedPythonDraft) {
+TEST_F(MtpExecutorTest, DraftPrefillLayoutUsesTheDraftModelConfig) {
     // No Python Torch import is needed: this exercises construction and the
     // capability contract, not forward. Keep the real PyWrappedModel wrapper.
     py::scoped_interpreter interpreter;
@@ -4174,12 +4174,8 @@ TEST_F(MtpExecutorTest, ReviewDraftPrefillLayoutUsesTheWrappedPythonDraft) {
 class DraftModel:
     def __init__(self):
         self.initializations = 0
-        self.layout_queries = 0
     def initialize(self, resources):
         self.initializations += 1
-        return True
-    def cuda_graph_draft_prefill_uses_request_lanes(self):
-        self.layout_queries += 1
         return True
     def forward(self, inputs):
         raise AssertionError("construction must not run a forward")
@@ -4199,13 +4195,14 @@ class DraftModel:
     params.py_model                           = py::none();
     params.py_sp_model                        = draft;
     auto modules                              = std::make_unique<std::vector<std::unique_ptr<EngineInitParams>>>();
-    modules->push_back(std::make_unique<EngineInitParams>(params));
+    auto draft_params                         = std::make_unique<EngineInitParams>(params);
+    draft_params->model_config_.mtp_draft_prefill_uses_request_lanes = true;
+    modules->push_back(std::move(draft_params));
     auto propose = std::make_unique<ProposeModelEngineInitParams>(SP_TYPE_MTP, 3, std::move(modules));
     ASSERT_TRUE(propose->getEngineInitParams().py_model.is_none());
     TestableMtpExecutor executor(params, propose, nullptr, 1, true);
     ASSERT_NE(dynamic_cast<PyWrappedModel*>(executor.draft_model_.get()), nullptr);
     EXPECT_EQ(draft.attr("initializations").cast<int>(), 1);
-    EXPECT_EQ(draft.attr("layout_queries").cast<int>(), 1);
     EXPECT_TRUE(executor.batch_stream_processor_->request_lanes_)
         << "the batch layout must use the same model configuration as the draft wrapper";
     EXPECT_EQ(executor.batch_stream_processor_->draftInputLayout(), mtp::DraftInputLayout::FIXED_WIDTH);

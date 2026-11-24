@@ -97,16 +97,10 @@ class MetadataModel:
         return PyModelOutputs(output)
 
 
-class MetadataMtpModel(MetadataModel):
-    def cuda_graph_draft_prefill_uses_request_lanes(self):
-        # Match KimiK3MtpModel: each captured request owns all four Q lanes.
-        return True
-
-
 def make_runner(model, role):
     runner = CudaGraphRunner()
     if role == "update":
-        runner.init_mtp_draft_prefill(model, 2, HIDDEN_SIZE, 4, 1)
+        runner.init_mtp_draft_prefill(model, 2, HIDDEN_SIZE, 4, 1, request_lanes=True)
     else:
         runner.init_decode(
             model,
@@ -181,8 +175,7 @@ class AttentionPrepareGraphTest(unittest.TestCase):
     def test_device_prepare_is_replayed_for_changing_metadata(self):
         for role in ("decode", "verify", "update"):
             with self.subTest(role=role):
-                model_type = MetadataMtpModel if role == "update" else MetadataModel
-                model = model_type(prepare_in_forward=True)
+                model = MetadataModel(prepare_in_forward=True)
                 runner = make_runner(model, role)
                 captured = [p for p in model.probes if p.capture_calls]
                 self.assertTrue(captured)

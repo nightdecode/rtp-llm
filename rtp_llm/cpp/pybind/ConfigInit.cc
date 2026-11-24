@@ -2225,6 +2225,7 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def_readwrite("num_layers", &ModelConfig::num_layers)
         .def_readwrite("max_seq_len", &ModelConfig::max_seq_len)
         .def_readwrite("max_execution_tokens", &ModelConfig::max_execution_tokens)
+        .def_readwrite("mtp_draft_prefill_uses_request_lanes", &ModelConfig::mtp_draft_prefill_uses_request_lanes)
         .def_readwrite("gen_num_per_cycle", &ModelConfig::gen_num_per_cycle)
         .def_readwrite("vocab_size", &ModelConfig::vocab_size)
         .def_readwrite("output_vocab_ids", &ModelConfig::output_vocab_ids)

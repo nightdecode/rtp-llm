@@ -221,6 +221,7 @@ class ModelConfig(CppModelConfig):
         "num_layers",
         "max_seq_len",
         "max_execution_tokens",
+        "mtp_draft_prefill_uses_request_lanes",
         "vocab_size",
         "hidden_size",
         "hidden_state_capture_layer_ids",

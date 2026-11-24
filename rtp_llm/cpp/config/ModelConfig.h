@@ -88,8 +88,10 @@ public:
     int64_t max_seq_len       = 0;
     // Global physical input rows of the initialized TP workspace, including Decode/verify; 0 is unspecified.
     int64_t max_execution_tokens = 0;
-    int64_t gen_num_per_cycle = 0;  // speculative decoding: tokens per cycle
-    int64_t vocab_size        = 0;
+    // The MTP draft graph keeps a fixed number of token lanes per request.
+    bool    mtp_draft_prefill_uses_request_lanes = false;
+    int64_t gen_num_per_cycle                    = 0;  // speculative decoding: tokens per cycle
+    int64_t vocab_size                           = 0;
     // Output vocab pruning contract: empty means disabled; otherwise ids must be strictly
     // ascending and deduplicated, each in [0, vocab_size), and output_vocab_padded_size >= ids.size().
     std::vector<int64_t> output_vocab_ids;
