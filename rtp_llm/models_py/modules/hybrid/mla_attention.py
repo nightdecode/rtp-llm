@@ -1,3 +1,4 @@
+import os
 from collections.abc import Mapping
 from typing import Dict, Optional, Tuple, Union, cast
 
@@ -44,6 +45,18 @@ else:
     _FP8_GEMM_LINEAR = None
     fused_strided_rmsnorm = None  # type: ignore
     fused_strided_rmsnorm_per_token_fp8_quant_with_bf16_output = None  # type: ignore
+
+
+
+def _kpool_cache_push_enabled() -> bool:
+    """池缓存组要不要在 prefill 侧显式推一次跨机传输。
+
+    索引器那一组是显式推的（上面紧挨着的那一行），所以池大概率也要。
+    但「声明了的组会不会自动带上」这件事只能上卡试，留一个开关：
+    真的自动带上、或者引擎不接受对同一层推第二个组时，置 0 重跑即可，
+    不用改代码重传覆盖包。默认开。
+    """
+    return os.environ.get("RTP_GLM_KPOOL_CACHE_PUSH", "1") == "1"
 
 
 class MlaAttention(nn.Module):
@@ -206,6 +219,7 @@ class MlaAttention(nn.Module):
         q_c_scale: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
         force_reuse_topk_indices: bool = False,
+        kpool_kv_cache: Optional[LayerKVCache] = None,
     ) -> Optional[torch.Tensor]:
         if self.reuse_topk_indices or force_reuse_topk_indices:
             if not fmha_impl.is_sparse():
@@ -232,6 +246,7 @@ class MlaAttention(nn.Module):
             x_scale=x_scale,
             q_c_fp8=q_c_fp8,
             q_c_scale=q_c_scale,
+            kpool_kv_cache=kpool_kv_cache,
         )
         attn_inputs = fmha_impl.attn_inputs
         if (
@@ -242,6 +257,13 @@ class MlaAttention(nn.Module):
             attn_inputs.cache_store_writer.write(
                 attn_inputs.cache_store_inputs, kv_cache
             )
+            if kpool_kv_cache is not None and _kpool_cache_push_enabled():
+                # 跨机传输是**按组显式推**的，不是声明了就自动带上：上面那行只推
+                # indexer 这一组。池单独一组，不在这里推一次，decode 机上就是空的，
+                # 提示词范围的池会读到别的请求留下的值（结果文档第 35 节）。
+                attn_inputs.cache_store_writer.write(
+                    attn_inputs.cache_store_inputs, kpool_kv_cache
+                )
         return topk_indices
 
     def forward(
@@ -270,12 +292,16 @@ class MlaAttention(nn.Module):
             if kv_cache is None:
                 default_kv_cache = None
                 indexer_kv_cache = None
+                kpool_kv_cache = None
             elif isinstance(kv_cache, Mapping) and (
-                set(kv_cache) == required_tags
+                # "kpool" 是可选的第三个组：GLM-5.3-Flash 把池 key 放在那里，
+                # 它没有自己的注意力实现，只是为了随 KV cache 跨机传输而声明。
+                set(kv_cache) - {"kpool"} == required_tags
                 or (self.reuse_topk_indices and set(kv_cache) == {"default"})
             ):
                 default_kv_cache = kv_cache["default"]
                 indexer_kv_cache = kv_cache.get("indexer_kv")
+                kpool_kv_cache = kv_cache.get("kpool")
                 if not isinstance(default_kv_cache, LayerKVCache) or (
                     indexer_kv_cache is not None
                     and not isinstance(indexer_kv_cache, LayerKVCache)
@@ -293,6 +319,7 @@ class MlaAttention(nn.Module):
                 raise RuntimeError("dense MLA does not accept tagged cache routes")
             default_fmha_impl = cast(MlaImplBase, fmha_impl)
             default_kv_cache = cast(Optional[LayerKVCache], kv_cache)
+            kpool_kv_cache = None
 
         fmha_impl = default_fmha_impl
         kv_cache = default_kv_cache
@@ -390,6 +417,7 @@ class MlaAttention(nn.Module):
                 q_c_scale,
                 prev_topk_indices,
                 force_reuse_topk_indices,
+                kpool_kv_cache,
             )
         # q_c and its quantized representation are Indexer-only. Releasing
         # the local references here lets SparseMLA reuse their blocks;

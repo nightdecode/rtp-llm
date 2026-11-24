@@ -1,6 +1,10 @@
+import logging
+import os
 from typing import Any, Dict, Optional, Tuple
 
 import torch
+
+from rtp_llm.models_py.modules.hybrid import kpool as kpool_mod
 from torch import nn
 
 from rtp_llm.device.device_type import DeviceType, get_device_type
@@ -36,6 +40,22 @@ elif _DEVICE_TYPE == DeviceType.Ppu:
 else:
     fused_logits_head_gate = None  # type: ignore
     _FP8_GEMM_LINEAR = None
+
+
+# A decode forward runs the 11 DSA layers' indexers on the same request set, so
+# their index bookkeeping (per-request context lengths, the int32-clamped block
+# table, each row's pool window) is identical across layers. Done per layer it
+# was ~17 tiny launches x 11 layers per step (timeline 2026-11-22). The model
+# calls begin_forward() once per forward; the first DSA layer computes the
+# bookkeeping, the rest reuse it. Under CUDA graph capture the forward's Python
+# runs once per captured shape, so the graph records the bookkeeping once.
+_FORWARD_GEN = 0
+_DECODE_META: Dict[str, Any] = {}
+
+
+def begin_forward() -> None:
+    global _FORWARD_GEN
+    _FORWARD_GEN += 1
 
 
 def _is_decode_phase(attention_inputs: Any) -> bool:
@@ -190,6 +210,8 @@ class Indexer(nn.Module):
             getattr(attn_config, "indexer_compress_ratio", 1) or 1
         )
         self.kpool = None
+        # 分页打分一旦被厂商算子的形状断言拒掉，本进程后续不再重试。
+        self._kpool_paged_ok = True
         if self.compress_ratio > 1:
             from rtp_llm.models_py.modules.hybrid.kpool import KPoolIndexer
 
@@ -548,8 +570,15 @@ class Indexer(nn.Module):
         q_c_fp8,
         q_c_scale,
         use_fast_path,
+        kpool_kv_cache=None,
     ):
         assert kv_cache is not None, "KPool indexer requires a KV cache"
+        # 池缓存组的存储。声明了就用它——它随 KV cache 跨机传输，prefill 算出的
+        # 提示词池在 decode 机上能读到；没声明就退回模块私有的旁路缓冲，
+        # 那种情况下 decode 只有自己生成的那些 token 的池是对的（见 kpool.py 说明）。
+        pool_base = (
+            kpool_kv_cache.kv_cache_base if kpool_kv_cache is not None else None
+        )
         # 1) 投影。池化要在**未旋转**的 key 上做（官方就是对 k_norm(wk(x)) 分组），
         #    q 仍旧旋转（本模型无 rope，apply_rope_* 只剩 Hadamard）。
         if self._wq_b_accepts_fp8 and q_c_fp8 is not None and q_c_scale is not None:
@@ -585,11 +614,26 @@ class Indexer(nn.Module):
             slot_mapping = fmha_params.slot_mapping
         half = self.index_head_dim
         self.kpool.write(
-            kv_cache.kv_cache_base, slot_mapping, pair[:, :half], pair[:, half:]
+            kv_cache.kv_cache_base,
+            slot_mapping,
+            pair[:, :half],
+            pair[:, half:],
+            self.kpool_ape,
+            pool_base=pool_base,
         )
         if use_fast_path:
             # 全选层只需要把 K 落盘，不出 top-k
             return None
+
+        # 3') decode 且走分页打分时，各 DSA 层共用同一份下标换算（见 _DECODE_META）
+        if _is_decode_phase(attention_inputs):
+            meta = self._kpool_decode_meta(
+                attention_inputs, fmha_params, q, kv_cache, pool_base
+            )
+            if meta is not None:
+                selected = self._kpool_decode_select(hidden_states, q, meta)
+                if selected is not None:
+                    return selected
 
         # 3) 组池：从 cache 里按请求取出凑满的池，算池 key，旋转后量化
         per_req_ctx, row_ctx, row_req, score_rows = self._kpool_context_lengths(
@@ -609,7 +653,11 @@ class Indexer(nn.Module):
             )
         block_table = _physical_block_table(attention_inputs)
         pool_fp8, pool_scale, pool_start = self.kpool.build_pools(
-            kv_cache.kv_cache_base, block_table, per_req_ctx, self.kpool_ape
+            kv_cache.kv_cache_base,
+            block_table,
+            per_req_ctx,
+            self.kpool_ape,
+            pool_base=pool_base,
         )
 
         # 4) 打分 + 选池 + 展开成请求内的 token 索引
@@ -628,6 +676,71 @@ class Indexer(nn.Module):
         pool_ke = pool_ks + torch.div(
             row_ctx, self.compress_ratio, rounding_mode="floor"
         ).to(torch.int32)
+        # 分页打分那条路 pool_fp8 是空的，所以步长按块表宽度算，两条路同值。
+        if int(pool_fp8.shape[0]):
+            max_pools = int(pool_fp8.shape[0]) // max(1, int(per_req_ctx.numel()))
+        else:
+            max_pools = int(block_table.shape[1]) * self.kpool.store.pools_per_page
+        # 池值对照放在这里：ks/ke 到这一步才算出来，而窗口必须是打分真正读的那一段。
+        # 只在 RTP_GLM_KPOOL_AUDIT=1 时执行，默认那条路直接返回。
+        if self.kpool.incremental:
+            self.kpool.audit_stored_vs_recomputed(
+                kv_cache.kv_cache_base, block_table, self.kpool_ape, pool_ks, pool_ke
+            )
+        paged_logits = None
+        # 池 cache 比块表还窄时不走分页路，但**不记失败**。
+        # 这是输出 dtype 探测那次前向的情形：它用的是很小的假 cache（实测 2 页），
+        # 而块表带的是真实宽度（实测 160）。那一次本来就该退回搬运路，
+        # 但如果把它记成永久失败，真正的图捕获就再也不会走分页路了——
+        # 上一轮正是这样：11 个 DSA 层各被拒一次，整个进程退化，
+        # 还白白付了新布局下回退 gather 的代价。
+        store_ready = (
+            self.kpool.store is not None
+            and self.kpool.store.num_pages >= int(block_table.shape[1])
+        )
+        if (
+            kpool_mod.paged_scoring_enabled()
+            and self.kpool.incremental
+            # 读写二分开关关着时，build_pools 已经改走重算路并真的搬了池出来，
+            # 这里再按页打分就会把重算结果盖掉，二分也就白做了。
+            and kpool_mod.incremental_read_enabled()
+            and self._kpool_paged_ok
+            and store_ready
+        ):
+            # 按页直接在池 cache 上打分，省掉 build_pools 里那次整段搬运。
+            # 每行一个请求（上面已经拒绝了多 token decode），所以 row_ctx 就是每行的上下文。
+            # 必须是 int32：torch.div 在 int32 输入上也会给出 int64，
+            # 而厂商算子对上下文长度的 dtype 有要求，传 int64 会被断言拒掉
+            # （空卡对拍里传的是 int32，所以那边一直过，上卡才暴露）。
+            pool_lens = torch.div(
+                row_ctx, self.compress_ratio, rounding_mode="floor"
+            ).to(torch.int32)
+            try:
+                paged_logits = self.kpool.paged_score(
+                    q_fp8, weights, block_table, pool_lens, max_pools
+                )
+            except Exception:
+                # 厂商算子的形状断言在 host 端抛，而且有的没有消息。崩在这里会让
+                # 整个 CUDA Graph 捕获失败、八个 rank 全起不来，所以退回搬运路，
+                # 但把所有实参的形状和 dtype 打出来——静默回退比崩还难查。
+                store = self.kpool.store
+                logging.exception(
+                    "kpool 分页打分失败，本进程后续退回搬运路；实参："
+                    "q=%s/%s weights=%s/%s block_table=%s/%s pool_lens=%s/%s "
+                    "cache=%s/%s 每页池数=%s max_pools=%s",
+                    tuple(q_fp8.shape), q_fp8.dtype,
+                    tuple(weights.shape), weights.dtype,
+                    tuple(block_table.shape), block_table.dtype,
+                    tuple(pool_lens.shape), pool_lens.dtype,
+                    tuple(store.pool_packed.shape), store.pool_packed.dtype,
+                    store.pools_per_page, max_pools,
+                )
+                self._kpool_paged_ok = False
+                paged_logits = None
+        if paged_logits is None and int(pool_fp8.shape[0]) == 0:
+            # 分页路没出结果（关着或刚退回），但 build_pools 当时按分页路跳过了搬运，
+            # 这里补上，否则 select 拿不到池。
+            pool_fp8, pool_scale, _ = self.kpool.store.gather(block_table, max_pools)
         return self.kpool.select(
             q_fp8,
             weights,
@@ -637,6 +750,96 @@ class Indexer(nn.Module):
             pool_ke,
             row_ctx,
             self.indexer_op._run_prefill_topk,
+            # 池缓冲的固定步长，select 用它把每行切回自己那段再做 top-k
+            max_pools=max_pools,
+            logits=paged_logits,
+        )
+
+    def _kpool_decode_meta(self, attention_inputs, fmha_params, q, kv_cache, pool_base):
+        """Decode bookkeeping shared by every DSA layer of this forward, or None.
+
+        Only for the paged-scoring decode path (one query row per request, pools
+        read straight from the cache). Cached per forward generation; the key also
+        carries the *source* tensors' addresses and shapes (``kvlen_d`` and the
+        block table, both stable buffers) so a forward that did not call
+        begin_forward() can never pick up another forward's values.
+        """
+        if (
+            _FORWARD_GEN == 0
+            or not kpool_mod.paged_scoring_enabled()
+            or not self.kpool.incremental
+            or not kpool_mod.incremental_read_enabled()
+            or not self._kpool_paged_ok
+            or os.environ.get("RTP_GLM_KPOOL_SHARED_DECODE_META", "1") == "0"
+        ):
+            return None
+        kvlen = fmha_params.kvlen_d
+        block_table = _physical_block_table(attention_inputs)
+        rows = self.kpool.layout.view(kv_cache.kv_cache_base)
+        store = self.kpool._ensure_store(rows, pool_base)
+        if store.num_pages < int(block_table.shape[1]):
+            return None
+        key = (
+            _FORWARD_GEN,
+            kvlen.data_ptr(), tuple(kvlen.shape),
+            block_table.data_ptr(), tuple(block_table.shape),
+            store.num_pages, store.pools_per_page, self.compress_ratio,
+        )
+        meta = _DECODE_META.get("decode")
+        if meta is not None and meta["key"] == key:
+            return meta
+        row_ctx = kvlen.reshape(-1).to(torch.long)
+        if int(q.shape[0]) != int(row_ctx.numel()):
+            # 多 token decode（MTP 等）不走这里，交给下面那条路去拒绝
+            return None
+        max_pools = int(block_table.shape[1]) * store.pools_per_page
+        pool_lens = torch.div(row_ctx, self.compress_ratio, rounding_mode="floor").to(
+            torch.int32
+        )
+        meta = {
+            "key": key,
+            "max_pools": max_pools,
+            "pool_lens": pool_lens,
+            # 分页打分给出的 logits 每行只含自己那段，窗口从 0 开始、宽度是池数
+            "zero_ks": torch.zeros_like(pool_lens),
+            "row_ctx": row_ctx,
+            "block_table_i32": block_table.to(torch.int32).clamp(
+                0, max(store.num_pages - 1, 0)
+            ),
+        }
+        _DECODE_META["decode"] = meta
+        return meta
+
+    def _kpool_decode_select(self, hidden_states, q, meta):
+        """Paged-scoring decode with the shared bookkeeping (same math as below)."""
+        q_fp8, q_scale = self.indexer_op.quant_q_only(_rotate_activation(q))
+        weights = self._get_logits_head_gate(hidden_states, q_scale)
+        if weights.dim() == 3:
+            weights = weights.squeeze(-1)
+        weights = weights.float().contiguous()
+        try:
+            logits = self.kpool.paged_score(
+                q_fp8, weights, None, meta["pool_lens"], meta["max_pools"],
+                block_table_i32=meta["block_table_i32"],
+            )
+        except Exception:
+            # 与下面那条路同样处理：厂商算子在 host 端断言时不要带崩图捕获，
+            # 记下来，本进程后续退回搬运路（返回 None 让调用方走原路）。
+            logging.exception("kpool 分页打分失败（共用 decode 元数据路），本进程后续退回搬运路")
+            self._kpool_paged_ok = False
+            return None
+        return self.kpool.select(
+            q_fp8,
+            weights,
+            None,
+            None,
+            meta["zero_ks"],
+            meta["pool_lens"],
+            meta["row_ctx"],
+            self.indexer_op._run_prefill_topk,
+            max_pools=meta["max_pools"],
+            logits=logits,
+            window_is_relative=True,
         )
 
     def forward(
@@ -652,6 +855,7 @@ class Indexer(nn.Module):
         x_scale: Optional[torch.Tensor] = None,
         q_c_fp8: Optional[torch.Tensor] = None,
         q_c_scale: Optional[torch.Tensor] = None,
+        kpool_kv_cache: Optional[LayerKVCache] = None,
     ) -> torch.Tensor:
         if self.kpool is not None:
             return self._forward_kpool(
@@ -666,6 +870,7 @@ class Indexer(nn.Module):
                 q_c_fp8,
                 q_c_scale,
                 use_fast_path,
+                kpool_kv_cache,
             )
 
         if use_fast_path:
