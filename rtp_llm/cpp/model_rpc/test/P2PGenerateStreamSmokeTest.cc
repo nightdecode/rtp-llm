@@ -1558,7 +1558,7 @@ TEST_F(P2PGenerateStreamSmokeTest, BatchLostAdmissionAckStillCancelsPrefillResou
     healthyAfterCancel(2203);
 }
 
-TEST_F(P2PGenerateStreamSmokeTest, BatchNonPDFallbackKeepsPrefillBatchResults) {
+TEST_F(P2PGenerateStreamSmokeTest, BatchNonPDRequestsAreRejectedWithoutPrefillExecution) {
     initialize(DataType::TYPE_FP16);
     BatchGenerateInputPB batch;
     for (int i = 0; i < 2; ++i) {
@@ -1572,14 +1572,12 @@ TEST_F(P2PGenerateStreamSmokeTest, BatchNonPDFallbackKeepsPrefillBatchResults) {
     context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(15));
     BatchGenerateOutputsPB response;
     const auto             status = stub->BatchGenerateCall(&context, batch, &response);
-    ASSERT_TRUE(status.ok()) << status.error_message();
-    ASSERT_EQ(response.results_size(), 2);
-    for (const auto& result : response.results()) {
-        ASSERT_FALSE(result.has_error_info());
-        ASSERT_EQ(result.final_output().flatten_output().finished_size(), 1);
-        EXPECT_TRUE(result.final_output().flatten_output().finished(0));
-        EXPECT_EQ(result.final_output().flatten_output().output_ids().int32_data().size(), sizeof(int32_t));
-    }
+    ASSERT_FALSE(status.ok());
+    ErrorDetailsPB details;
+    ASSERT_TRUE(details.ParseFromString(status.error_details())) << status.error_message();
+    EXPECT_EQ(details.error_code(), static_cast<int64_t>(ErrorCode::INVALID_PARAMS));
+    EXPECT_EQ(response.results_size(), 0);
+    EXPECT_EQ(prefill_process_->snapshot().generate_calls, 0);
     EXPECT_EQ(prefill_process_->snapshot().load_calls, 0);
     EXPECT_EQ(decode_engine_->checked_requests.load(), 0);
     ASSERT_NO_FATAL_FAILURE(expectReleased());
@@ -1600,7 +1598,7 @@ TEST_F(P2PGenerateStreamSmokeTest, CancelAtEachPDStageDrainsBothSides) {
     }
 }
 
-TEST_F(P2PGenerateStreamSmokeTest, NonPDQueriesFinishOnPrefillWithoutP2PTransfer) {
+TEST_F(P2PGenerateStreamSmokeTest, NonPDQueriesAreRejectedWithoutPrefillExecution) {
     initialize(DataType::TYPE_FP16);
     int requests = 0;
     for (int mode = 0; mode < 5; ++mode) {
@@ -1625,13 +1623,13 @@ TEST_F(P2PGenerateStreamSmokeTest, NonPDQueriesFinishOnPrefillWithoutP2PTransfer
             std::vector<GenerateOutputsPB> outputs;
             const auto                     status  = generate(input, outputs);
             const auto                     prefill = prefill_process_->snapshot();
-            ASSERT_TRUE(status.ok()) << status.error_message() << " P=" << prefill.failure;
-            ASSERT_FALSE(outputs.empty());
-            ASSERT_GT(outputs.back().flatten_output().finished_size(), 0);
-            for (bool finished : outputs.back().flatten_output().finished())
-                EXPECT_TRUE(finished);
+            ASSERT_FALSE(status.ok());
+            ErrorDetailsPB details;
+            ASSERT_TRUE(details.ParseFromString(status.error_details())) << status.error_message();
+            EXPECT_EQ(details.error_code(), static_cast<int64_t>(ErrorCode::INVALID_PARAMS));
+            EXPECT_TRUE(outputs.empty());
             ++requests;
-            EXPECT_EQ(prefill.generate_calls, requests);
+            EXPECT_EQ(prefill.generate_calls, 0);
             EXPECT_EQ(prefill.peer_calls, 0);
             EXPECT_EQ(prefill.load_calls, 0);
             EXPECT_EQ(prefill.published_bytes, 0u);
