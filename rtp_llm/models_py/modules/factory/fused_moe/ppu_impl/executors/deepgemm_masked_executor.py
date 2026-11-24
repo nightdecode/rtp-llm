@@ -21,6 +21,7 @@ from rtp_llm.models_py.kernels.ppu.deepgemm_wrapper import (
     m_grouped_fp8_gemm_nt_masked,
     m_grouped_int8_gemm_nt_masked,
 )
+from rtp_llm.models_py.kernels.ppu import moe_probe
 from rtp_llm.models_py.kernels.ppu.fp8_quant import (
     masked_fp8_quantize_128,
     masked_silu_mul_fp8_quantize_128,
@@ -50,6 +51,42 @@ from rtp_llm.models_py.utils.memory import dispose_tensor
 from rtp_llm.utils.model_weight import W
 
 logger = logging.getLogger(__name__)
+
+
+_MOE_LAYOUT_LOGGED = False
+
+
+def _log_moe_weight_layout(**tensors: Optional[torch.Tensor]) -> None:
+    """把专家权重在显存里的排布打一次，用来查 masked GEMM 的带宽差距。
+
+    decode 每步每卡只有 8 个 token、每个专家平均 1.78 行，两次分组 GEMM 的乘加量约 2.4 GFLOP，
+    却要花 227 + 121 μs——耗时几乎全在把专家权重读进来（gate+up 604 MB、down 302 MB）。
+    实测等效带宽 RTP-LLM 2.5～2.7 TB/s、sglang 3.0～3.2 TB/s，两处都差 1.20 倍，
+    而启动网格两边相同、换输入无影响、也不是降频。所以要看权重本身是不是连续、起点怎么对齐。
+    每个进程只打一次。
+    """
+    global _MOE_LAYOUT_LOGGED
+    if _MOE_LAYOUT_LOGGED:
+        return
+    _MOE_LAYOUT_LOGGED = True
+    for name, t in tensors.items():
+        if t is None:
+            continue
+        ptr = t.data_ptr()
+        logging.info(
+            "MoE 权重排布 %s：形状 %s %s，%.1f MB，连续=%s，步长 %s，"
+            "起点 %% 2MB=%d，%% 512=%d，存储 %.1f MB、偏移 %d",
+            name,
+            tuple(t.shape),
+            str(t.dtype).replace("torch.", ""),
+            t.numel() * t.element_size() / 2**20,
+            t.is_contiguous(),
+            tuple(t.stride()),
+            ptr % (2 << 20),
+            ptr % 512,
+            t.untyped_storage().nbytes() / 2**20,
+            t.storage_offset(),
+        )
 
 
 class DeepGemmBf16MaskedExecutor(FusedMoeExpertExecutor):
@@ -532,6 +569,12 @@ class DeepGemmFp8MaskedExecutor(FusedMoeExpertExecutor):
             )
 
         self._num_gemm_sms = deep_gemm_default_num_sms()
+        _log_moe_weight_layout(
+            w1=self._w1,
+            w2=self._w2,
+            w1_scale=self._w1_scale,
+            w2_scale=self._w2_scale,
+        )
         self._warmup_fp8_kernels()
 
     def _warmup_fp8_kernels(self) -> None:
@@ -587,12 +630,29 @@ class DeepGemmFp8MaskedExecutor(FusedMoeExpertExecutor):
         masked_m = payload.expert_tokens_meta.expert_num_tokens
         if masked_m is None:
             raise ValueError("DeepEP LL payload is missing per-expert token counts")
+        if moe_probe.ENABLED:
+            moe_probe.setup(masked_m.device)
+            moe_probe.record(masked_m)
 
+        # Two accepted inputs, matching the two router modes:
+        #   BF16 with no scale -- quantize per-128-group here;
+        #   FP8 with an FP32 scale -- DeepEP already quantized it during the
+        #   all-to-all (quant_size=128), so hand it to the GEMM untouched.
         expert_x = payload.expert_x
-        if expert_x.dtype != torch.bfloat16:
+        pre_quantized = payload.expert_x_scale is not None
+        if pre_quantized:
+            if expert_x.dtype != torch.float8_e4m3fn:
+                raise ValueError(
+                    "a dispatched scale means FP8 input, got "
+                    f"{expert_x.dtype}; the router and executor disagree"
+                )
+            if payload.expert_x_scale.dtype != torch.float32:
+                raise ValueError(
+                    "PPU is not Blackwell, so DeepEP returns FP32 scales; got "
+                    f"{payload.expert_x_scale.dtype}"
+                )
+        elif expert_x.dtype != torch.bfloat16:
             raise ValueError(f"DeepEP LL expected BF16 input, got {expert_x.dtype}")
-        if payload.expert_x_scale is not None:
-            raise ValueError("FP8 DeepEP LL executor quantizes its own input")
         if expert_x.shape[0] != self._num_experts:
             raise ValueError(
                 f"DeepEP returned {expert_x.shape[0]} experts, expected {self._num_experts}"
@@ -612,10 +672,13 @@ class DeepGemmFp8MaskedExecutor(FusedMoeExpertExecutor):
         device = expert_x.device
 
         with configure_deep_gemm_num_sms(self._num_gemm_sms):
-            expert_x_q, expert_x_scale = masked_fp8_quantize_128(
-                expert_x, masked_m, expected_m
-            )
-            dispose_tensor(expert_x)
+            if pre_quantized:
+                expert_x_q, expert_x_scale = expert_x, payload.expert_x_scale
+            else:
+                expert_x_q, expert_x_scale = masked_fp8_quantize_128(
+                    expert_x, masked_m, expected_m
+                )
+                dispose_tensor(expert_x)
 
             gateup_output = torch.empty(
                 (self._num_experts, max_tokens, self._intermediate_size),
