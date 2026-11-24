@@ -168,6 +168,7 @@ def build_pure_pd_managers(
     rdma_connect_timeout_ms: int = 30000,
     max_context_batch_size: int = 8,
     concurrency_limit: int = 16,
+    enable_decode_cuda_graph: bool = True,
     force_host_demotion: bool = False,
     role_name_suffix: str = "",
     extra_common_env: Optional[Dict[str, str]] = None,
@@ -227,7 +228,6 @@ def build_pure_pd_managers(
         f"--max_seq_len {max_seq_len} "
         f"--max_context_batch_size {max_context_batch_size} "
         f"--concurrency_limit {concurrency_limit} "
-        f"--enable_cuda_graph 0 "
         f"--cache_store_rdma_mode 1 "
         f"--cache_store_rdma_connect_timeout_ms {rdma_connect_timeout_ms} "
         f"--use_local 1 "
@@ -241,6 +241,7 @@ def build_pure_pd_managers(
     prefill_args = (
         f"{common_args} "
         f"--role_type PREFILL "
+        f"--enable_cuda_graph 0 "
         f"--reuse_cache 1 "
         f"--enable_device_cache 1 "
         f"--enable_memory_cache 1 "
@@ -252,9 +253,11 @@ def build_pure_pd_managers(
             " --block_tree_device_evict_high_watermark_ratio 2e-12"
         )
 
+    decode_cg_flag = 1 if enable_decode_cuda_graph else 0
     decode_args = (
         f"{common_args} "
         f"--role_type DECODE "
+        f"--enable_cuda_graph {decode_cg_flag} "
         f"--reuse_cache 0 "
         f"--enable_device_cache 1 "
         f"--enable_memory_cache 0"
@@ -348,6 +351,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-seq-len", type=int, default=4096)
     parser.add_argument("--max-context-batch-size", type=int, default=8)
     parser.add_argument("--concurrency-limit", type=int, default=16)
+    parser.add_argument(
+        "--enable-decode-cuda-graph",
+        action=argparse.BooleanOptionalAction,
+        default=(os.environ.get("QWEN4_5_ENABLE_DECODE_CUDA_GRAPH", "1").strip() == "1"),
+    )
     parser.add_argument("--reserver-runtime-mem-mb", type=int, default=16384)
     parser.add_argument("--memory-cache-size-mb", type=int, default=32768)
     parser.add_argument("--kv-cache-mem-mb", type=int, default=None)
@@ -394,6 +402,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         rdma_connect_timeout_ms=args.rdma_connect_timeout_ms,
         max_context_batch_size=args.max_context_batch_size,
         concurrency_limit=args.concurrency_limit,
+        enable_decode_cuda_graph=args.enable_decode_cuda_graph,
     )
 
     stop_requested = False

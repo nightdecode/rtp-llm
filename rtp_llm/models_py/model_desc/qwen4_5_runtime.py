@@ -66,6 +66,16 @@ from rtp_llm.models_py.modules.qwen4_5.contracts import (
 # ---------------------------------------------------------------------------
 
 try:
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON = True
+except Exception:  # pragma: no cover - pure-Python / no-triton mode
+    triton = None  # type: ignore[assignment]
+    tl = None  # type: ignore[assignment]
+    _HAS_TRITON = False
+
+try:
     from rtp_llm.models_py.model_desc.module_base import (
         GptModelBase as _RtpGptModelBase,
     )
@@ -473,9 +483,27 @@ def publish_qwen4_5_layer_caches(kv_cache: Any, layer_idx: int, writers: Mapping
 
 def _block_table_for_tag(attention_inputs: Any, tag: str) -> torch.Tensor:
     grp = _select_group_for_tag(attention_inputs, tag)
-    table = getattr(grp, "kv_cache_block_id_device", None)
-    if table is None or table.numel() == 0:
-        table = getattr(grp, "kv_cache_block_id", None)
+    names = (
+        (
+            "kv_cache_kernel_block_id_device",
+            "kv_cache_kernel_block_id",
+            "kv_cache_block_id_device",
+            "kv_cache_block_id",
+        )
+        if bool(getattr(grp, "is_cuda_graph", False))
+        else (
+            "kv_cache_block_id_device",
+            "kv_cache_kernel_block_id_device",
+            "kv_cache_block_id",
+            "kv_cache_kernel_block_id",
+        )
+    )
+    table = None
+    for name in names:
+        cand = getattr(grp, name, None)
+        if cand is not None and cand.numel() > 0:
+            table = cand
+            break
     if table is None or table.ndim != 2:
         raise RuntimeError(f"qwen4_5 paged cache {tag!r} requires a 2D block table")
     return table
@@ -653,6 +681,176 @@ def _pack_linear_block(
     row_fp32[ssm_n:].view(torch.bfloat16)[:conv_n].copy_(conv_flat)
 
 
+if _HAS_TRITON:
+
+    @triton.jit
+    def _write_opaque_rows_triton(
+        dst_ptr,
+        src_ptr,
+        phys_ids_ptr,
+        dst_row_stride: tl.int64,
+        src_row_stride: tl.int64,
+        n_elems,
+        num_blocks: tl.int32,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        phys = tl.load(phys_ids_ptr + row).to(tl.int32)
+        if phys <= 0 or phys >= num_blocks:
+            return
+        offs = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offs < n_elems
+        val = tl.load(src_ptr + row.to(tl.int64) * src_row_stride + offs, mask=mask)
+        tl.store(dst_ptr + phys.to(tl.int64) * dst_row_stride + offs, val, mask=mask)
+
+    @triton.jit
+    def _store_decode_full_attn_kv_triton(
+        pool_ptr,
+        k_ptr,
+        v_ptr,
+        block_table_ptr,
+        seq_before_ptr,
+        s_blk: tl.int64,
+        s_kv: tl.int64,
+        s_h: tl.int64,
+        s_tok: tl.int64,
+        s_d: tl.int64,
+        k_sb: tl.int64,
+        k_sh: tl.int64,
+        k_sd: tl.int64,
+        v_sb: tl.int64,
+        v_sh: tl.int64,
+        v_sd: tl.int64,
+        bt_s0: tl.int64,
+        bt_s1: tl.int64,
+        tpb: tl.int32,
+        max_blocks: tl.int32,
+        num_blocks: tl.int32,
+        head_dim: tl.int32,
+        BLOCK_D: tl.constexpr,
+    ):
+        b = tl.program_id(0)
+        h = tl.program_id(1)
+        pos = tl.load(seq_before_ptr + b).to(tl.int32)
+        if pos < 0:
+            return
+        page = pos // tpb
+        if page >= max_blocks:
+            return
+        slot = pos - page * tpb
+        phys = tl.load(
+            block_table_ptr + b.to(tl.int64) * bt_s0 + page.to(tl.int64) * bt_s1
+        ).to(tl.int32)
+        if phys <= 0 or phys >= num_blocks:
+            return
+        offs_d = tl.arange(0, BLOCK_D)
+        mask_d = offs_d < head_dim
+        k_val = tl.load(
+            k_ptr + b.to(tl.int64) * k_sb + h.to(tl.int64) * k_sh + offs_d * k_sd,
+            mask=mask_d,
+        )
+        v_val = tl.load(
+            v_ptr + b.to(tl.int64) * v_sb + h.to(tl.int64) * v_sh + offs_d * v_sd,
+            mask=mask_d,
+        )
+        dst_base = (
+            phys.to(tl.int64) * s_blk
+            + h.to(tl.int64) * s_h
+            + slot.to(tl.int64) * s_tok
+            + offs_d * s_d
+        )
+        tl.store(pool_ptr + dst_base, k_val, mask=mask_d)
+        tl.store(pool_ptr + dst_base + s_kv, v_val, mask=mask_d)
+
+
+def _store_decode_full_attn_kv_gpu(
+    kv_cache_layer: Any,
+    block_table: torch.Tensor,
+    seq_before_dev: torch.Tensor,
+    k_4d: torch.Tensor,
+    v_4d: torch.Tensor,
+) -> None:
+    if not _HAS_TRITON:
+        raise RuntimeError("Triton is required for GPU paged KV store")
+    from rtp_llm.models_py.modules.factory.attention.common import (
+        reshape_paged_kv_cache,
+    )
+
+    tpb = int(kv_cache_layer.seq_size_per_block)
+    bsz, _, h_kv, head_dim = k_4d.shape
+    max_blocks = int(block_table.shape[1]) if block_table.ndim >= 2 else 0
+    if bsz == 0 or max_blocks == 0:
+        return
+    pool_hnd = reshape_paged_kv_cache(kv_cache_layer.kv_cache_base, h_kv, tpb, head_dim)
+    if int(pool_hnd.shape[2]) != h_kv or int(pool_hnd.shape[3]) != tpb:
+        pool_hnd = pool_hnd.transpose(2, 3)
+    num_blocks = int(pool_hnd.shape[0])
+    k_3d = k_4d[:, 0]
+    v_3d = v_4d[:, 0]
+    s_blk, s_kv, s_h, s_tok, s_d = pool_hnd.stride()
+    block_d = int(triton.next_power_of_2(head_dim))
+    _store_decode_full_attn_kv_triton[(bsz, h_kv)](
+        pool_hnd,
+        k_3d,
+        v_3d,
+        block_table,
+        seq_before_dev,
+        s_blk,
+        s_kv,
+        s_h,
+        s_tok,
+        s_d,
+        int(k_3d.stride(0)),
+        int(k_3d.stride(1)),
+        int(k_3d.stride(2)),
+        int(v_3d.stride(0)),
+        int(v_3d.stride(1)),
+        int(v_3d.stride(2)),
+        int(block_table.stride(0)),
+        int(block_table.stride(1)),
+        tpb,
+        max_blocks,
+        num_blocks,
+        head_dim,
+        BLOCK_D=block_d,
+    )
+
+
+class Qwen4_5DecodeAttnHandle:
+    """Persistent FlashInfer paged-decode handle compatible with ``CudaGraphRunner``."""
+
+    def __init__(
+        self,
+        attn_configs: Any,
+        full_attn_inputs: Any,
+        *,
+        is_cuda_graph: bool = False,
+    ) -> None:
+        from rtp_llm.models_py.modules.factory.attention.cuda_impl.py_flashinfer_mha import (
+            PyFlashinferDecodeAttnOp,
+        )
+
+        self.is_cuda_graph = bool(is_cuda_graph)
+        if bool(getattr(full_attn_inputs, "is_cuda_graph", False)) != self.is_cuda_graph:
+            try:
+                full_attn_inputs.is_cuda_graph = self.is_cuda_graph
+            except Exception:
+                pass
+        self.op = PyFlashinferDecodeAttnOp(attn_configs, full_attn_inputs)
+        self.op.enable_cuda_graph = self.is_cuda_graph
+        self.params = self.op.prepare(full_attn_inputs)
+
+    def support_cuda_graph(self) -> bool:
+        return True
+
+    def prepare_cuda_graph(self, attn_inputs_or_by_tag: Any) -> None:
+        full_inputs = _select_group_for_tag(attn_inputs_or_by_tag, FULL_ATTN_KV_TAG)
+        self.op.prepare_for_cuda_graph_replay(full_inputs)
+
+    def forward(self, q_3d: torch.Tensor, kv_cache_layer: Any) -> torch.Tensor:
+        return self.op.forward(q_3d, kv_cache_layer, self.params)
+
+
 class Qwen4_5PagedStateBridge:
     """Adapts RTP-LLM paged ``KVCache`` pools <-> ``Qwen4_5DecoderLayer`` execution."""
 
@@ -783,6 +981,490 @@ class Qwen4_5PagedStateBridge:
                 phys = _check_phys_block(raw_phys, int(base.shape[0]), tag, layer_idx)
                 _view_opaque_row(base, phys, target_shape, target_dtype).copy_(tensor[b])
 
+    def _read_opaque_batch_gpu(
+        self,
+        cache: Any,
+        block_table: torch.Tensor,
+        seq_before_dev: torch.Tensor,
+        tag: str,
+        layer_idx: int,
+        *,
+        fill_value: int = 0,
+        target_dtype: Optional[torch.dtype] = None,
+    ) -> torch.Tensor:
+        base = cache.kv_cache_base
+        tpb = int(cache.seq_size_per_block)
+        bsz = int(seq_before_dev.shape[0])
+        target_shape, resolved_dtype = self._opaque_target_spec(tag, base, target_dtype)
+        num_blocks = int(base.shape[0])
+        max_blocks = int(block_table.shape[1]) if block_table.ndim >= 2 else 0
+        if bsz == 0 or max_blocks == 0 or num_blocks == 0:
+            if fill_value == 0:
+                return torch.zeros((bsz, *target_shape), dtype=resolved_dtype, device=base.device)
+            return torch.full(
+                (bsz, *target_shape), fill_value, dtype=resolved_dtype, device=base.device
+            )
+
+        pos = seq_before_dev.to(torch.int64)
+        read_page = ((pos - 1).clamp(min=0) // tpb).clamp(max=max_blocks - 1)
+        read_phys = block_table.gather(1, read_page.unsqueeze(1)).squeeze(1).to(torch.int64)
+        valid = (pos > 0) & (read_phys > 0) & (read_phys < num_blocks)
+        safe_phys = read_phys.clamp(min=0, max=num_blocks - 1)
+
+        elem_size = torch.empty((), dtype=resolved_dtype).element_size()
+        need_bytes = math.prod(target_shape) * elem_size
+        base_u8 = base.reshape(num_blocks, -1).view(torch.uint8)
+        if int(base_u8.shape[1]) < need_bytes:
+            raise RuntimeError(
+                f"Opaque pool row too small: {base_u8.shape[1]} bytes < {need_bytes} bytes "
+                f"for tag={tag} layer={layer_idx} shape={target_shape} dtype={resolved_dtype}"
+            )
+        gathered = (
+            base_u8[:, :need_bytes]
+            .index_select(0, safe_phys)
+            .view(resolved_dtype)
+            .reshape(bsz, *target_shape)
+            .contiguous()
+        )
+        valid_bc = valid.view(bsz, *([1] * len(target_shape)))
+        return gathered.masked_fill_(~valid_bc, fill_value)
+
+    def _write_opaque_batch_gpu(
+        self,
+        cache: Any,
+        block_table: torch.Tensor,
+        seq_before_dev: torch.Tensor,
+        tensor: torch.Tensor,
+        tag: str,
+        layer_idx: int,
+    ) -> None:
+        if not _HAS_TRITON:
+            raise RuntimeError("Triton is required for GPU opaque state writes")
+        base = cache.kv_cache_base
+        tpb = int(cache.seq_size_per_block)
+        bsz = int(seq_before_dev.shape[0])
+        num_blocks = int(base.shape[0])
+        max_blocks = int(block_table.shape[1]) if block_table.ndim >= 2 else 0
+        if bsz == 0 or max_blocks == 0 or num_blocks == 0:
+            return
+
+        new_last = seq_before_dev.to(torch.int64).clamp(min=0)
+        write_page = (new_last // tpb).clamp(max=max_blocks - 1)
+        write_phys = block_table.gather(1, write_page.unsqueeze(1)).squeeze(1).to(torch.int32)
+        write_phys = torch.where(seq_before_dev >= 0, write_phys, 0)
+
+        src_u8 = tensor.contiguous().reshape(bsz, -1).view(torch.uint8)
+        need_bytes = int(src_u8.shape[1])
+        base_u8 = base.reshape(num_blocks, -1).view(torch.uint8)
+        if int(base_u8.shape[1]) < need_bytes:
+            raise RuntimeError(
+                f"Opaque pool row too small for write: {base_u8.shape[1]} bytes < {need_bytes} bytes "
+                f"for tag={tag} layer={layer_idx}"
+            )
+        if (
+            need_bytes % 4 == 0
+            and int(base_u8.shape[1]) % 4 == 0
+            and int(base_u8.stride(0)) % 4 == 0
+            and int(src_u8.stride(0)) % 4 == 0
+            and base_u8.data_ptr() % 4 == 0
+            and src_u8.data_ptr() % 4 == 0
+        ):
+            dst_view = base_u8.view(torch.int32)
+            src_view = src_u8.view(torch.int32)
+            n_elems = need_bytes // 4
+        else:
+            dst_view = base_u8
+            src_view = src_u8
+            n_elems = need_bytes
+
+        block_sz = 1024
+        grid = (bsz, int(triton.cdiv(n_elems, block_sz)))
+        _write_opaque_rows_triton[grid](
+            dst_view,
+            src_view,
+            write_phys,
+            int(dst_view.stride(0)),
+            int(src_view.stride(0)),
+            n_elems,
+            num_blocks,
+            BLOCK_SIZE=block_sz,
+        )
+
+    def _run_decode_batch_gpu(
+        self,
+        model: Qwen4_5Model,
+        input_ids_2d: torch.Tensor,
+        positions_2d: torch.Tensor,
+        kv_cache: Any,
+        attention_inputs: Any,
+        *,
+        seq_lens_before_dev: torch.Tensor,
+        decode_attn_handle: Qwen4_5DecodeAttnHandle,
+        enable_yoco_decode: Optional[bool] = None,
+    ) -> torch.Tensor:
+        """CUDA-graph-safe zero-sync Decode path backed by FlashInfer & Triton."""
+        device = input_ids_2d.device
+        dtype = model.embed_tokens.weight.dtype
+        bsz = int(input_ids_2d.shape[0])
+        yoco_on = (
+            self.cfg.enable_yoco_decode
+            if enable_yoco_decode is None
+            else bool(enable_yoco_decode)
+        )
+
+        emb = model.embed_tokens(input_ids_2d)
+        hyper_hidden = emb.repeat(1, 1, self.cfg.hc_count)
+        prev_latent: Optional[torch.Tensor] = None
+        deferred: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        shared_gdn: Dict[int, Any] = {}
+        full_kv_layer_caches: Dict[int, Any] = {}
+
+        for layer in model.layers:
+            assert isinstance(layer, Qwen4_5DecoderLayer)
+            lid = layer.layer_idx
+            layer_caches = {str(c.tag): c for c in kv_cache.get_layer_cache_groups(lid)}
+
+            # 1. Optional PLE
+            if layer.ple is not None:
+                if deferred is not None:
+                    hyper_hidden = layer.attn_hyper_connection.combine(
+                        deferred[0], hyper_hidden, deferred[1]
+                    )
+                    deferred = None
+                ple_st_cache = layer_caches[PLE_STATE_TAG]
+                ple_ctx_cache = layer_caches[PLE_NGRAM_CTX_TAG]
+                bt_st = _block_table_for_tag(attention_inputs, PLE_STATE_TAG)
+                bt_ctx = _block_table_for_tag(attention_inputs, PLE_NGRAM_CTX_TAG)
+                ple_state = PLELayerState(
+                    ngram_context=self._read_opaque_batch_gpu(
+                        ple_ctx_cache,
+                        bt_ctx,
+                        seq_lens_before_dev,
+                        PLE_NGRAM_CTX_TAG,
+                        lid,
+                        fill_value=self.cfg.eos_token_id,
+                    ),
+                    conv_state=self._read_opaque_batch_gpu(
+                        ple_st_cache,
+                        bt_st,
+                        seq_lens_before_dev,
+                        PLE_STATE_TAG,
+                        lid,
+                        target_dtype=dtype,
+                    ),
+                )
+                hyper_hidden = layer.ple(hyper_hidden, input_ids_2d, state=ple_state)
+                self._write_opaque_batch_gpu(
+                    ple_st_cache, bt_st, seq_lens_before_dev, ple_state.conv_state, PLE_STATE_TAG, lid
+                )
+                self._write_opaque_batch_gpu(
+                    ple_ctx_cache,
+                    bt_ctx,
+                    seq_lens_before_dev,
+                    ple_state.ngram_context,
+                    PLE_NGRAM_CTX_TAG,
+                    lid,
+                )
+
+            # 2. Attn Hyper-Connection
+            if deferred is None:
+                attn_in, hyper_hidden, attn_inj, prev_latent = (
+                    layer.attn_hyper_connection.mix_with_latent(hyper_hidden, prev_latent)
+                )
+            else:
+                attn_in, hyper_hidden, attn_inj, prev_latent = (
+                    layer.attn_hyper_connection.combine_and_mix_with_latent(
+                        deferred[0], hyper_hidden, deferred[1], prev_latent
+                    )
+                )
+                deferred = None
+
+            # 3. Attention (Linear GDN or Full MQA-1)
+            if layer.layer_type == "linear_attention":
+                assert layer.linear_attn is not None
+                if layer.is_consumer:
+                    q_state: Optional[GDNLayerState] = None
+                    bt_q = None
+                    if GDN_SSM_STATE_TAG in layer_caches:
+                        c_ssm = layer_caches[GDN_SSM_STATE_TAG]
+                        bt_ssm = _block_table_for_tag(attention_inputs, GDN_SSM_STATE_TAG)
+                        ssm_buf = self._read_opaque_batch_gpu(
+                            c_ssm,
+                            bt_ssm,
+                            seq_lens_before_dev,
+                            GDN_SSM_STATE_TAG,
+                            lid,
+                            target_dtype=torch.float32,
+                        )
+                        if GDN_CONV_STATE_TAG in layer_caches:
+                            c_conv = layer_caches[GDN_CONV_STATE_TAG]
+                            bt_q = _block_table_for_tag(attention_inputs, GDN_CONV_STATE_TAG)
+                            q_conv_buf = self._read_opaque_batch_gpu(
+                                c_conv,
+                                bt_q,
+                                seq_lens_before_dev,
+                                GDN_CONSUMER_Q_CONV_TAG,
+                                lid,
+                                target_dtype=dtype,
+                            )
+                        else:
+                            q_conv_buf = torch.zeros(
+                                (bsz, *self.gdn_consumer_conv_shape), dtype=dtype, device=device
+                            )
+                        q_state = GDNLayerState(conv_state=q_conv_buf, ssm_state=ssm_buf)
+                    elif GDN_CONSUMER_Q_CONV_TAG in layer_caches:
+                        c_q = layer_caches[GDN_CONSUMER_Q_CONV_TAG]
+                        bt_q = _block_table_for_tag(attention_inputs, GDN_CONSUMER_Q_CONV_TAG)
+                        q_conv_buf = self._read_opaque_batch_gpu(
+                            c_q,
+                            bt_q,
+                            seq_lens_before_dev,
+                            GDN_CONSUMER_Q_CONV_TAG,
+                            lid,
+                            target_dtype=dtype,
+                        )
+                        q_state = GDNLayerState(
+                            conv_state=q_conv_buf,
+                            ssm_state=(
+                                None
+                                if yoco_on
+                                else torch.zeros(
+                                    (bsz, *self.ssm_shape), dtype=torch.float32, device=device
+                                )
+                            ),
+                        )
+                    else:
+                        raise RuntimeError(
+                            f"Unsupported linear consumer cache layout at layer {lid}: {list(layer_caches.keys())}"
+                        )
+                    shared_in = shared_gdn[layer.source_layer_idx]  # type: ignore[index]
+                    attn_out, _ = layer.linear_attn(
+                        attn_in,
+                        state=q_state,
+                        shared=shared_in,
+                        enable_yoco_decode=yoco_on,
+                    )
+                    if q_state is not None and GDN_SSM_STATE_TAG in layer_caches:
+                        assert q_state.ssm_state is not None
+                        bt_ssm = _block_table_for_tag(attention_inputs, GDN_SSM_STATE_TAG)
+                        self._write_opaque_batch_gpu(
+                            layer_caches[GDN_SSM_STATE_TAG],
+                            bt_ssm,
+                            seq_lens_before_dev,
+                            q_state.ssm_state,
+                            GDN_SSM_STATE_TAG,
+                            lid,
+                        )
+                        if GDN_CONV_STATE_TAG in layer_caches and bt_q is not None:
+                            self._write_opaque_batch_gpu(
+                                layer_caches[GDN_CONV_STATE_TAG],
+                                bt_q,
+                                seq_lens_before_dev,
+                                q_state.conv_state,
+                                GDN_CONV_STATE_TAG,
+                                lid,
+                            )
+                    elif q_state is not None and GDN_CONSUMER_Q_CONV_TAG in layer_caches and bt_q is not None:
+                        self._write_opaque_batch_gpu(
+                            layer_caches[GDN_CONSUMER_Q_CONV_TAG],
+                            bt_q,
+                            seq_lens_before_dev,
+                            q_state.conv_state,
+                            GDN_CONSUMER_Q_CONV_TAG,
+                            lid,
+                        )
+                else:
+                    if GDN_SSM_STATE_TAG not in layer_caches:
+                        raise RuntimeError(
+                            f"Unsupported linear cache layout at layer {lid}: {list(layer_caches.keys())}"
+                        )
+                    c_ssm = layer_caches[GDN_SSM_STATE_TAG]
+                    bt_ssm = _block_table_for_tag(attention_inputs, GDN_SSM_STATE_TAG)
+                    ssm_buf = self._read_opaque_batch_gpu(
+                        c_ssm,
+                        bt_ssm,
+                        seq_lens_before_dev,
+                        GDN_SSM_STATE_TAG,
+                        lid,
+                        target_dtype=torch.float32,
+                    )
+                    if GDN_CONV_STATE_TAG in layer_caches:
+                        c_conv = layer_caches[GDN_CONV_STATE_TAG]
+                        bt_conv = _block_table_for_tag(attention_inputs, GDN_CONV_STATE_TAG)
+                        conv_buf = self._read_opaque_batch_gpu(
+                            c_conv,
+                            bt_conv,
+                            seq_lens_before_dev,
+                            GDN_CONV_STATE_TAG,
+                            lid,
+                            target_dtype=dtype,
+                        )
+                    else:
+                        bt_conv = None
+                        conv_buf = torch.zeros(
+                            (bsz, *self.gdn_conv_shape), dtype=dtype, device=device
+                        )
+                    gdn_state = GDNLayerState(conv_state=conv_buf, ssm_state=ssm_buf)
+                    attn_out, published = layer.linear_attn(
+                        attn_in,
+                        state=gdn_state,
+                        shared=None,
+                        enable_yoco_decode=yoco_on,
+                    )
+                    if published is not None:
+                        shared_gdn[lid] = published
+                    assert gdn_state.ssm_state is not None
+                    self._write_opaque_batch_gpu(
+                        c_ssm,
+                        bt_ssm,
+                        seq_lens_before_dev,
+                        gdn_state.ssm_state,
+                        GDN_SSM_STATE_TAG,
+                        lid,
+                    )
+                    if GDN_CONV_STATE_TAG in layer_caches and bt_conv is not None:
+                        self._write_opaque_batch_gpu(
+                            layer_caches[GDN_CONV_STATE_TAG],
+                            bt_conv,
+                            seq_lens_before_dev,
+                            gdn_state.conv_state,
+                            GDN_CONV_STATE_TAG,
+                            lid,
+                        )
+            else:
+                assert layer.self_attn is not None
+                if not layer.is_consumer:
+                    kv_c = layer_caches[FULL_ATTN_KV_TAG]
+                    sc_c = layer_caches.get(FULL_ATTN_KV_SCONV_TAG)
+                    bt_kv = _block_table_for_tag(attention_inputs, FULL_ATTN_KV_TAG)
+                    k_sc_st: Optional[ShortConvState] = None
+                    v_sc_st: Optional[ShortConvState] = None
+                    bt_sc = None
+                    if sc_c is not None:
+                        bt_sc = _block_table_for_tag(attention_inputs, FULL_ATTN_KV_SCONV_TAG)
+                        kv_sc_buf = self._read_opaque_batch_gpu(
+                            sc_c,
+                            bt_sc,
+                            seq_lens_before_dev,
+                            FULL_ATTN_KV_SCONV_TAG,
+                            lid,
+                            target_dtype=dtype,
+                        )
+                        k_sc_st = ShortConvState(kv_sc_buf[:, 0].clone())
+                        v_sc_st = ShortConvState(kv_sc_buf[:, 1].clone())
+
+                    attn_out = layer.self_attn.forward_paged_decode(
+                        attn_in,
+                        positions_2d,
+                        kv_c,
+                        decode_attn_handle.forward,
+                        block_table=bt_kv,
+                        seq_before_dev=seq_lens_before_dev,
+                        k_sconv_state=k_sc_st,
+                        v_sconv_state=v_sc_st,
+                        write_kv_fn=_store_decode_full_attn_kv_gpu,
+                    )
+                    full_kv_layer_caches[lid] = kv_c
+                    if (
+                        sc_c is not None
+                        and bt_sc is not None
+                        and k_sc_st is not None
+                        and v_sc_st is not None
+                    ):
+                        packed_sc = torch.stack(
+                            [k_sc_st.conv_state, v_sc_st.conv_state], dim=1
+                        )
+                        self._write_opaque_batch_gpu(
+                            sc_c,
+                            bt_sc,
+                            seq_lens_before_dev,
+                            packed_sc,
+                            FULL_ATTN_KV_SCONV_TAG,
+                            lid,
+                        )
+                else:
+                    src_kv_c = full_kv_layer_caches[layer.kv_cache_owner]
+                    attn_out = layer.self_attn.forward_paged_decode(
+                        attn_in,
+                        positions_2d,
+                        src_kv_c,
+                        decode_attn_handle.forward,
+                    )
+
+            # 4. Attention Output ShortConv
+            if layer.attn_output_sconv is not None:
+                tag_out = (
+                    LINEAR_ATTN_OUTPUT_SCONV_TAG
+                    if layer.layer_type == "linear_attention"
+                    else FULL_ATTN_OUTPUT_SCONV_TAG
+                )
+                c_ao = layer_caches[tag_out]
+                bt_ao = _block_table_for_tag(attention_inputs, tag_out)
+                ao_state = ShortConvState(
+                    self._read_opaque_batch_gpu(
+                        c_ao,
+                        bt_ao,
+                        seq_lens_before_dev,
+                        tag_out,
+                        lid,
+                        target_dtype=dtype,
+                    )
+                )
+                attn_out = layer.attn_output_sconv(attn_out, state=ao_state)
+                self._write_opaque_batch_gpu(
+                    c_ao,
+                    bt_ao,
+                    seq_lens_before_dev,
+                    ao_state.conv_state,
+                    tag_out,
+                    lid,
+                )
+            if self.cfg.clip_attn_output is not None:
+                attn_out = attn_out.clamp(-self.cfg.clip_attn_output, self.cfg.clip_attn_output)
+
+            # 5. MLP Hyper-Connection + MLP
+            mlp_in, hyper_hidden, mlp_inj, prev_latent = (
+                layer.mlp_hyper_connection.combine_and_mix_with_latent(
+                    attn_out, hyper_hidden, attn_inj, prev_latent
+                )
+            )
+            assert mlp_inj is not None
+            mlp_out = layer.mlp(mlp_in)
+
+            # 6. FFN Output ShortConv + clamp
+            if layer.ffn_output_sconv is not None:
+                c_fo = layer_caches[FFN_OUTPUT_SCONV_TAG]
+                bt_fo = _block_table_for_tag(attention_inputs, FFN_OUTPUT_SCONV_TAG)
+                fo_state = ShortConvState(
+                    self._read_opaque_batch_gpu(
+                        c_fo,
+                        bt_fo,
+                        seq_lens_before_dev,
+                        FFN_OUTPUT_SCONV_TAG,
+                        lid,
+                        target_dtype=dtype,
+                    )
+                )
+                mlp_out = layer.ffn_output_sconv(mlp_out, state=fo_state)
+                self._write_opaque_batch_gpu(
+                    c_fo,
+                    bt_fo,
+                    seq_lens_before_dev,
+                    fo_state.conv_state,
+                    FFN_OUTPUT_SCONV_TAG,
+                    lid,
+                )
+            if self.cfg.clip_mlp_output is not None:
+                mlp_out = mlp_out.clamp(-self.cfg.clip_mlp_output, self.cfg.clip_mlp_output)
+
+            deferred = (mlp_out, mlp_inj)
+
+        assert deferred is not None
+        hidden, _, _, _ = model.hyper_connection_mixer.combine_and_mix_with_latent(
+            deferred[0], hyper_hidden, deferred[1], prev_latent=None
+        )
+        return hidden.reshape(bsz, self.cfg.hidden_size)
+
     def run_decode_batch(
         self,
         model: Qwen4_5Model,
@@ -792,10 +1474,29 @@ class Qwen4_5PagedStateBridge:
         attention_inputs: Any,
         writers: Mapping[str, Any],
         *,
-        seq_lens_before: List[int],
+        seq_lens_before: Optional[List[int]] = None,
+        seq_lens_before_dev: Optional[torch.Tensor] = None,
+        decode_attn_handle: Optional[Any] = None,
         enable_yoco_decode: Optional[bool] = None,
     ) -> torch.Tensor:
         """Vectorized Decode path ([B, 1]) backed directly by paged ``KVCache`` pools."""
+        if (
+            seq_lens_before_dev is not None
+            and isinstance(decode_attn_handle, Qwen4_5DecodeAttnHandle)
+            and input_ids_2d.device.type == "cuda"
+            and _HAS_TRITON
+        ):
+            return self._run_decode_batch_gpu(
+                model,
+                input_ids_2d,
+                positions_2d,
+                kv_cache,
+                attention_inputs,
+                seq_lens_before_dev=seq_lens_before_dev,
+                decode_attn_handle=decode_attn_handle,
+                enable_yoco_decode=enable_yoco_decode,
+            )
+        assert seq_lens_before is not None
         device = input_ids_2d.device
         dtype = model.embed_tokens.weight.dtype
         bsz = int(input_ids_2d.shape[0])
@@ -1990,8 +2691,54 @@ class Qwen4_5RTPModel(_RtpGptModelBase):
         self.kv_cache = getattr(init_resource, "kv_cache", None)
         return True
 
-    def prepare_fmha_impl(self, inputs: Any, is_cuda_graph: bool = False) -> Dict[str, Any]:
-        return {}
+    def prepare_fmha_impl(self, inputs: Any, is_cuda_graph: bool = False) -> Any:
+        if self.kv_cache is None or isinstance(self.kv_cache, LocalKVCache):
+            return None
+        flat_ids = getattr(inputs, "input_ids", None)
+        if flat_ids is None or flat_ids.device.type != "cuda":
+            return None
+        attn_by_tag = getattr(inputs, "attention_inputs_by_tag", None)
+        attn_inputs = (
+            attn_by_tag
+            if isinstance(attn_by_tag, Mapping) and len(attn_by_tag) > 0
+            else getattr(inputs, "attention_inputs", None)
+        )
+        if attn_inputs is None:
+            return None
+        primary = _select_group_for_tag(attn_inputs, FULL_ATTN_KV_TAG)
+        if bool(getattr(primary, "is_prefill", False)) or bool(
+            getattr(primary, "is_target_verify", False)
+        ):
+            return None
+
+        full_caches = [
+            c
+            for lid in range(len(self.model.layers))
+            for c in self.kv_cache.get_layer_cache_groups(lid)
+            if str(c.tag) == FULL_ATTN_KV_TAG
+        ]
+        if not full_caches:
+            return None
+        tpb = int(full_caches[0].seq_size_per_block)
+
+        from rtp_llm.ops import AttentionConfigs, KvCacheDataType
+
+        attn_cfg = AttentionConfigs()
+        attn_cfg.head_num = int(self.arch_config.num_attention_heads)
+        attn_cfg.kv_head_num = int(self.arch_config.num_key_value_heads)
+        attn_cfg.size_per_head = int(self.arch_config.head_dim)
+        attn_cfg.tokens_per_block = tpb
+        attn_cfg.kernel_tokens_per_block = tpb
+        attn_cfg.dtype = self.model.embed_tokens.weight.dtype
+        src_attn = getattr(self.config, "attn_config", None)
+        if src_attn is not None and getattr(src_attn, "kv_cache_dtype", None) is not None:
+            attn_cfg.kv_cache_dtype = src_attn.kv_cache_dtype
+        else:
+            attn_cfg.kv_cache_dtype = KvCacheDataType.BASE
+        attn_cfg.is_causal = True
+        attn_cfg.use_mla = False
+        attn_cfg.need_rope_kv_cache = False
+        return Qwen4_5DecodeAttnHandle(attn_cfg, primary, is_cuda_graph=is_cuda_graph)
 
     def _wrap_outputs(self, hidden: torch.Tensor) -> Any:
         if _RtpPyModelOutputs is not None and _HAS_COMPILED_GPT_BASE:
@@ -2056,7 +2803,7 @@ class Qwen4_5RTPModel(_RtpGptModelBase):
             prepare_qwen4_5_cache_store_writers(
                 attn_inputs, self.kv_cache, layer_count=len(self.model.layers)
             )
-            if self.kv_cache is not None
+            if is_prefill and self.kv_cache is not None
             else {}
         )
 
@@ -2085,6 +2832,51 @@ class Qwen4_5RTPModel(_RtpGptModelBase):
                     enable_yoco_decode=enable_yoco_decode,
                 )
                 return self._wrap_outputs(hidden)
+
+            if (
+                device.type == "cuda"
+                and self.kv_cache is not None
+                and not isinstance(self.kv_cache, LocalKVCache)
+                and _HAS_TRITON
+            ):
+                bsz = int(flat_ids.numel())
+                ids_2d = flat_ids.view(bsz, 1)
+                seq_plus_1_dev = getattr(primary, "sequence_lengths_plus_1_device", None)
+                if (
+                    seq_plus_1_dev is not None
+                    and seq_plus_1_dev.is_cuda
+                    and int(seq_plus_1_dev.numel()) == bsz
+                ):
+                    seq_before_dev = seq_plus_1_dev.to(torch.int32) - 1
+                else:
+                    seq_before_dev = primary.sequence_lengths.to(
+                        device=device, dtype=torch.int32
+                    )
+                pos = getattr(inputs, "combo_position_ids", None)
+                if pos is None or (isinstance(pos, torch.Tensor) and pos.numel() == 0):
+                    pos = getattr(primary, "combo_position_ids", None)
+                if isinstance(pos, torch.Tensor) and pos.numel() == bsz:
+                    pos_2d = pos.to(device=device, dtype=torch.int64).view(bsz, 1)
+                else:
+                    pos_2d = seq_before_dev.to(torch.int64).view(bsz, 1)
+                handle = (
+                    fmha_impl
+                    if isinstance(fmha_impl, Qwen4_5DecodeAttnHandle)
+                    else self.prepare_fmha_impl(inputs, is_cuda_graph=False)
+                )
+                hidden = self.bridge.run_decode_batch(
+                    self.model,
+                    ids_2d,
+                    pos_2d,
+                    self.kv_cache,
+                    attn_inputs,
+                    writers,
+                    seq_lens_before_dev=seq_before_dev,
+                    decode_attn_handle=handle,
+                    enable_yoco_decode=enable_yoco_decode,
+                )
+                return self._wrap_outputs(hidden)
+
             seq_before = [int(x) for x in primary.sequence_lengths.tolist()]
             bsz = len(seq_before)
             ids_2d = flat_ids.view(bsz, 1)

@@ -678,6 +678,92 @@ class Qwen4_5Attention(nn.Module):
         out_flat = attn_out.reshape(bsz, seq_len, self.num_heads * self.head_dim)
         return self.o_proj(out_flat)
 
+    def forward_paged_decode(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        kv_cache_layer: Any,
+        decode_attn_fn: Callable[[torch.Tensor, Any], torch.Tensor],
+        *,
+        block_table: Optional[torch.Tensor] = None,
+        seq_before_dev: Optional[torch.Tensor] = None,
+        k_sconv_state: Optional[ShortConvState] = None,
+        v_sconv_state: Optional[ShortConvState] = None,
+        write_kv_fn: Optional[
+            Callable[[Any, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], None]
+        ] = None,
+    ) -> torch.Tensor:
+        """CUDA-graph-safe B*1 paged decode path for producer and YoCo consumer layers."""
+        bsz, seq_len, _ = hidden_states.shape
+        if seq_len != 1:
+            raise ValueError(f"forward_paged_decode expects seq_len=1, got {seq_len}")
+        pos = positions.unsqueeze(1) if positions.ndim == 1 else positions
+
+        q_packed = self.q_proj(hidden_states)
+        if self.attn_output_gate:
+            q, gate = q_packed.unflatten(-1, (self.num_heads, self.head_dim * 2)).chunk(
+                2, dim=-1
+            )
+        else:
+            q = q_packed.unflatten(-1, (self.num_heads, self.head_dim))
+            gate = None
+
+        q = gemma_rmsnorm_and_partial_rope(
+            q,
+            self.q_norm.weight,
+            pos,
+            self.inv_freq,
+            self.rotary_dim,
+            eps=self.rms_norm_eps,
+        )
+
+        if not self.is_consumer:
+            assert (
+                self.k_proj is not None
+                and self.v_proj is not None
+                and self.k_norm is not None
+                and write_kv_fn is not None
+                and block_table is not None
+                and seq_before_dev is not None
+            )
+            k_raw = self.k_proj(hidden_states)
+            v_raw = self.v_proj(hidden_states)
+            if self.use_kv_sconv:
+                if self.k_sconv is not None:
+                    k_raw = causal_dwconv1d(
+                        k_raw,
+                        self.k_sconv.weight,
+                        state=k_sconv_state,
+                        residual=self.kv_sconv_residual,
+                        use_silu=self.kv_sconv_use_activation,
+                    )
+                if self.v_sconv is not None:
+                    v_raw = causal_dwconv1d(
+                        v_raw,
+                        self.v_sconv.weight,
+                        state=v_sconv_state,
+                        residual=self.kv_sconv_residual,
+                        use_silu=self.kv_sconv_use_activation,
+                    )
+
+            k = k_raw.unflatten(-1, (self.num_kv_heads, self.head_dim))
+            v = v_raw.unflatten(-1, (self.num_kv_heads, self.head_dim))
+            k = gemma_rmsnorm_and_partial_rope(
+                k,
+                self.k_norm.weight,
+                pos,
+                self.inv_freq,
+                self.rotary_dim,
+                eps=self.rms_norm_eps,
+            )
+            write_kv_fn(kv_cache_layer, block_table, seq_before_dev, k, v)
+
+        attn_out = decode_attn_fn(q.squeeze(1), kv_cache_layer).unsqueeze(1)
+        if gate is not None:
+            attn_out = attn_out * torch.sigmoid(gate)
+        out_flat = attn_out.reshape(bsz, seq_len, self.num_heads * self.head_dim)
+        return self.o_proj(out_flat)
+
 
 __all__ = [
     "GemmaRMSNorm",

@@ -68,7 +68,7 @@ class Qwen4_5(_BaseModel):
         return False
 
     def support_cuda_graph(self) -> bool:
-        return False
+        return True
 
     def _py_model_class(self) -> Any:
         from rtp_llm.models_py.model_desc.qwen4_5_runtime import Qwen4_5RTPModel
@@ -191,6 +191,10 @@ class Qwen4_5(_BaseModel):
             attn.head_num = arch_cfg.num_attention_heads
             attn.kv_head_num = arch_cfg.num_key_value_heads
             attn.size_per_head = arch_cfg.head_dim
+            if getattr(attn, "dtype", None) is None:
+                import torch
+
+                attn.dtype = torch.bfloat16
 
         model_config.hc_mult = arch_cfg.hc_count
         model_config.has_lm_head = True

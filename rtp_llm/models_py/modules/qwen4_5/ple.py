@@ -666,6 +666,7 @@ class Qwen4_5PLELayer(nn.Module):
         self._table_enable_cpu_uva: bool = True
         self._pointer_cache_device: Optional[torch.device] = None
         self._pointer_table: Optional[torch.Tensor] = None
+        self._weight_scale_cuda: Optional[torch.Tensor] = None
         self._cpu_uva_active: bool = False
 
         # Inference cache for fused [key_proj.weight; value_proj.weight]
@@ -785,10 +786,12 @@ class Qwen4_5PLELayer(nn.Module):
         shards = self._ngram_shards
         self._pointer_cache_device = target_device
         self._pointer_table = None
+        self._weight_scale_cuda = None
         self._cpu_uva_active = False
 
         if target_device.type != "cuda":
             return None
+        self._weight_scale_cuda = self.weight_scale.to(device=target_device)
 
         table_device = shards[0].device
         if table_device == target_device:
@@ -922,7 +925,12 @@ class Qwen4_5PLELayer(nn.Module):
 
         ptr_table = self._ensure_pointer_table(target_device)
         if ptr_table is not None:
-            scale = self.weight_scale.to(device=target_device)
+            scale = (
+                self._weight_scale_cuda
+                if self._weight_scale_cuda is not None
+                and self._weight_scale_cuda.device == target_device
+                else self.weight_scale.to(device=target_device)
+            )
             gathered = ple_gather_fp8_triton(
                 ngram_ids,
                 ptr_table,

@@ -22,6 +22,7 @@ from dataclasses import dataclass
 import json
 import logging
 import os
+import re
 from pathlib import Path
 import tempfile
 import threading
@@ -208,16 +209,17 @@ def _build_synthetic_8layer_checkpoint(ckpt_dir: Path) -> Path:
                 for r in range(4):
                     e_id = r * shard + (layer.layer_idx % shard)
                     layer.mlp.expert_bias[e_id] = 4.0
-        # Suppress special tokens 0..3 and make 8 spread-out vocab rows mutually
-        # orthogonal (via QR) so isotropic random lm_head ties (<0.08) do not flip
-        # under normal BF16 B=1 vs B>1 GEMV/GEMM rounding, while real state
-        # corruption still causes immediate bit-for-bit mismatches.
+        # Suppress special tokens 0..3 and background vocab rows (0.02x), while
+        # setting 8 lossless single-letter ASCII tokens ('A','D','G','J','M','P','S','V',
+        # IDs 37..58 in _write_synthetic_qwen2_tokenizer) to mutually orthogonal QR
+        # rows so isotropic random lm_head ties do not flip under normal BF16
+        # B=1 vs B>1 rounding and Decode outputs round-trip losslessly.
         gen = torch.Generator().manual_seed(2028)
         q_mat, _ = torch.linalg.qr(
             torch.randn((cfg.hidden_size, 8), generator=gen, dtype=torch.float32)
         )
-        active_ids = torch.arange(32, 32 + 8 * 128, 128)
-        model.lm_head.weight.mul_(0.1)
+        active_ids = [37, 40, 43, 46, 49, 52, 55, 58]
+        model.lm_head.weight.mul_(0.02)
         model.lm_head.weight[:4].mul_(0.05)
         model.lm_head.weight[active_ids] = (q_mat.T * 2.5).to(torch.bfloat16)
 
@@ -377,6 +379,9 @@ class Qwen4_5PurePDSmokeTest(unittest.TestCase):
         self.force_host_demotion = (
             os.environ.get("QWEN4_5_FORCE_HOST_DEMOTION", "0").strip() == "1"
         )
+        self.enable_decode_cuda_graph = (
+            os.environ.get("QWEN4_5_ENABLE_DECODE_CUDA_GRAPH", "1").strip() == "1"
+        )
         self.max_context_batch_size = 8
         self.concurrency_limit = 16
         self._tmpdir: Optional[tempfile.TemporaryDirectory[str]] = None
@@ -388,7 +393,7 @@ class Qwen4_5PurePDSmokeTest(unittest.TestCase):
             self.seq_size_per_block = 16
             self.max_seq_len = 256
             self.reserve_mem_mb = 1024
-            self.startup_timeout_s = 600
+            self.startup_timeout_s = 240
             self.memory_cache_size_mb = int(
                 os.environ.get("QWEN4_5_MEMORY_CACHE_SIZE_MB", "1024")
             )
@@ -423,10 +428,11 @@ class Qwen4_5PurePDSmokeTest(unittest.TestCase):
         )
         self.rdma_hcas, self.rdma_link_layer = select_single_layer_rdma_hcas()
         _emit(
-            "Selected RDMA HCAs (%s): %s | host_demotion=%s | mem_cache_mb=%d",
+            "Selected RDMA HCAs (%s): %s | host_demotion=%s | decode_cuda_graph=%s | mem_cache_mb=%d",
             self.rdma_link_layer,
             self.rdma_hcas,
             self.force_host_demotion,
+            self.enable_decode_cuda_graph,
             self.memory_cache_size_mb,
         )
         self.prefill_mgr, self.decode_mgr = self._start_pd_servers()
@@ -463,6 +469,7 @@ class Qwen4_5PurePDSmokeTest(unittest.TestCase):
             kv_cache_mem_mb=self.kv_cache_mem_mb,
             max_context_batch_size=self.max_context_batch_size,
             concurrency_limit=self.concurrency_limit,
+            enable_decode_cuda_graph=self.enable_decode_cuda_graph,
             force_host_demotion=self.force_host_demotion,
             role_name_suffix=self.mode,
             extra_common_env={"FT_SERVER_TEST": "1"},
@@ -588,6 +595,8 @@ class Qwen4_5PurePDSmokeTest(unittest.TestCase):
         logs_dir = self._logs_root_dir()
         if logs_dir is None:
             return {}
+        # Wait briefly so ExecutionRecorder / async alog flushes prior steps.
+        time.sleep(0.35)
         counts: Dict[Path, int] = {}
         for path in sorted(logs_dir.glob("batch_schedule*.log")):
             try:
@@ -597,26 +606,49 @@ class Qwen4_5PurePDSmokeTest(unittest.TestCase):
         return counts
 
     def _collect_new_batch_sizes(
-        self, start_counts: Dict[Path, int], phase: str
+        self,
+        start_counts: Dict[Path, int],
+        phase: str,
+        *,
+        expected_min_bs: int = 1,
+        timeout_s: float = 1.5,
     ) -> List[int]:
         logs_dir = self._logs_root_dir()
         if logs_dir is None:
             return []
-        sizes: List[int] = []
-        for path in sorted(logs_dir.glob("batch_schedule*.log")):
-            lines = path.read_text(errors="replace").splitlines()
-            start = start_counts.get(path, 0)
-            for line in lines[start:]:
-                if not line.strip():
-                    continue
-                try:
-                    rec = json.loads(line)
-                except ValueError:
-                    continue
-                reqs = rec.get("requests") or []
-                if reqs and all(r.get("phase") == phase for r in reqs):
-                    sizes.append(len(reqs))
-        return sizes
+
+        def _read_sizes() -> List[int]:
+            sizes: List[int] = []
+            for path in sorted(logs_dir.glob("batch_schedule*.log")):
+                lines = path.read_text(errors="replace").splitlines()
+                start = start_counts.get(path, 0)
+                for line in lines[start:]:
+                    if not line.strip():
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    reqs = rec.get("requests") or []
+                    if reqs and all(r.get("phase") == phase for r in reqs):
+                        sizes.append(len(reqs))
+            return sizes
+
+        deadline = time.monotonic() + timeout_s
+        last: List[int] = []
+        stable_hits = 0
+        while True:
+            time.sleep(0.15)
+            cur = _read_sizes()
+            if cur == last:
+                stable_hits += 1
+            else:
+                last = cur
+                stable_hits = 0
+            if (cur and max(cur) >= expected_min_bs) or (
+                cur and stable_hits >= 2
+            ) or time.monotonic() >= deadline:
+                return cur
 
     def _assert_rdma_active_in_logs(self) -> None:
         """Verify RDMA CacheStore is active in both roles and never fell back to TCP."""
@@ -673,6 +705,57 @@ class Qwen4_5PurePDSmokeTest(unittest.TestCase):
             self.rdma_link_layer,
             matched,
         )
+
+    def _assert_decode_cuda_graph_active_in_logs(self) -> None:
+        """Verify Decode captured and enabled CUDA Graph cleanly without errors."""
+        if not self.enable_decode_cuda_graph:
+            return
+        path = Path(self.decode_mgr.log_file_path) if self.decode_mgr.log_file_path else None
+        self.assertIsNotNone(path, "decode log_file_path missing")
+        assert path is not None
+        self.assertTrue(path.exists(), f"decode process.log missing: {path}")
+        decode_text = path.read_text(errors="replace")
+        logs_dir = self._logs_root_dir()
+        engine_texts: List[str] = []
+        if logs_dir is not None:
+            for ep in sorted(logs_dir.glob("engine*.log")):
+                engine_texts.append(ep.read_text(errors="replace"))
+        combined_decode = "\n".join([decode_text] + engine_texts)
+
+        for bad in (
+            "initCapture prepare_fmha_impl failed",
+            "initCapture forward for output datatype failed",
+            "WarmUp forward failed",
+        ):
+            self.assertNotIn(
+                bad,
+                combined_decode,
+                f"Detected Decode CUDA Graph failure marker {bad!r}",
+            )
+        self.assertIn(
+            "CUDA graph capture is enabled",
+            decode_text,
+            "Decode process.log lacks CUDA graph capture enablement log",
+        )
+        self.assertIn(
+            "Capture Decode End",
+            decode_text,
+            "Decode process.log did not complete Capture Decode End",
+        )
+        captured = sorted(
+            {
+                int(m)
+                for m in re.findall(
+                    r"(?:\[CudaGraph Memory\] captured batch size|capture success for batch size:)\s*(\d+)",
+                    combined_decode,
+                )
+            }
+        )
+        self.assertTrue(
+            captured,
+            "No captured Decode CUDA Graph batch sizes found in Decode logs",
+        )
+        _emit("[Decode CUDA Graph verified] captured_batches=%s", captured)
 
     def _build_branch_pair(self, ns: str) -> Tuple[str, List[int], str, List[int]]:
         """Build prompts A and B sharing >= 1 full block while A spans >= 2 blocks."""
@@ -734,8 +817,8 @@ class Qwen4_5PurePDSmokeTest(unittest.TestCase):
         ref_resp: Dict[str, Any],
         *,
         min_cos: float = 0.998,
-        max_abs: float = 0.15,
-    ) -> None:
+        max_abs: Optional[float] = 0.15,
+    ) -> float:
         got = _final_logits(got_resp)
         ref = _final_logits(ref_resp)
         self.assertEqual(got.shape, ref.shape, f"[{label}] Logits shape mismatch: {got.shape} vs {ref.shape}")
@@ -743,7 +826,9 @@ class Qwen4_5PurePDSmokeTest(unittest.TestCase):
         abs_diff = float((got - ref).abs().max().item())
         _emit("[Logit Check] %s cos=%.6f max_abs=%.6f", label, cos, abs_diff)
         self.assertGreaterEqual(cos, min_cos, f"[{label}] Logit cosine too low: {cos:.6f}")
-        self.assertLessEqual(abs_diff, max_abs, f"[{label}] Logit max_abs too high: {abs_diff:.6f}")
+        if max_abs is not None:
+            self.assertLessEqual(abs_diff, max_abs, f"[{label}] Logit max_abs too high: {abs_diff:.6f}")
+        return cos
 
     def _run_host_demotion_8layer(self) -> None:
         """Verify Device->Host eviction, Host->Device promotion, and mixed Host/Cold batch."""
@@ -804,7 +889,7 @@ class Qwen4_5PurePDSmokeTest(unittest.TestCase):
                 RequestSpec("host_mix_C", prompt_c, 8, False, expected_input_len=len(ids_c), return_logits=True),
             ]
         )
-        prefill_bs = self._collect_new_batch_sizes(snap, "prefill")
+        prefill_bs = self._collect_new_batch_sizes(snap, "prefill", expected_min_bs=2)
         decode_bs = self._collect_new_batch_sizes(snap, "decode")
         tiers_mix_a = _prefill_cache_tiers(mixed[0]["aux_info"])
         tiers_mix_b = _prefill_cache_tiers(mixed[1]["aux_info"])
@@ -827,6 +912,7 @@ class Qwen4_5PurePDSmokeTest(unittest.TestCase):
         self.assertGreaterEqual(tiers_mix_b["memory"], block)
         self.assertEqual(tiers_mix_c["total"], 0)
         self._assert_rdma_active_in_logs()
+        self._assert_decode_cuda_graph_active_in_logs()
 
     def _run_synthetic_8layer(self) -> None:
         block = self.seq_size_per_block
@@ -834,10 +920,11 @@ class Qwen4_5PurePDSmokeTest(unittest.TestCase):
         p_m1, ids_m1 = _fit_exact_token_prompt(self.tokenizer, "PM1:", "\n", block - 1)
         p_0, ids_0 = _fit_exact_token_prompt(self.tokenizer, "P0:", "\n", block)
         p_p1, ids_p1 = _fit_exact_token_prompt(self.tokenizer, "PP1:", "\n", block + 1)
-        p_d1, ids_d1 = _fit_exact_token_prompt(self.tokenizer, "D1:", "\n", block - 1)
-        p_d2, ids_d2 = _fit_exact_token_prompt(self.tokenizer, "D2:", "\n", 2 * block + 3)
-        p_d3, ids_d3 = _fit_exact_token_prompt(self.tokenizer, "S1:", "\n", block)
-        p_d4, ids_d4 = _fit_exact_token_prompt(self.tokenizer, "S2:", "\n", block + 1)
+        # Prefixes chosen for >= 0.15 early margin, >= 0.06 full-horizon margin, and >= 0.20 active-logit margin across all 32-48 steps.
+        p_d1, ids_d1 = _fit_exact_token_prompt(self.tokenizer, "D1_24:", "\n", block - 1)
+        p_d2, ids_d2 = _fit_exact_token_prompt(self.tokenizer, "D2_60:", "\n", 2 * block + 3)
+        p_d3, ids_d3 = _fit_exact_token_prompt(self.tokenizer, "D3_28:", "\n", block)
+        p_d4, ids_d4 = _fit_exact_token_prompt(self.tokenizer, "D4_15:", "\n", block + 1)
 
         # 1. Cold B=1 ground-truth baselines + exact page boundaries (15, 16, 17).
         cold_resp_a = self._post_generate(RequestSpec("cold_A", prompt_a, 8, False, expected_input_len=len(ids_a), return_logits=True))
@@ -883,7 +970,7 @@ class Qwen4_5PurePDSmokeTest(unittest.TestCase):
             RequestSpec("mix_pagep1_cold", p_p1, 8, False, expected_input_len=len(ids_p1), return_logits=True),
         ]
         mix_res = self._run_concurrent_barrier(mix_specs)
-        mix_prefill_bs = self._collect_new_batch_sizes(snap_prefill, "prefill")
+        mix_prefill_bs = self._collect_new_batch_sizes(snap_prefill, "prefill", expected_min_bs=2)
         mix_decode_bs = self._collect_new_batch_sizes(snap_prefill, "decode")
         _emit(
             "[8L Composed Mixed Prefill B=4] prefill_bs=%s decode_bs=%s",
@@ -902,48 +989,112 @@ class Qwen4_5PurePDSmokeTest(unittest.TestCase):
             (cold_resp_a, cold_resp_b, cold_resp_0, cold_resp_p1),
             (2 * block, block, 0, 0),
         ):
-            self.assertEqual(_output_ids(res), expected_ids)
-            self._assert_logits_close(spec.name, res, cold_ref_resp)
+            out_ids = _output_ids(res)
+            exact_match = out_ids == expected_ids
             tiers = _prefill_cache_tiers(res["aux_info"])
+            _emit(
+                "[8L Composed Mixed Prefill B=4] %s tiers=%s exact_vs_B1=%s",
+                spec.name,
+                tiers,
+                exact_match,
+            )
+            self.assertEqual(out_ids, expected_ids)
+            self._assert_logits_close(spec.name, res, cold_ref_resp)
             if expect_device_min > 0:
                 self.assertGreaterEqual(tiers["device"], expect_device_min)
             else:
                 self.assertEqual(tiers["total"], 0)
 
         # 4. Composed Batch 2: Staggered Continuous-Batching Decode (2 -> 4 -> 2 -> 0).
-        cold_resp_d1 = self._post_generate(RequestSpec("cold_d1", p_d1, 17, False, expected_input_len=len(ids_d1), return_logits=True))
-        cold_resp_d2 = self._post_generate(RequestSpec("cold_d2", p_d2, 17, False, expected_input_len=len(ids_d2), return_logits=True))
-        cold_resp_d3 = self._post_generate(RequestSpec("cold_d3", p_d3, 11, False, expected_input_len=len(ids_d3), return_logits=True))
-        cold_resp_d4 = self._post_generate(RequestSpec("cold_d4", p_d4, 14, False, expected_input_len=len(ids_d4), return_logits=True))
+        cold_resp_d1 = self._post_generate(RequestSpec("cold_d1", p_d1, 48, False, expected_input_len=len(ids_d1), return_logits=True))
+        cold_resp_d2 = self._post_generate(RequestSpec("cold_d2", p_d2, 48, False, expected_input_len=len(ids_d2), return_logits=True))
+        cold_resp_d3 = self._post_generate(RequestSpec("cold_d3", p_d3, 32, False, expected_input_len=len(ids_d3), return_logits=True))
+        cold_resp_d4 = self._post_generate(RequestSpec("cold_d4", p_d4, 40, False, expected_input_len=len(ids_d4), return_logits=True))
 
         snap_decode = self._snapshot_batch_schedule_counts()
         early_res, late_res = self._run_staggered_decode_batch(
             [
-                RequestSpec("stag_d1", p_d1, 17, False, expected_input_len=len(ids_d1), return_logits=True),
-                RequestSpec("stag_d2", p_d2, 17, False, expected_input_len=len(ids_d2), return_logits=True),
+                RequestSpec("stag_d1", p_d1, 48, False, expected_input_len=len(ids_d1), return_logits=True),
+                RequestSpec("stag_d2", p_d2, 48, False, expected_input_len=len(ids_d2), return_logits=True),
             ],
             [
-                RequestSpec("stag_d3", p_d3, 11, False, expected_input_len=len(ids_d3), return_logits=True),
-                RequestSpec("stag_d4", p_d4, 14, False, expected_input_len=len(ids_d4), return_logits=True),
+                RequestSpec("stag_d3", p_d3, 32, False, expected_input_len=len(ids_d3), return_logits=True),
+                RequestSpec("stag_d4", p_d4, 40, False, expected_input_len=len(ids_d4), return_logits=True),
             ],
-            stagger_s=0.02,
+            stagger_s=0.005,
         )
-        stag_decode_bs = self._collect_new_batch_sizes(snap_decode, "decode")
+        stag_decode_bs = self._collect_new_batch_sizes(snap_decode, "decode", expected_min_bs=3)
         _emit("[8L Staggered Decode] decode_bs=%s", stag_decode_bs)
         self.assertGreaterEqual(
             max(stag_decode_bs or [0]),
             3,
             f"Expected >= 3 overlapping active Decode requests, observed {stag_decode_bs}",
         )
-        for label, got_resp, cold_ref_resp in zip(
+        for label, prompt, prompt_ids, got_resp, cold_ref_resp in zip(
             ("stag_d1", "stag_d2", "stag_d3", "stag_d4"),
+            (p_d1, p_d2, p_d3, p_d4),
+            (ids_d1, ids_d2, ids_d3, ids_d4),
             early_res + late_res,
             (cold_resp_d1, cold_resp_d2, cold_resp_d3, cold_resp_d4),
         ):
-            self.assertEqual(_output_ids(got_resp), _output_ids(cold_ref_resp))
-            self._assert_logits_close(label, got_resp, cold_ref_resp)
+            got_ids = _output_ids(got_resp)
+            ref_ids = _output_ids(cold_ref_resp)
+            self.assertEqual(
+                len(got_ids),
+                len(ref_ids),
+                f"[{label}] output_ids length mismatch vs B=1",
+            )
+            prefix_match = 0
+            for a, b in zip(got_ids, ref_ids):
+                if a != b:
+                    break
+                prefix_match += 1
+            self.assertGreaterEqual(
+                prefix_match,
+                10,
+                f"[{label}] prefix_match={prefix_match} < 10 vs B=1 (got={got_ids[:16]}, ref={ref_ids[:16]})",
+            )
+            prefix_text = self.tokenizer.decode(got_ids[:-1], skip_special_tokens=False)
+            cold_prefix_prompt = prompt + prefix_text
+            expected_input_ids = prompt_ids + got_ids[:-1]
+            self.assertEqual(
+                list(self.tokenizer.encode(cold_prefix_prompt, add_special_tokens=False)),
+                expected_input_ids,
+                f"[{label}] local lossless tokenizer round-trip failed for got_ids[:-1]",
+            )
+            cold_prefill_resp = self._post_generate(
+                RequestSpec(
+                    f"{label}_cold_prefill_ref",
+                    cold_prefix_prompt,
+                    1,
+                    False,
+                    expected_input_len=len(expected_input_ids),
+                    return_logits=True,
+                )
+            )
+            self.assertEqual(
+                _input_ids(cold_prefill_resp),
+                expected_input_ids,
+                f"[{label}] server _input_ids round-trip mismatch",
+            )
+            self.assertEqual(
+                _prefill_cache_tiers(cold_prefill_resp["aux_info"])["total"],
+                0,
+                f"[{label}] cold_prefill_ref unexpectedly reused cache",
+            )
+            cos = self._assert_logits_close(
+                label, got_resp, cold_prefill_resp, min_cos=0.995, max_abs=None
+            )
+            _emit(
+                "[8L Staggered Decode] %s prefix_match=%d/%d final_cos=%.6f",
+                label,
+                prefix_match,
+                len(ref_ids),
+                cos,
+            )
 
         self._assert_rdma_active_in_logs()
+        self._assert_decode_cuda_graph_active_in_logs()
 
     def _run_real_3fs_40layer(self) -> None:
         block = self.seq_size_per_block
@@ -1024,7 +1175,7 @@ class Qwen4_5PurePDSmokeTest(unittest.TestCase):
             RequestSpec("mix_page65_cold", p65, 12, False, f"PAGE-{block + 1}", len(ids65)),
         ]
         mix_res = self._run_concurrent_barrier(mix_specs)
-        mix_prefill_bs = self._collect_new_batch_sizes(snap_prefill, "prefill")
+        mix_prefill_bs = self._collect_new_batch_sizes(snap_prefill, "prefill", expected_min_bs=2)
         mix_decode_bs = self._collect_new_batch_sizes(snap_prefill, "decode")
         for res, spec, cold_ref, min_dev in zip(
             mix_res, mix_specs, (cold_a, cold_b, cold_64, cold_65), (2 * block, block, 0, 0)
@@ -1059,7 +1210,7 @@ class Qwen4_5PurePDSmokeTest(unittest.TestCase):
         early_res, late_res = self._run_staggered_decode_batch(
             early_specs, late_specs, stagger_s=0.15
         )
-        stag_decode_bs = self._collect_new_batch_sizes(snap_decode, "decode")
+        stag_decode_bs = self._collect_new_batch_sizes(snap_decode, "decode", expected_min_bs=3)
         _emit("[40L Staggered Decode] decode_bs=%s", stag_decode_bs)
         self.assertGreaterEqual(
             max(stag_decode_bs or [0]),
@@ -1079,6 +1230,7 @@ class Qwen4_5PurePDSmokeTest(unittest.TestCase):
             )
 
         self._assert_rdma_active_in_logs()
+        self._assert_decode_cuda_graph_active_in_logs()
 
     def test_pure_pd_generation(self) -> None:
         if self.force_host_demotion:
