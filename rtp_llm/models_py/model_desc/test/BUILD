@@ -164,6 +164,13 @@ py_test(
 )
 
 py_test(
+    name = "projection_packing_test",
+    srcs = ["projection_packing_test.py"],
+    data = ["//rtp_llm/models_py:model_desc/projection_packing.py"],
+    deps = ["//rtp_llm:torch"],
+)
+
+py_test(
     name = "cp_mtp_hidden_handoff_test",
     srcs = ["cp_mtp_hidden_handoff_test.py"],
     data = ["//rtp_llm/models_py:model_desc/cp_mtp_hidden_handoff.py"],
