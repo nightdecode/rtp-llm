@@ -292,3 +292,9 @@ py_test(
     srcs = ["dsa_indexing_test.py"],
     data = ["//rtp_llm:utils/dsa_indexing.py"],
 )
+
+py_test(
+    name = "prefill_watchdog_test",
+    srcs = ["prefill_watchdog_test.py"],
+    deps = ["//rtp_llm:utils"],
+)
