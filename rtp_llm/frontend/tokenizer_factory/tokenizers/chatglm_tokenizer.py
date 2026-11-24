@@ -49,7 +49,17 @@ class ChatGLMV5Tokenizer(BaseTokenizer):
     - tokenizer.json contains all vocabulary and encoding rules
     - We bypass all config parsing that causes issues
     - No dependency on the problematic tokenizer_config.json
+
+    Building the tokenizer from a tokenizer object also skips two things that
+    live outside tokenizer.json and that generation needs, so both are restored
+    below: the chat template (its own ``chat_template.jinja`` file in current
+    transformers) and the full stop-token set from ``generation_config.json``.
+    Without them the model answers, emits ``<|user|>`` and keeps going with a
+    turn it made up, because ``<|user|>`` is a stop token nothing registered.
     """
+
+    #: ``eos_token`` below covers this one; the rest become stop words.
+    PRIMARY_EOS = "<|endoftext|>"
 
     def init_tokenizer(self, tokenizer_path: str, config_json: Dict[str, Any] = {}):
         import os
@@ -64,10 +74,53 @@ class ChatGLMV5Tokenizer(BaseTokenizer):
         # Wrap it with PreTrainedTokenizerFast
         self.tokenizer = PreTrainedTokenizerFast(
             tokenizer_object=tokenizer,
-            eos_token="<|endoftext|>",
-            pad_token="<|endoftext|>",
-            unk_token="<|endoftext|>",
+            eos_token=self.PRIMARY_EOS,
+            pad_token=self.PRIMARY_EOS,
+            unk_token=self.PRIMARY_EOS,
         )
+        self._load_chat_template(tokenizer_path)
+        self._extra_stop_token_ids = self._load_extra_stop_token_ids(tokenizer_path)
+
+    def _load_chat_template(self, tokenizer_path: str) -> None:
+        import os
+
+        # Transformers moved the template out of tokenizer_config.json into a
+        # sibling file; GLM-5.3-Flash ships it that way. ``renderer_factory``
+        # only picks a template up when the tokenizer carries one.
+        template_file = os.path.join(tokenizer_path, "chat_template.jinja")
+        if not os.path.exists(template_file):
+            return
+        with open(template_file, encoding="utf-8") as handle:
+            self.tokenizer.chat_template = handle.read()
+
+    def _load_extra_stop_token_ids(self, tokenizer_path: str) -> List[int]:
+        import json
+        import logging
+        import os
+
+        config_file = os.path.join(tokenizer_path, "generation_config.json")
+        if not os.path.exists(config_file):
+            return []
+        with open(config_file, encoding="utf-8") as handle:
+            eos = json.load(handle).get("eos_token_id")
+        if eos is None:
+            return []
+        if isinstance(eos, int):
+            eos = [eos]
+        primary = self.tokenizer.convert_tokens_to_ids(self.PRIMARY_EOS)
+        extra = [int(token_id) for token_id in eos if int(token_id) != primary]
+        if extra:
+            logging.info(
+                "GLM-5 stop tokens beyond %s (id %s): %s",
+                self.PRIMARY_EOS,
+                primary,
+                [(i, self.tokenizer.convert_ids_to_tokens(i)) for i in extra],
+            )
+        return extra
+
+    @property
+    def stop_words_id_list(self) -> List[List[int]]:
+        return [[token_id] for token_id in getattr(self, "_extra_stop_token_ids", [])]
 
 
 register_tokenizer(["chatglm2", "chat_glm_2"], ChatGLMV2Tokenizer)
