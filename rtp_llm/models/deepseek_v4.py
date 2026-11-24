@@ -65,6 +65,8 @@ SCORING_FUNC_SOFTMAX = 0
 SCORING_FUNC_SIGMOID = 1
 SCORING_FUNC_SQRT_SOFTPLUS = 2  # DeepSeek-V4
 
+_TRUTHY_ENV_VALUES = ("yes", "true", "t", "1", "on")
+
 
 def _is_prefill_role(role_type: object) -> bool:
     """Accept both the production pybind enum and lightweight string configs."""
