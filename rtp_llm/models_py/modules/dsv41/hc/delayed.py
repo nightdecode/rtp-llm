@@ -9,6 +9,7 @@ learned ``hc_head`` weights.
 from __future__ import annotations
 
 import importlib
+import os
 import weakref
 from functools import lru_cache
 from typing import Optional
@@ -44,6 +45,17 @@ def collapse_delayed(x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
     return (x.float() * pre_mix.unsqueeze(-1)).sum(dim=-2).to(x.dtype)
 
 
+def can_fuse_big_pre() -> bool:
+    backend = os.environ.get("DSV4_MHC_PRE_GEMM_BACKEND", "").strip().lower()
+    if backend in ("tilelang_single", "tilelang", "single"):
+        return True
+    if backend in ("", "auto", "deepgemm", "dg"):
+        from rtp_llm.models_py.modules.dsv41.hc.v41_prenorm import _has_prenorm_gemm
+
+        return _has_prenorm_gemm()
+    return False
+
+
 class DelayedHCUnit(HCUnitBase):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -63,19 +75,55 @@ class DelayedHCUnit(HCUnitBase):
         self.base = self.base.reshape(mix_width).contiguous()
         self.scale = self.scale.reshape(3).contiguous()
         self._previous_ref = None
+        self._mega_mhc_supported: Optional[bool] = None
         self.pre_mix_out: Optional[torch.Tensor] = None
 
     def set_previous(self, previous: Optional["DelayedHCUnit"]) -> None:
         # Avoid registering predecessors as nested modules or creating cycles.
+        self._mega_mhc_supported = None
         self._previous_ref = weakref.ref(previous) if previous is not None else None
 
     def _pre_impl(self, x: torch.Tensor, dbg_tag=None):
         shape = x.shape
         if x.is_cuda and x.dtype == torch.bfloat16:
-            from rtp_llm.models_py.modules.dsv41.hc.v41_prenorm import prenorm
+            from rtp_llm.models_py.modules.dsv41.hc.v41_prenorm import (
+                is_supported,
+                prenorm,
+            )
 
             ops = _tile_ops()
             residual = x.reshape(1, -1, self.hc_mult, self.dim)
+            previous = self._previous_ref() if self._previous_ref is not None else None
+            if (
+                previous is not None
+                and not torch.is_grad_enabled()
+                and can_fuse_big_pre()
+                and residual.shape[-2:] == (4, 5120)
+                and residual.is_contiguous()
+                and self.fn.is_contiguous()
+                and torch.cuda.get_device_capability(x.device)[0] == 10
+                and (residual.shape[1] > 64 or is_supported(residual, self.fn))
+            ):
+                use_deepgemm = is_supported(residual, self.fn)
+                pre, post, comb, y = ops.mhc_pre_big_fuse(
+                    residual,
+                    self.fn,
+                    self.scale,
+                    self.base,
+                    rms_eps=self.norm_eps,
+                    mhc_pre_eps=self.hc_eps,
+                    mhc_sinkhorn_eps=self.hc_eps,
+                    mhc_post_mult_value=2.0,
+                    sinkhorn_repeat=self.hc_sinkhorn_iters,
+                    previous_pre_mix=previous.pre_mix_out,
+                    gemm_backend="deepgemm" if use_deepgemm else None,
+                )
+                self.pre_mix_out = pre.reshape(*shape[:-1])
+                return (
+                    y.reshape(*shape[:-2], self.dim),
+                    post.reshape(*shape[:-1], 1),
+                    comb.reshape(*shape[:-2], self.hc_mult, self.hc_mult),
+                )
             mixes = prenorm(residual, self.fn, self.norm_eps)
             if mixes is None:
                 mixes = ops.mhc_pre_norm_fn(

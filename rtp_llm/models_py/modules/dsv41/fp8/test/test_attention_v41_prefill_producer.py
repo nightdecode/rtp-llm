@@ -3,7 +3,7 @@
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -77,7 +77,9 @@ class PrefillProducerIntegrationCPU(unittest.TestCase):
                 _slots=lambda *args, **kwargs: slots, _source_pool=lambda region: pool
             )
 
-            def store(v, s, mapped, target):
+            def store(v, s, mapped, target, *, source_map=None, carry_out=None):
+                self.assertIsNone(source_map)
+                self.assertIsNone(carry_out)
                 self.assertIs(target, pool)
                 self.assertIs(mapped, slots)
                 if fast:
@@ -107,6 +109,7 @@ class PrefillProducerIntegrationCPU(unittest.TestCase):
         pool_bound,
         empty=False,
         index_only=False,
+        prefetched_state=False,
     ):
         starts_host, lengths_host = ([0], [0]) if empty else ([1, 0, 3], [4, 1, 2])
         starts = torch.tensor(starts_host)
@@ -172,7 +175,10 @@ class PrefillProducerIntegrationCPU(unittest.TestCase):
             mapping,
             actual_ratio,
             carry,
+            *,
+            source_map=None,
         ):
+            self.assertIsNone(source_map)
             calls.append("main")
             self.assertEqual(actual_ratio, ratio)
             if ratio == 2:
@@ -225,7 +231,7 @@ class PrefillProducerIntegrationCPU(unittest.TestCase):
                 count = min(tile_rows, rows - t0)
                 buffer.fill_(-991)
                 buffer[:count].copy_(raw[t0 : t0 + count])
-                yield t0, buffer[:count]
+                yield t0, buffer[:count], count, None
 
         shared = {"prefill_chunk_meta": object()}
         attn = SimpleNamespace(
@@ -256,6 +262,10 @@ class PrefillProducerIntegrationCPU(unittest.TestCase):
             _gather_shards=lambda value: value,
             _shared_attention=shared,
         )
+        pending = None
+        if prefetched_state:
+            pending = SimpleNamespace(wait=Mock(return_value=original_state.clone()))
+            attn._read_state = Mock(side_effect=AssertionError("State read twice"))
         with ExitStack() as stack:
             main_mock = stack.enter_context(
                 patch.object(
@@ -309,7 +319,10 @@ class PrefillProducerIntegrationCPU(unittest.TestCase):
                 lengths,
                 prefill=True,
                 projected_tiles=tiles(),
+                previous_state=pending,
             )
+        if pending is not None:
+            pending.wait.assert_called_once_with()
         self.assertNotIn("prefill_chunk_meta", shared)
         self.assertEqual(
             main_mock.call_count,
@@ -362,6 +375,15 @@ class PrefillProducerIntegrationCPU(unittest.TestCase):
                     for start, length in zip((1, 0, 3), (4, 1, 2))
                 ]
                 self.assertEqual([len(g) for g, k in actual[2]], expected)
+
+    def test_prefetched_state_matches_synchronous_snapshot_across_ring_writes(self):
+        for tile_rows in (1, 2, 7):
+            for fused in (False, True):
+                expected = self._run(2, tile_rows, fused, fused, True)
+                actual = self._run(
+                    2, tile_rows, fused, fused, True, prefetched_state=True
+                )
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_main_pool_unbound_keeps_warmup_keys_with_index_pool_bound(self):
         for ratio in (1, 2):
