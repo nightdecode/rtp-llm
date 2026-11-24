@@ -6,7 +6,7 @@ from .validation import DeviceChecks
 
 
 def matching_model_prefill_geometry(impl, cache, table, bases, lengths, device):
-    for receipt in getattr(impl, "_model_prefill_geometry", None) or ():
+    for receipt in impl._model_prefill_geometry or ():
         if receipt.owners[0].device == device and receipt.matches(
             impl, cache, table, bases, lengths
         ):
@@ -324,7 +324,7 @@ def validate_qsa_before_side_write(
         # The model's side-writer preflight combines these read-only flags with
         # its position/CU and pool checks, before the first cache mutation.
         checks = DeviceChecks()
-        object.__setattr__(qsa_runtime, "_prewrite_checks", checks)
+        qsa_runtime._prewrite_checks = checks
     token_mismatch = query_lengths.sum() != int(hidden_states.shape[0])
     if checks is not None and token_mismatch.is_cuda:
         checks.add(

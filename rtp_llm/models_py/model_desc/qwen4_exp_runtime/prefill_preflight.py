@@ -6,10 +6,11 @@ only scoped receipts for that forward. Side-cache and selected-token checks
 keep their existing mutation boundaries. No receipt survives a call.
 """
 
-from collections.abc import Mapping
 from contextlib import contextmanager, nullcontext
 
 import torch
+
+from rtp_llm.models_py.model_desc.block_map import get_primary_attention_inputs
 
 
 def _signature(tensor, *, version=False):
@@ -87,7 +88,7 @@ def main_geometry_preflight(entries):
     for impl, cache, bases, lengths in entries:
         attn_inputs = impl.attn_inputs
         table = attn_inputs.kv_cache_kernel_block_id_device
-        if getattr(impl, "_model_prefill_geometry", None) is not None:
+        if impl._model_prefill_geometry is not None:
             raise RuntimeError("Qwen4 Prefill geometry scopes must not overlap")
         page_size, pages = _validate_main_cache_layout(
             impl, cache, table, bases.numel(), cache.device
@@ -109,7 +110,7 @@ def main_geometry_preflight(entries):
             raise_geometry_error(verdict)
     try:
         for impl, receipt in pending:
-            receipts = getattr(impl, "_model_prefill_geometry", None)
+            receipts = impl._model_prefill_geometry
             if receipts is None:
                 impl._model_prefill_geometry = receipts = []
             receipts.append(receipt)
@@ -120,14 +121,13 @@ def main_geometry_preflight(entries):
 
 
 def prefill_geometry_scope(model, inputs, fmha_impl):
-    attn_inputs = getattr(inputs, "attention_inputs", None)
-    if isinstance(attn_inputs, Mapping):
-        attn_inputs = next(iter(attn_inputs.values()), None)
+    if model.kv_cache is None:
+        return nullcontext(True)
+    attn_inputs = get_primary_attention_inputs(inputs)
     if (
-        model.kv_cache is None
-        or not getattr(attn_inputs, "is_prefill", False)
-        or getattr(attn_inputs, "is_target_verify", False)
-        or getattr(attn_inputs, "is_cuda_graph", False)
+        not attn_inputs.is_prefill
+        or attn_inputs.is_target_verify
+        or attn_inputs.is_cuda_graph
     ):
         return nullcontext(True)
     if (
@@ -145,7 +145,6 @@ def prefill_geometry_scope(model, inputs, fmha_impl):
         return nullcontext(False)
     if (
         fmha_impl is None
-        or getattr(model.config, "is_mtp", False)
         or torch.version.hip is not None
         or not inputs.input_ids.is_cuda
         or torch.cuda.get_device_capability(inputs.input_ids.device) != (12, 0)
@@ -156,7 +155,7 @@ def prefill_geometry_scope(model, inputs, fmha_impl):
         SparseGqaFmhaImpl,
     )
 
-    if type(model) is not Qwen4ExpModel:
+    if type(model) is not Qwen4ExpModel or model.config.is_mtp:
         return nullcontext(True)
 
     entries = []

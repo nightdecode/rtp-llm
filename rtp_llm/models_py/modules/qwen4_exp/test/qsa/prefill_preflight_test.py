@@ -33,6 +33,7 @@ class PrefillPreflightTest(unittest.TestCase):
             attn_configs=SimpleNamespace(kernel_tokens_per_block=4),
             head_dim=16,
             kv_head_num=1,
+            _model_prefill_geometry=None,
         )
         return impl, cache, bases, lengths
 
@@ -139,7 +140,7 @@ class PrefillPreflightTest(unittest.TestCase):
                 [(impl, cache, bases, lengths), (impl, cache[:2], bases, lengths)]
             ):
                 self.fail("Page 2 is outside the second pool")
-        self.assertIsNone(getattr(impl, "_model_prefill_geometry", None))
+        self.assertIsNone(impl._model_prefill_geometry)
 
     def test_current_host_lengths_win_over_stale_mirrors_and_receipts(self):
         impl, cache, bases, lengths = self.fixture()
@@ -215,7 +216,7 @@ class PrefillPreflightTest(unittest.TestCase):
             with main_geometry_preflight(entries):
                 self.fail("Invalid page entered the model body")
         for impl, *_ in entries:
-            self.assertIsNone(getattr(impl, "_model_prefill_geometry", None))
+            self.assertIsNone(impl._model_prefill_geometry)
 
     def test_only_matching_model_receipt_allows_shared_prefill_checks(self):
         entry = self.fixture()

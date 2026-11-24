@@ -11,7 +11,7 @@ import triton.language as tl
 
 def is_supported(*tensors):
     return bool(tensors) and all(
-        isinstance(t, torch.Tensor)
+        torch.is_tensor(t)
         and t.is_cuda
         and t.is_contiguous()
         and t.dtype in (torch.int32, torch.int64)
@@ -365,7 +365,7 @@ def prepare_replay_metadata(
         or reference.device != lengths.device
         or reference.shape != (2, batch)
         or reference.dtype != torch.int64
-        or not isinstance(invalid, torch.Tensor)
+        or not torch.is_tensor(invalid)
         or invalid.device != lengths.device
         or invalid.dtype != torch.bool
         or invalid.ndim != 0
