@@ -12,6 +12,16 @@ py_test(
 )
 
 py_test(
+    name = "deepep_ll_dispatch_overlap_test",
+    srcs = ["deepep_ll_dispatch_overlap_test.py"],
+    deps = py_test_deps,
+    exec_properties = {"gpu": "L20_CU13"},
+    # Drives the split-dispatch contract with a fake buffer and CPU tensors,
+    # but the CUDA router module itself needs the runtime library.
+    tags = ["L20_CU13"],
+)
+
+py_test(
     name = "deepep_normal_router_test",
     srcs = ["deepep_normal_router_test.py"],
     deps = py_test_deps + [

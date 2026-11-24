@@ -1,5 +1,6 @@
 """PPU DeepEP low-latency router implementations."""
 
+import os
 from typing import Any, Optional
 
 import torch
@@ -19,6 +20,7 @@ from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.routers.deepep_low_la
     DEEPEP_QUANT_BLOCK_SIZE,
     SUPPORTED_HIDDEN_SIZES,
     DeepEpLowLatencyRouter,
+    LowLatencyDispatchState,
 )
 from rtp_llm.models_py.modules.factory.fused_moe.utils.config_resolver import (
     MoeConfigResolver,
@@ -65,22 +67,11 @@ class PpuDeepEpLowLatencyRouterW8A8Int8(DeepEpLowLatencyRouter):
         super().__init__(config, quant_config)
         self._use_int8_dispatch = True
 
-    def _normal_prepare(
-        self, dispatch_args: dict[str, Any], tp_topk_weights: torch.Tensor
+    def _dispatch_recv(
+        self, state: LowLatencyDispatchState
     ) -> ExpertForwardPayload:
-        tp_num_tokens = dispatch_args["x"].size(0)
-        expected_m = max(
-            1,
-            int(
-                tp_num_tokens
-                * self.config.ep_size
-                * self._num_topk
-                // self._num_experts
-            ),
-        )
-        expert_x, expert_num_tokens, self._handle, _, _ = (
-            self._buffer.low_latency_dispatch(**dispatch_args)
-        )
+        self._wait_transfer(state.event, state.hook)
+        expert_x = state.expert_x
         if not isinstance(expert_x, tuple) or len(expert_x) != 2:
             raise TypeError(
                 "PPU DeepEP INT8 dispatch must return (expert_x, expert_x_scale)"
@@ -94,23 +85,23 @@ class PpuDeepEpLowLatencyRouterW8A8Int8(DeepEpLowLatencyRouter):
         return ExpertForwardPayload(
             expert_x=expert_x,
             expert_x_scale=expert_x_scale,
-            expert_x_origin_dtype=dispatch_args["x"].dtype,
-            expert_topk_ids=dispatch_args["topk_idx"],
-            expert_topk_weights=tp_topk_weights,
+            expert_x_origin_dtype=state.origin_dtype,
+            expert_topk_ids=state.topk_ids,
+            expert_topk_weights=state.topk_weights,
             expert_tokens_meta=ExpertTokensMetadata(
-                expected_m=expected_m,
-                expert_num_tokens=expert_num_tokens,
+                expected_m=state.expected_m,
+                expert_num_tokens=state.expert_num_tokens,
             ),
         )
 
-    def prepare(
+    def prepare_send(
         self,
         a1: torch.Tensor,
         a1_scale: Optional[torch.Tensor],
         a2_scale: Optional[torch.Tensor],
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-    ) -> ExpertForwardPayload:
+    ) -> LowLatencyDispatchState:
         if a1_scale is not None or a2_scale is not None:
             raise ValueError("W8A8 DeepEP LL expects an unquantized BF16 input")
         num_tokens, hidden_size = a1.size()
@@ -153,15 +144,35 @@ class PpuDeepEpLowLatencyRouterW8A8Int8(DeepEpLowLatencyRouter):
             "async_finish": self._async_finish,
             "return_recv_hook": self._return_recv_hook,
         }
-        return self._normal_prepare(dispatch_args, tp_topk_weights)
+        return self._dispatch_send(dispatch_args, tp_topk_weights)
+
+
+def deepep_fp8_dispatch_enabled() -> bool:
+    """Whether the all-to-all carries FP8 instead of BF16.
+
+    On by default: this is sglang-for-sail's production configuration on the
+    same hardware (``use_fp8=True, quant_size=128``), and it halves the
+    all-to-all payload. Measured end-to-end on this build the difference is
+    neutral to slightly negative, so set ``RTP_GLM_DEEPEP_FP8=0`` to A/B it
+    against the BF16 dispatch; the executor accepts either side.
+    """
+    return os.environ.get("RTP_GLM_DEEPEP_FP8", "1") == "1"
 
 
 class PpuDeepEpLowLatencyRouterFp8PerBlock(DeepEpLowLatencyRouter):
-    """BF16 DeepEP low-latency dispatch for FP8 per-block checkpoints.
+    """DeepEP low-latency dispatch for FP8 per-block checkpoints.
 
-    The PPU deep_ep low-latency buffer dispatches BF16 activations; the FP8
-    masked executor quantizes per-128-group after dispatch. This router only
-    adapts the eligibility checks and payload validation for FP8 models.
+    Two modes, picked by RTP_GLM_DEEPEP_FP8:
+
+    * BF16 (default): dispatch BF16 activations and let the FP8 masked executor
+      quantize per-128-group on the receiving side.
+    * FP8: dispatch already-quantized FP8 with ``quant_size=128``, halving the
+      all-to-all payload, and hand the dispatched scales straight to the masked
+      GEMM. This is sglang-for-sail's production configuration on this same
+      hardware -- ``use_fp8=True, quant_size=128``.
+
+    PPU is not Blackwell, so sglang leaves ``round_scale``/``use_ue8m0`` off and
+    DeepEP returns FP32 scales; the executor validates that rather than assuming.
     """
 
     QUANT_METHOD = "FP8_PER_BLOCK"
@@ -180,16 +191,16 @@ class PpuDeepEpLowLatencyRouterFp8PerBlock(DeepEpLowLatencyRouter):
         quant_config: FusedMoEQuantConfig,
     ) -> None:
         super().__init__(config, quant_config)
-        self._use_fp8_dispatch = False
+        self._use_fp8_dispatch = deepep_fp8_dispatch_enabled()
 
-    def prepare(
+    def prepare_send(
         self,
         a1: torch.Tensor,
         a1_scale: Optional[torch.Tensor],
         a2_scale: Optional[torch.Tensor],
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-    ) -> ExpertForwardPayload:
+    ) -> LowLatencyDispatchState:
         if a1_scale is not None or a2_scale is not None:
             raise ValueError("FP8 DeepEP LL expects an unquantized BF16 input")
         num_tokens, hidden_size = a1.size()
@@ -226,8 +237,13 @@ class PpuDeepEpLowLatencyRouterFp8PerBlock(DeepEpLowLatencyRouter):
             "topk_idx": tp_topk_ids,
             "num_max_dispatch_tokens_per_rank": self._num_max_dispatch_tokens_per_rank,
             "num_experts": self._num_experts,
-            "use_fp8": False,
+            "use_fp8": self._use_fp8_dispatch,
             "async_finish": self._async_finish,
             "return_recv_hook": self._return_recv_hook,
         }
-        return self._normal_prepare(dispatch_args, tp_topk_weights)
+        if self._use_fp8_dispatch:
+            # Only meaningful alongside use_fp8, and passing it unconditionally
+            # would make the switch-off path differ from the BF16 dispatch we
+            # already measured -- the point of the switch is a clean A/B.
+            dispatch_args["quant_size"] = DEEPEP_QUANT_BLOCK_SIZE
+        return self._dispatch_send(dispatch_args, tp_topk_weights)

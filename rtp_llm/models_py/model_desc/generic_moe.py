@@ -1,4 +1,5 @@
 import logging
+import os
 from collections.abc import Mapping
 from typing import Any, Dict, Optional
 
@@ -269,14 +270,105 @@ class GenericMoeLayer(nn.Module):
         # path separately.  This is especially important for decode, where the
         # hidden dimension is small enough that collective launch latency
         # dominates the payload transfer.
+        if self.shared_expert is None or not self.fused_moe.supports_dispatch_overlap:
+            experts_output = self.fused_moe(
+                hidden_states=hidden_states,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation="SiGLU",
+                skip_tp_allreduce=self.use_unified_tp_allreduce,
+            )
+            return self._add_shared_expert(
+                hidden_states, experts_output, x_fp8, x_scale
+            )
+
+        # The shared expert reads only hidden_states, so it can run while the
+        # dispatch all-to-all is still in flight instead of after the combine.
+        shared_expert_output: list[torch.Tensor] = []
+
+        if self._split_shared_expert_across_transfers():
+            # 两个传输窗口各填一半：up_proj + 激活放进 dispatch 窗口，down_proj
+            # 放进 combine 窗口。实测 rank 0 的 150 步 timeline 里，dispatch 的两个
+            # kernel 之间已经塞着整个 shared expert，所以第二个（收）只花 9.52 us；
+            # 而 combine 的两个 kernel 紧挨着，第二个要花 28.79 us。把 down_proj
+            # 挪到 combine 窗口，是在不新开 stream 的前提下让两个窗口都有活干。
+            staged: list[Any] = []
+
+            def _run_shared_up() -> None:
+                staged.append(
+                    self.shared_expert.forward_activation(
+                        hidden_states, x_fp8=x_fp8, x_scale=x_scale
+                    )
+                )
+
+            def _run_shared_down() -> None:
+                shared_expert_output.append(
+                    self.shared_expert.forward_down(
+                        staged[0],
+                        skip_allreduce=(
+                            self.use_ep_shared_allreduce
+                            or self.use_unified_tp_allreduce
+                        ),
+                    )
+                )
+
+            experts_output = self.fused_moe(
+                hidden_states=hidden_states,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation="SiGLU",
+                skip_tp_allreduce=self.use_unified_tp_allreduce,
+                dispatch_overlap_fn=_run_shared_up,
+                combine_overlap_fn=_run_shared_down,
+            )
+            return self._merge_shared_expert(
+                hidden_states, experts_output, shared_expert_output[0]
+            )
+
+        def _run_shared_expert() -> None:
+            shared_expert_output.append(
+                self._compute_shared_expert(hidden_states, x_fp8, x_scale)
+            )
+
         experts_output = self.fused_moe(
             hidden_states=hidden_states,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             activation="SiGLU",
             skip_tp_allreduce=self.use_unified_tp_allreduce,
+            dispatch_overlap_fn=_run_shared_expert,
         )
-        return self._add_shared_expert(hidden_states, experts_output, x_fp8, x_scale)
+        return self._merge_shared_expert(
+            hidden_states, experts_output, shared_expert_output[0]
+        )
+
+    def _split_shared_expert_across_transfers(self) -> bool:
+        """shared expert 能否拆成两半，分别填进 dispatch 和 combine 的传输窗口。
+
+        默认开；设 RTP_GLM_SHARED_EXPERT_SPLIT=0 退回「整个 shared expert 都放在
+        dispatch 窗口」的做法，用来做同一部署下的 A/B。
+        """
+        if os.environ.get("RTP_GLM_SHARED_EXPERT_SPLIT", "1") == "0":
+            return False
+        if not self.fused_moe.supports_combine_overlap:
+            return False
+        return bool(getattr(self.shared_expert, "supports_split_down", False))
+
+    def _compute_shared_expert(
+        self,
+        hidden_states: torch.Tensor,
+        x_fp8: Optional[torch.Tensor] = None,
+        x_scale: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        assert self.shared_expert is not None
+        return self.shared_expert(
+            hidden_states,
+            x_fp8=x_fp8,
+            x_scale=x_scale,
+            skip_allreduce=(
+                self.use_ep_shared_allreduce or self.use_unified_tp_allreduce
+            ),
+        )
 
     def _add_shared_expert(
         self,
@@ -286,39 +378,46 @@ class GenericMoeLayer(nn.Module):
         x_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.shared_expert is not None:
-            shared_expert_output = self.shared_expert(
-                hidden_states,
-                x_fp8=x_fp8,
-                x_scale=x_scale,
-                skip_allreduce=(
-                    self.use_ep_shared_allreduce or self.use_unified_tp_allreduce
-                ),
+            shared_expert_output = self._compute_shared_expert(
+                hidden_states, x_fp8, x_scale
             )
-            if self.use_unified_tp_allreduce:
-                # Both paths are still TP-partial.  The shared-expert gate is
-                # rank-consistent because hidden_states are replicated across
-                # TP ranks, so it is safe to apply it before the single
-                # all-reduce.
-                experts_output = self._merge_shared_expert_output(
-                    hidden_states, experts_output, shared_expert_output
-                )
-                experts_output = all_reduce(experts_output, group=Group.TP)
-            elif self.use_ep_shared_allreduce:
-                # EP mode: routed expert output is already complete
-                # (EP combine via all_to_all / all_gather aggregated across ranks).
-                # Only the shared expert output is TP-partial and needs all_reduce.
-                shared_expert_output = self._gate_shared_expert_output(
-                    hidden_states, shared_expert_output
-                )
-                shared_expert_output = all_reduce(shared_expert_output, group=Group.TP)
-                experts_output = experts_output + shared_expert_output
-            else:
-                # Fallback path: each path is already complete independently.
-                # This includes ffn_tp_size == 1 and routers that retain their
-                # own finalize reduction, so only local merging remains.
-                experts_output = self._merge_shared_expert_output(
-                    hidden_states, experts_output, shared_expert_output
-                )
+            return self._merge_shared_expert(
+                hidden_states, experts_output, shared_expert_output
+            )
+
+        return experts_output
+
+    def _merge_shared_expert(
+        self,
+        hidden_states: torch.Tensor,
+        experts_output: torch.Tensor,
+        shared_expert_output: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.use_unified_tp_allreduce:
+            # Both paths are still TP-partial.  The shared-expert gate is
+            # rank-consistent because hidden_states are replicated across
+            # TP ranks, so it is safe to apply it before the single
+            # all-reduce.
+            experts_output = self._merge_shared_expert_output(
+                hidden_states, experts_output, shared_expert_output
+            )
+            experts_output = all_reduce(experts_output, group=Group.TP)
+        elif self.use_ep_shared_allreduce:
+            # EP mode: routed expert output is already complete
+            # (EP combine via all_to_all / all_gather aggregated across ranks).
+            # Only the shared expert output is TP-partial and needs all_reduce.
+            shared_expert_output = self._gate_shared_expert_output(
+                hidden_states, shared_expert_output
+            )
+            shared_expert_output = all_reduce(shared_expert_output, group=Group.TP)
+            experts_output = experts_output + shared_expert_output
+        else:
+            # Fallback path: each path is already complete independently.
+            # This includes ffn_tp_size == 1 and routers that retain their
+            # own finalize reduction, so only local merging remains.
+            experts_output = self._merge_shared_expert_output(
+                hidden_states, experts_output, shared_expert_output
+            )
 
         return experts_output
 

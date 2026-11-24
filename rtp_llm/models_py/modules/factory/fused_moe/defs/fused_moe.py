@@ -156,6 +156,50 @@ class FusedMoeDataRouter(ABC):
 
         return False
 
+    @property
+    def supports_dispatch_overlap(self) -> bool:
+        """Whether ``prepare`` splits into ``prepare_send`` and ``prepare_recv``.
+
+        Routers that advertise this let the caller run unrelated work between
+        issuing the dispatch and waiting for it, so the transfer stops being
+        fully exposed on the critical path.
+        """
+
+        return False
+
+    def prepare_send(
+        self,
+        a1: torch.Tensor,
+        a1_scale: Optional[torch.Tensor],
+        a2_scale: Optional[torch.Tensor],
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> Any:
+        """Issue the dispatch and return the state ``prepare_recv`` needs."""
+
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support split dispatch"
+        )
+
+    def prepare_recv(self, state: Any) -> ExpertForwardPayload:
+        """Wait for a dispatch issued by ``prepare_send`` and build its payload."""
+
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support split dispatch"
+        )
+
+    @property
+    def supports_combine_overlap(self) -> bool:
+        """Whether ``finalize`` accepts a ``combine_overlap_fn`` keyword.
+
+        A router that advertises this issues the combine, runs the callback,
+        and only then waits for the transfer. Callers use it to park work that
+        does not depend on the combined output inside that window, the same way
+        ``supports_dispatch_overlap`` covers the dispatch window.
+        """
+
+        return False
+
     def prepare_gate_pack(
         self,
         a1: torch.Tensor,
@@ -327,6 +371,14 @@ class FusedMoe(torch.nn.Module):
             self.router.supports_gate_pack and self.fused_experts.supports_gate_pack
         )
 
+    @property
+    def supports_dispatch_overlap(self) -> bool:
+        return bool(self.router.supports_dispatch_overlap)
+
+    @property
+    def supports_combine_overlap(self) -> bool:
+        return bool(self.router.supports_combine_overlap)
+
     def forward_gate_pack(
         self,
         hidden_states: torch.Tensor,
@@ -371,18 +423,43 @@ class FusedMoe(torch.nn.Module):
         extra_expert_args: Optional[Dict[str, Any]] = None,
         extra_finalize_args: Optional[FinalizeArgs] = None,
         skip_tp_allreduce: bool = False,
+        dispatch_overlap_fn: Optional[Callable[[], None]] = None,
+        combine_overlap_fn: Optional[Callable[[], None]] = None,
     ) -> torch.Tensor:
 
         self._validate_skip_tp_allreduce(skip_tp_allreduce)
+        if combine_overlap_fn is not None and not self.supports_combine_overlap:
+            raise ValueError(
+                f"strategy {self.strategy_name!r} does not support overlapping "
+                "work with the combine"
+            )
         a1 = hidden_states
 
-        expert_payload = self.router.prepare(
-            a1,
-            a1_scale,
-            a2_scale,
-            topk_weights,
-            topk_ids,
-        )
+        if dispatch_overlap_fn is not None:
+            if not self.supports_dispatch_overlap:
+                raise ValueError(
+                    f"strategy {self.strategy_name!r} does not support overlapping "
+                    "work with the dispatch"
+                )
+            # The transfer is in flight here; whatever the caller runs must not
+            # depend on the dispatched tokens.
+            dispatch_state = self.router.prepare_send(
+                a1,
+                a1_scale,
+                a2_scale,
+                topk_weights,
+                topk_ids,
+            )
+            dispatch_overlap_fn()
+            expert_payload = self.router.prepare_recv(dispatch_state)
+        else:
+            expert_payload = self.router.prepare(
+                a1,
+                a1_scale,
+                a2_scale,
+                topk_weights,
+                topk_ids,
+            )
         if expert_payload.expert_topk_ids is None:
             expert_payload.expert_topk_ids = topk_ids
         if expert_payload.expert_topk_weights is None:
@@ -398,6 +475,7 @@ class FusedMoe(torch.nn.Module):
             extra_expert_args=extra_expert_args,
             extra_finalize_args=extra_finalize_args,
             skip_tp_allreduce=skip_tp_allreduce,
+            combine_overlap_fn=combine_overlap_fn,
         )
 
     def _validate_skip_tp_allreduce(self, skip_tp_allreduce: bool) -> None:
@@ -419,6 +497,7 @@ class FusedMoe(torch.nn.Module):
         extra_expert_args: Optional[Dict[str, Any]],
         extra_finalize_args: Optional[FinalizeArgs],
         skip_tp_allreduce: bool,
+        combine_overlap_fn: Optional[Callable[[], None]] = None,
     ) -> torch.Tensor:
         self._validate_skip_tp_allreduce(skip_tp_allreduce)
 
@@ -472,13 +551,25 @@ class FusedMoe(torch.nn.Module):
             }
         )
 
-        output = self.router.finalize(
-            combine_payload,
-            expert_payload.expert_topk_weights,
-            expert_payload.expert_topk_ids,
-            apply_router_weight_on_input,
-            finalize_args,
-        )
+        # 只有 supports_combine_overlap 的 router 才接这个关键字；其余 router 的
+        # finalize 没有这个形参，无条件传会直接 TypeError。
+        if combine_overlap_fn is not None:
+            output = self.router.finalize(
+                combine_payload,
+                expert_payload.expert_topk_weights,
+                expert_payload.expert_topk_ids,
+                apply_router_weight_on_input,
+                finalize_args,
+                combine_overlap_fn=combine_overlap_fn,
+            )
+        else:
+            output = self.router.finalize(
+                combine_payload,
+                expert_payload.expert_topk_weights,
+                expert_payload.expert_topk_ids,
+                apply_router_weight_on_input,
+                finalize_args,
+            )
 
         assert (
             output.shape == hidden_states.shape

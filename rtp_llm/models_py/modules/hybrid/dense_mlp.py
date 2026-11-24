@@ -1,5 +1,6 @@
 """Unified dense MLP implementation supporting multiple activation types."""
 
+from dataclasses import dataclass
 from typing import Dict, Optional, Type
 
 import torch
@@ -40,6 +41,20 @@ _ACTIVATION_FUNC_MAP: Dict[ActivationType, Type[nn.Module]] = {
 }
 
 _GATED_ACTIVATION_TYPE_LIST = [ActivationType.Swiglu]
+
+
+@dataclass
+class DenseMlpActivation:
+    """down_proj 还没跑时的中间结果，由 forward_activation 产出。
+
+    拆成两段是为了让调用方能在两段之间插入别的工作。MoE 层用它把 shared expert
+    的两个 GEMM 分别放进 DeepEP 的 dispatch 和 combine 两个传输窗口里。
+    """
+
+    # down_proj 的输入：量化路径下是 FP8 张量，其余路径下是激活后的 BF16 张量
+    down_input: torch.Tensor
+    # 量化路径下 down_input 的 per-group scale；非量化路径为 None
+    down_scales: Optional[torch.Tensor] = None
 
 
 class DenseMLP(nn.Module):
@@ -152,33 +167,39 @@ class DenseMLP(nn.Module):
             and isinstance(self.up_proj, PpuFp8DeepGemmLinear)
         )
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        skip_allreduce: bool = False,
-        *,
-        x_fp8: Optional[torch.Tensor] = None,
-        x_scale: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if not self.is_gated and self.activation_type == ActivationType.Gelu:
-            activated = self.up_proj.forward_with_bias_gelu(x)
-            output = self.down_proj(activated)
-            if not skip_allreduce and self.parallelism_config.get_ffn_tp_size() > 1:
-                output = all_reduce(output, group=Group.TP)
-            return output
-        if x_fp8 is not None and x_scale is not None and self.accepts_fp8_input:
-            up = self.up_proj(x_fp8, input_scales=x_scale)
-        else:
-            up = self.up_proj(x)
-        output = None
-        if (
+    @property
+    def _down_proj_fuses_activation(self) -> bool:
+        """down_proj 是否把 silu、量化和 GEMM 融在一次调用里。
+
+        融在一起时 activation 和 down_proj 之间没有缝，forward 不能拆成两段。
+        """
+        return bool(
             self.is_gated
             and self.swiglu_limit <= 0
             and getattr(self, "_fuse_kernels", True)
             and getattr(self.down_proj, "supports_fused_silu_quant", False)
-        ):
-            output = self.down_proj.forward_silu_and_mul_quantized(up)
-        if output is None and getattr(self, "_fuse_ppu_silu_quant", False) and up.dim() == 2:
+        )
+
+    @property
+    def supports_split_down(self) -> bool:
+        """forward 能否拆成 forward_activation + forward_down 两段。"""
+        return not self._down_proj_fuses_activation
+
+    def forward_activation(
+        self,
+        x: torch.Tensor,
+        *,
+        x_fp8: Optional[torch.Tensor] = None,
+        x_scale: Optional[torch.Tensor] = None,
+    ) -> DenseMlpActivation:
+        """跑到 down_proj 之前为止，返回 down_proj 还差的输入。"""
+        if not self.is_gated and self.activation_type == ActivationType.Gelu:
+            return DenseMlpActivation(self.up_proj.forward_with_bias_gelu(x))
+        if x_fp8 is not None and x_scale is not None and self.accepts_fp8_input:
+            up = self.up_proj(x_fp8, input_scales=x_scale)
+        else:
+            up = self.up_proj(x)
+        if getattr(self, "_fuse_ppu_silu_quant", False) and up.dim() == 2:
             fp8_out, scale_out = silu_mul_fp8_quantize_128(
                 up.contiguous(),
                 gate_first=True,
@@ -187,8 +208,8 @@ class DenseMLP(nn.Module):
                 ),
                 swiglu_limit=self.swiglu_limit,
             )
-            output = self.down_proj(fp8_out, input_scales=scale_out)
-        elif output is None and self._fuse_silu_quant and up.dim() == 2:
+            return DenseMlpActivation(fp8_out, scale_out)
+        if self._fuse_silu_quant and up.dim() == 2:
             scale_ue8m0 = self.down_proj.scale_ue8m0
             fp8_out, scale_out = (
                 silu_and_mul_per_token_group_fp8_quant_dense_packed_fwd(
@@ -197,21 +218,54 @@ class DenseMLP(nn.Module):
                     scale_ue8m0=scale_ue8m0,
                 )
             )
-            output = self.down_proj(fp8_out, input_scales=scale_out)
-        if output is None:
-            if self.is_gated and self.swiglu_limit > 0:
-                # Unfused fallback: clamp the packed [gate, up] halves before
-                # the activation, matching the reference's pre-SwiGLU clamp.
-                d = up.shape[-1] // 2
-                up = torch.cat(
-                    (
-                        up[..., :d].clamp(max=self.swiglu_limit),
-                        up[..., d:].clamp(-self.swiglu_limit, self.swiglu_limit),
-                    ),
-                    dim=-1,
-                )
-            activated = self.act_fn(up)
-            output = self.down_proj(activated)
+            return DenseMlpActivation(fp8_out, scale_out)
+        if self.is_gated and self.swiglu_limit > 0:
+            # Unfused fallback: clamp the packed [gate, up] halves before
+            # the activation, matching the reference's pre-SwiGLU clamp.
+            d = up.shape[-1] // 2
+            up = torch.cat(
+                (
+                    up[..., :d].clamp(max=self.swiglu_limit),
+                    up[..., d:].clamp(-self.swiglu_limit, self.swiglu_limit),
+                ),
+                dim=-1,
+            )
+        return DenseMlpActivation(self.act_fn(up))
+
+    def forward_down(
+        self,
+        activation: DenseMlpActivation,
+        skip_allreduce: bool = False,
+    ) -> torch.Tensor:
+        """跑 down_proj 以及（需要时）TP all-reduce。"""
+        if activation.down_scales is not None:
+            output = self.down_proj(
+                activation.down_input, input_scales=activation.down_scales
+            )
+        else:
+            output = self.down_proj(activation.down_input)
         if not skip_allreduce and self.parallelism_config.get_ffn_tp_size() > 1:
             output = all_reduce(output, group=Group.TP)
         return output
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        skip_allreduce: bool = False,
+        *,
+        x_fp8: Optional[torch.Tensor] = None,
+        x_scale: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self._down_proj_fuses_activation:
+            if x_fp8 is not None and x_scale is not None and self.accepts_fp8_input:
+                up = self.up_proj(x_fp8, input_scales=x_scale)
+            else:
+                up = self.up_proj(x)
+            output = self.down_proj.forward_silu_and_mul_quantized(up)
+            if not skip_allreduce and self.parallelism_config.get_ffn_tp_size() > 1:
+                output = all_reduce(output, group=Group.TP)
+            return output
+        return self.forward_down(
+            self.forward_activation(x, x_fp8=x_fp8, x_scale=x_scale),
+            skip_allreduce=skip_allreduce,
+        )
