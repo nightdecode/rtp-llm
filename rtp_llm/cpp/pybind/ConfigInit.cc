@@ -1766,7 +1766,6 @@ PYBIND11_MODULE(libth_transformer_config, m) {
     py::class_<RuntimeConfig> runtime_config(m, "RuntimeConfig");
     runtime_config.def(py::init<>())
         .def_readwrite("max_generate_batch_size", &RuntimeConfig::max_generate_batch_size)
-        .def_readwrite("max_block_size_per_item", &RuntimeConfig::max_block_size_per_item)
         .def_readwrite("reserve_runtime_mem_mb", &RuntimeConfig::reserve_runtime_mem_mb)
         .def_readwrite("warm_up", &RuntimeConfig::warm_up)
         .def_readwrite("warm_up_with_loss", &RuntimeConfig::warm_up_with_loss)
@@ -1791,7 +1790,7 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def(py::pickle(
             [](const RuntimeConfig& self) {
                 return py::make_tuple(self.max_generate_batch_size,
-                                      self.max_block_size_per_item,
+                                      16,  // Retired field: preserve the historical RuntimeConfig pickle slot.
                                       self.reserve_runtime_mem_mb,
                                       self.warm_up,
                                       self.warm_up_with_loss,
@@ -1812,7 +1811,6 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                 RuntimeConfig c;
                 try {
                     c.max_generate_batch_size       = t[0].cast<int64_t>();
-                    c.max_block_size_per_item       = t[1].cast<int64_t>();
                     c.reserve_runtime_mem_mb        = t[2].cast<int64_t>();
                     c.warm_up                       = t[3].cast<bool>();
                     c.warm_up_with_loss             = t[4].cast<bool>();

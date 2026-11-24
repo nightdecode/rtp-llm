@@ -1625,7 +1625,6 @@ class RopeStyle:
         ...
 class RuntimeConfig:
     output_dispatcher_worker_count: int
-    max_block_size_per_item: int
     max_generate_batch_size: int
     model_name: str
     reserve_runtime_mem_mb: int
