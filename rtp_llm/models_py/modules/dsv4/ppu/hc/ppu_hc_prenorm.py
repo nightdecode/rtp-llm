@@ -7,10 +7,13 @@ Explicit opt-in via DSV4_MHC_PRE_GEMM_BACKEND=deepgemm_deterministic.
 """
 
 import logging
+import os
 from functools import lru_cache
 from pathlib import Path
 
 import torch
+import triton
+import triton.language as tl
 
 _TEMPLATE = """
 using gemm_t = deep_gemm::HcPrenormGemm<
@@ -26,6 +29,50 @@ using gemm_t = deep_gemm::HcPrenormGemm<
 gemm_t::run(reduced, reduced_squares, m, a, b, stream, num_sms, smem_size,
             d, sqr_sum, counter);
 """
+
+
+@triton.jit
+def _split_reduce_kernel(
+    PARTIALS, SQUARES, OUT, SQRSUM,
+    M: tl.constexpr, N: tl.constexpr, S: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """把 split-K 的 S 个分片一次加完：同时产出 [M, N] 的和与 [M] 的平方和。
+
+    两件事放一个 kernel 是因为它们读的是同一次 GEMM 的产物、形状又都极小
+    （S=64、N=24，batch 1 时总共 6 KB）。分成两次 torch.sum 的话，
+    代价几乎全是启动与归约往返：实测每次 7.4 和 11.6 微秒，而每个子层都要做一次，
+    45 层两个子层就是每步 180 个 kernel、约 1.9 毫秒。
+    """
+    row = tl.program_id(0)
+    lane = tl.arange(0, BLOCK_N)
+    keep = lane < N
+    plane = tl.arange(0, S)
+    # [S, N]：第 s 个分片第 row 个 token 的 N 个输出
+    offs = plane[:, None] * (M * N) + row * N + lane[None, :]
+    vals = tl.load(PARTIALS + offs, mask=keep[None, :], other=0.0)
+    tl.store(OUT + row * N + lane, tl.sum(vals, 0), mask=keep)
+    sq = tl.load(SQUARES + plane * M + row)
+    tl.store(SQRSUM + row, tl.sum(sq, 0))
+
+
+def _fused_split_reduce(partials, squares, out, sqrsum) -> bool:
+    """一个 kernel 做完两次 split-K 归约；形状不合适时返回 False 让调用方退回 torch。"""
+    if os.environ.get("RTP_HC_FUSED_SPLIT_REDUCE", "1") == "0":
+        return False
+    splits, m, n = partials.shape
+    # tl.arange 要求 2 的幂；S 由 launch_geometry 固定给 64，这里只做防御。
+    if splits & (splits - 1) or splits > 1024 or n > 128:
+        return False
+    if squares.shape != (splits, m) or not partials.is_contiguous() or not squares.is_contiguous():
+        return False
+    _split_reduce_kernel[(m,)](
+        partials, squares, out[0], sqrsum[0],
+        M=m, N=n, S=splits,
+        BLOCK_N=triton.next_power_of_2(n),
+        num_warps=4,
+    )
+    return True
 
 
 def launch_geometry(m: int, k: int, n: int, *, is_ppu1v5: bool = True) -> dict:
@@ -82,8 +129,9 @@ def tf32_hc_prenorm_gemm(x, weight, out, sqrsum, requested_splits=None):
     if len(set(storage)) != len(storage):
         raise ValueError("HC input, weight and outputs must not alias")
     partials, squares = _launch_partials(x, weight, config)
-    torch.sum(partials, dim=0, out=out[0])
-    torch.sum(squares, dim=0, out=sqrsum[0])
+    if not _fused_split_reduce(partials, squares, out, sqrsum):
+        torch.sum(partials, dim=0, out=out[0])
+        torch.sum(squares, dim=0, out=sqrsum[0])
     return out
 
 
