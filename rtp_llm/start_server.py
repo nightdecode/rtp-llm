@@ -31,6 +31,7 @@ from rtp_llm.utils.process_manager import (
     DEFER_FIRST_SIGTERM_SECONDS_ENV,
     DEFER_FIRST_SIGTERM_VALUE,
     ProcessManager,
+    create_service_draining,
 )
 from rtp_llm.utils.warmup import configure_warmup
 
@@ -755,7 +756,7 @@ def start_server(py_env_configs: PyEnvConfigs):
     )
     _sync_server_shutdown_timeout(py_env_configs)
 
-    service_draining = multiprocessing.Event()
+    service_draining = create_service_draining()
     # Create process manager with config values
     process_manager = ProcessManager(
         service_draining=service_draining,
