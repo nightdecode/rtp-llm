@@ -196,6 +196,44 @@ class CappedDecodePageTest(unittest.TestCase):
                 )
                 self.assertEqual(len(smoke.records), 1)
 
+    def test_pd_chat_passes_prefill_route_to_selected_decode_owner(self):
+        smoke, case, response = formal_response_fixture("kimi_k31")
+        smoke.args.prefill_grpc_port = 27189
+        smoke.args.base_url = "http://192.0.2.1:27188"
+        smoke.endpoint = smoke.args.base_url + "/v1/chat/completions"
+        prefill = {
+            "role": "PREFILL",
+            "ip": "192.0.2.1",
+            "http_port": 27188,
+            "grpc_port": 27189,
+        }
+        decode = {
+            "role": "DECODE",
+            "ip": "192.0.2.2",
+            "http_port": 28224,
+            "grpc_port": 28225,
+        }
+        smoke.decode_role_addrs = [
+            {**decode, "http_port": 28188, "grpc_port": 28189},
+            decode,
+        ]
+        case = replace(case, decode_owner_rank=1)
+        response["aux_info"]["role_addrs"] = [prefill, decode]
+        completed = types.SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(response).encode() + b"\n__K3_HTTP_STATUS__200",
+            stderr=b"",
+        )
+        with patch.object(smoke, "tokenize", return_value=[1]), patch(
+            "rtp_llm.test.smoke.kimi_k3.text_smoke.subprocess.run",
+            return_value=completed,
+        ) as run:
+            result = smoke.request(case)
+        self.assertEqual(run.call_args.args[0][-1], smoke.endpoint)
+        request = json.loads(run.call_args.kwargs["input"])
+        self.assertEqual(request["extra_configs"]["role_addrs"], [prefill, decode])
+        self.assertEqual(result["observed_decode_role_addrs"], [prefill, decode])
+
     def test_rdma_prewarm_applies_its_shorter_transport_timeout(self):
         smoke, _, response = formal_response_fixture()
         smoke.args.rdma_prewarm_attempts = 1
