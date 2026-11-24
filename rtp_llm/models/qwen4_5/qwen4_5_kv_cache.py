@@ -40,6 +40,8 @@ except Exception:  # pragma: no cover - pure-Python fallback without C++ ops
 
 FULL_ATTN_KV_TAG = "full"
 LINEAR_ATTN_TAG = "linear"
+GDN_SSM_STATE_TAG = "gdn_ssm_state"
+GDN_CONV_STATE_TAG = "gdn_conv_state"
 GDN_CONSUMER_Q_CONV_TAG = "gdn_consumer_q_conv"
 FULL_ATTN_KV_SCONV_TAG = "full_attn_kv_sconv"
 FULL_ATTN_K_SCONV_TAG = "full_attn_k_sconv"
@@ -574,14 +576,25 @@ def build_qwen4_5_kv_cache_spec_descs(
                 descs.append(mha)
         else:
             if lp.allocates_ssm_state:
-                lin = KVCacheSpecDesc()
-                lin.tag = LINEAR_ATTN_TAG
-                lin.cache_type = KVCacheSpecType.LINEAR
-                capacity = CacheCapacityPolicyDesc()
-                capacity.charge_to_paged_budget = True
-                lin.capacity = capacity
-                lin.tp_transfer_mode = TpCacheTransferMode.LINEAR_QKV
-                descs.append(lin)
+                assert lp.ssm_state_shape is not None
+                ssm_heads, ssm_k, ssm_v = lp.ssm_state_shape
+                descs.append(
+                    _make_full_group_opaque_desc(
+                        tag=GDN_SSM_STATE_TAG,
+                        entry_elems=ssm_k * ssm_v,
+                        entry_count=ssm_heads,
+                        dtype_str="F32",
+                    )
+                )
+                if lp.has_gdn_conv:
+                    descs.append(
+                        _make_full_group_opaque_desc(
+                            tag=GDN_CONV_STATE_TAG,
+                            entry_elems=lp.gdn_conv_channels,
+                            entry_count=lp.gdn_conv_state_len,
+                            dtype_str="BF16",
+                        )
+                    )
             elif lp.has_gdn_conv:
                 # YoCo decode consumer: no SSM state, only Q-conv [2048, k-1=3]
                 descs.append(

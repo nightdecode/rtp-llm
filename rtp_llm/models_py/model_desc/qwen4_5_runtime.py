@@ -20,6 +20,7 @@ Provides:
 from __future__ import annotations
 
 import copy
+import math
 from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -36,6 +37,8 @@ from rtp_llm.models.qwen4_5.qwen4_5_kv_cache import (
     FULL_ATTN_OUTPUT_SCONV_TAG,
     FFN_OUTPUT_SCONV_TAG,
     GDN_CONSUMER_Q_CONV_TAG,
+    GDN_CONV_STATE_TAG,
+    GDN_SSM_STATE_TAG,
     LINEAR_ATTN_OUTPUT_SCONV_TAG,
     LINEAR_ATTN_TAG,
     PLE_NGRAM_CTX_TAG,
@@ -433,18 +436,10 @@ def prepare_qwen4_5_cache_store_writers(
     writers: Dict[str, Any] = {}
     for tag in sorted(required):
         group_inputs = _select_group_for_tag(attention_inputs, tag)
-        sample_cache = kv_cache.get_layer_cache(
-            next(
-                lid
-                for lid in range(layer_count)
-                if any(str(c.tag) == tag for c in kv_cache.get_layer_cache_groups(lid))
-            ),
-            tag,
-        )
         cs_inputs = getattr(group_inputs, "cache_store_inputs", None)
         cs_writer = getattr(group_inputs, "cache_store_writer", None)
-        if factory is not None and _HAS_COMPILED_GPT_BASE:
-            op = factory(group_inputs, sample_cache)
+        if factory is not None and _HAS_COMPILED_GPT_BASE and not isinstance(kv_cache, LocalKVCache):
+            op = factory(group_inputs, kv_cache)
             if op is not None:
                 writers[tag] = op
                 continue
@@ -486,6 +481,11 @@ def _block_table_for_tag(attention_inputs: Any, tag: str) -> torch.Tensor:
     return table
 
 
+def _is_padded_group(attention_inputs: Any, tag: str) -> bool:
+    grp = _select_group_for_tag(attention_inputs, tag)
+    return bool(getattr(grp, "is_s_padded", False))
+
+
 def _check_phys_block(phys_id: int, pool_rows: int, tag: str, layer_idx: int) -> int:
     if phys_id <= 0 or phys_id >= pool_rows:
         raise RuntimeError(
@@ -494,24 +494,96 @@ def _check_phys_block(phys_id: int, pool_rows: int, tag: str, layer_idx: int) ->
     return phys_id
 
 
+def _view_mha_kv_nhd(
+    base: torch.Tensor,
+    num_kv_heads: int,
+    tokens_per_block: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """Return a live zero-copy NHD view ``[num_blocks, 2, B_tok, H_kv, D]`` of MHA pool."""
+    if base.ndim == 2:
+        need = 2 * num_kv_heads * tokens_per_block * head_dim
+        if int(base.shape[1]) < need:
+            raise RuntimeError(
+                f"MHA packed pool stride too small: {base.shape[1]} < {need}"
+            )
+        return (
+            base[:, :need]
+            .reshape(int(base.shape[0]), 2, num_kv_heads, tokens_per_block, head_dim)
+            .transpose(2, 3)
+        )
+    if base.ndim == 5:
+        if (
+            int(base.shape[2]) == num_kv_heads
+            and int(base.shape[3]) == tokens_per_block
+            and int(base.shape[4]) == head_dim
+        ):
+            return base.transpose(2, 3)
+        if (
+            int(base.shape[2]) == tokens_per_block
+            and int(base.shape[3]) == num_kv_heads
+            and int(base.shape[4]) == head_dim
+        ):
+            return base
+    raise RuntimeError(
+        f"Unexpected MHA kv_cache_base shape {tuple(base.shape)} for "
+        f"(H_kv={num_kv_heads}, B_tok={tokens_per_block}, D={head_dim})"
+    )
+
+
+def _view_opaque_row(
+    base: torch.Tensor,
+    phys_id: int,
+    target_shape: Tuple[int, ...],
+    target_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return a live zero-copy view of physical block ``phys_id`` as ``target_shape``."""
+    if (
+        base.ndim == 1 + len(target_shape)
+        and tuple(int(d) for d in base.shape[1:]) == target_shape
+        and base.dtype == target_dtype
+    ):
+        return base[phys_id]
+    elem_size = torch.empty((), dtype=target_dtype).element_size()
+    need_bytes = math.prod(target_shape) * elem_size
+    row_u8 = base[phys_id].reshape(-1).view(torch.uint8)
+    if int(row_u8.numel()) < need_bytes:
+        raise RuntimeError(
+            f"Opaque pool row too small: {row_u8.numel()} bytes < {need_bytes} bytes "
+            f"for shape={target_shape} dtype={target_dtype}"
+        )
+    return row_u8[:need_bytes].view(target_dtype).view(*target_shape)
+
+
 def _load_single_req_full_attn_kv(
     base: torch.Tensor,
     blocks: torch.Tensor,
     total_tokens: int,
     tokens_per_block: int,
+    *,
+    num_kv_heads: Optional[int] = None,
+    head_dim: Optional[int] = None,
+    allow_zero_padded: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Read [total_tokens, H_kv, D] K/V from [num_blocks, 2, B_tok, H_kv, D]."""
-    num_kv_heads, head_dim = int(base.shape[3]), int(base.shape[4])
+    """Read [total_tokens, H_kv, D] K/V from MHA paged pool (NHD, HND, or 2D packed)."""
+    if num_kv_heads is not None and head_dim is not None:
+        nhd = _view_mha_kv_nhd(base, num_kv_heads, tokens_per_block, head_dim)
+    else:
+        nhd = base
+        num_kv_heads, head_dim = int(nhd.shape[3]), int(nhd.shape[4])
     if total_tokens <= 0:
-        empty = torch.empty((0, num_kv_heads, head_dim), dtype=base.dtype, device=base.device)
+        empty = torch.empty((0, num_kv_heads, head_dim), dtype=nhd.dtype, device=nhd.device)
         return empty, empty
     n_pages = (total_tokens + tokens_per_block - 1) // tokens_per_block
-    page_ids = blocks[:n_pages].to(device=base.device, dtype=torch.long)
-    if (page_ids <= 0).any().item() or (page_ids >= base.shape[0]).any().item():
+    page_ids = blocks[:n_pages].to(device=nhd.device, dtype=torch.long)
+    if allow_zero_padded and (page_ids == 0).all().item():
+        z = torch.zeros((total_tokens, num_kv_heads, head_dim), dtype=nhd.dtype, device=nhd.device)
+        return z, z.clone()
+    if (page_ids <= 0).any().item() or (page_ids >= nhd.shape[0]).any().item():
         raise RuntimeError(
-            f"Invalid FullAttn physical page ids {page_ids.tolist()} for pool={base.shape[0]}"
+            f"Invalid FullAttn physical page ids {page_ids.tolist()} for pool={nhd.shape[0]}"
         )
-    gathered = base.index_select(0, page_ids)  # [n_pages, 2, B_tok, H_kv, D]
+    gathered = nhd.index_select(0, page_ids)  # [n_pages, 2, B_tok, H_kv, D]
     k = gathered[:, 0].reshape(n_pages * tokens_per_block, num_kv_heads, head_dim)[:total_tokens]
     v = gathered[:, 1].reshape(n_pages * tokens_per_block, num_kv_heads, head_dim)[:total_tokens]
     return k, v
@@ -524,18 +596,32 @@ def _store_single_req_full_attn_kv(
     v: torch.Tensor,
     start_pos: int,
     tokens_per_block: int,
+    *,
+    num_kv_heads: Optional[int] = None,
+    head_dim: Optional[int] = None,
+    allow_zero_padded: bool = False,
 ) -> None:
     """Write [T_new, H_kv, D] K/V starting at ``start_pos`` into paged pool."""
+    if num_kv_heads is not None and head_dim is not None:
+        nhd = _view_mha_kv_nhd(base, num_kv_heads, tokens_per_block, head_dim)
+    else:
+        nhd = base
     t_new = int(k.shape[0])
     pos = start_pos
     written = 0
     while written < t_new:
         page_idx = pos // tokens_per_block
         in_page = pos % tokens_per_block
-        phys_id = _check_phys_block(int(blocks[page_idx].item()), int(base.shape[0]), FULL_ATTN_KV_TAG, -1)
+        raw_phys = int(blocks[page_idx].item())
+        if allow_zero_padded and raw_phys == 0:
+            take = min(tokens_per_block - in_page, t_new - written)
+            pos += take
+            written += take
+            continue
+        phys_id = _check_phys_block(raw_phys, int(nhd.shape[0]), FULL_ATTN_KV_TAG, -1)
         take = min(tokens_per_block - in_page, t_new - written)
-        base[phys_id, 0, in_page : in_page + take].copy_(k[written : written + take])
-        base[phys_id, 1, in_page : in_page + take].copy_(v[written : written + take])
+        nhd[phys_id, 0, in_page : in_page + take].copy_(k[written : written + take])
+        nhd[phys_id, 1, in_page : in_page + take].copy_(v[written : written + take])
         pos += take
         written += take
 
@@ -579,34 +665,72 @@ class Qwen4_5PagedStateBridge:
         )
         k_dim = arch_cfg.linear_num_key_heads * arch_cfg.linear_key_head_dim
         v_dim = arch_cfg.linear_num_value_heads * arch_cfg.linear_value_head_dim
-        self.gdn_conv_shape = (2 * k_dim + v_dim, max(0, arch_cfg.linear_conv_kernel_dim - 1))
-        self.gdn_consumer_conv_shape = (k_dim, max(0, arch_cfg.linear_conv_kernel_dim - 1))
+        k_conv = max(0, arch_cfg.linear_conv_kernel_dim - 1)
+        self.gdn_conv_shape = (2 * k_dim + v_dim, k_conv)
+        self.gdn_consumer_conv_shape = (k_dim, k_conv)
+        full_kv_dim = arch_cfg.num_key_value_heads * arch_cfg.head_dim
+        self._opaque_shapes: Dict[str, Tuple[int, ...]] = {
+            GDN_SSM_STATE_TAG: self.ssm_shape,
+            GDN_CONV_STATE_TAG: self.gdn_conv_shape,
+            GDN_CONSUMER_Q_CONV_TAG: self.gdn_consumer_conv_shape,
+            FULL_ATTN_KV_SCONV_TAG: (2, full_kv_dim, k_conv),
+            FULL_ATTN_OUTPUT_SCONV_TAG: (arch_cfg.hidden_size, k_conv),
+            LINEAR_ATTN_OUTPUT_SCONV_TAG: (arch_cfg.hidden_size, k_conv),
+            FFN_OUTPUT_SCONV_TAG: (arch_cfg.hidden_size, k_conv),
+            PLE_STATE_TAG: (
+                arch_cfg.hc_count * arch_cfg.hidden_size,
+                max(0, arch_cfg.ple_conv_kernel_size - 1),
+            ),
+            PLE_NGRAM_CTX_TAG: (max(0, arch_cfg.ngram_size - 1),),
+        }
 
-    @staticmethod
+    def _opaque_target_spec(
+        self, tag: str, base: torch.Tensor, dtype: Optional[torch.dtype] = None
+    ) -> Tuple[Tuple[int, ...], torch.dtype]:
+        if tag == PLE_NGRAM_CTX_TAG:
+            return self._opaque_shapes[tag], torch.int64
+        if tag == GDN_SSM_STATE_TAG:
+            return self._opaque_shapes[tag], torch.float32
+        target_shape = self._opaque_shapes.get(tag, tuple(int(d) for d in base.shape[1:]))
+        target_dtype = dtype if dtype is not None else base.dtype
+        if target_dtype == torch.uint8:
+            target_dtype = torch.bfloat16
+        return target_shape, target_dtype
+
     def _unpack_decode_kv_to_padded(
+        self,
         cache: Any,
         block_table: torch.Tensor,
         prev_lens: List[int],
         max_prev: int,
         device: torch.device,
         dtype: torch.dtype,
+        *,
+        allow_zero_padded: bool = False,
     ) -> FullAttnKVCache:
         bsz = len(prev_lens)
         base = cache.kv_cache_base
         tpb = int(cache.seq_size_per_block)
-        h_kv, h_d = int(base.shape[3]), int(base.shape[4])
-        # Room for +1 new decoded token at max_prev
+        h_kv, h_d = self.cfg.num_key_value_heads, self.cfg.head_dim
         k_buf = torch.zeros((bsz, max_prev + 1, h_kv, h_d), dtype=dtype, device=device)
         v_buf = torch.zeros((bsz, max_prev + 1, h_kv, h_d), dtype=dtype, device=device)
         for b, plen in enumerate(prev_lens):
             if plen > 0:
-                k_req, v_req = _load_single_req_full_attn_kv(base, block_table[b], plen, tpb)
+                k_req, v_req = _load_single_req_full_attn_kv(
+                    base,
+                    block_table[b],
+                    plen,
+                    tpb,
+                    num_kv_heads=h_kv,
+                    head_dim=h_d,
+                    allow_zero_padded=allow_zero_padded,
+                )
                 k_buf[b, :plen].copy_(k_req)
                 v_buf[b, :plen].copy_(v_req)
         return FullAttnKVCache(k_cache=k_buf, v_cache=v_buf, seq_len=max_prev)
 
-    @staticmethod
     def _read_opaque_batch(
+        self,
         cache: Any,
         block_table: torch.Tensor,
         prev_lens: List[int],
@@ -614,37 +738,50 @@ class Qwen4_5PagedStateBridge:
         layer_idx: int,
         *,
         fill_value: int = 0,
+        target_dtype: Optional[torch.dtype] = None,
+        allow_zero_padded: bool = False,
     ) -> torch.Tensor:
         base = cache.kv_cache_base
         tpb = int(cache.seq_size_per_block)
         bsz = len(prev_lens)
+        target_shape, resolved_dtype = self._opaque_target_spec(tag, base, target_dtype)
         if fill_value == 0:
-            out = torch.zeros((bsz, *base.shape[1:]), dtype=base.dtype, device=base.device)
+            out = torch.zeros((bsz, *target_shape), dtype=resolved_dtype, device=base.device)
         else:
-            out = torch.full((bsz, *base.shape[1:]), fill_value, dtype=base.dtype, device=base.device)
+            out = torch.full((bsz, *target_shape), fill_value, dtype=resolved_dtype, device=base.device)
         for b, plen in enumerate(prev_lens):
             if plen > 0:
                 page = (plen - 1) // tpb
-                phys = _check_phys_block(int(block_table[b, page].item()), int(base.shape[0]), tag, layer_idx)
-                out[b].copy_(base[phys])
+                raw_phys = int(block_table[b, page].item())
+                if allow_zero_padded and raw_phys == 0:
+                    continue
+                phys = _check_phys_block(raw_phys, int(base.shape[0]), tag, layer_idx)
+                out[b].copy_(_view_opaque_row(base, phys, target_shape, resolved_dtype))
         return out
 
-    @staticmethod
     def _write_opaque_batch(
+        self,
         cache: Any,
         block_table: torch.Tensor,
         new_lens: List[int],
         tensor: torch.Tensor,
         tag: str,
         layer_idx: int,
+        *,
+        allow_zero_padded: bool = False,
     ) -> None:
         base = cache.kv_cache_base
         tpb = int(cache.seq_size_per_block)
+        target_shape = tuple(int(d) for d in tensor.shape[1:])
+        target_dtype = tensor.dtype
         for b, nlen in enumerate(new_lens):
             if nlen > 0:
                 page = (nlen - 1) // tpb
-                phys = _check_phys_block(int(block_table[b, page].item()), int(base.shape[0]), tag, layer_idx)
-                base[phys].copy_(tensor[b])
+                raw_phys = int(block_table[b, page].item())
+                if allow_zero_padded and raw_phys == 0:
+                    continue
+                phys = _check_phys_block(raw_phys, int(base.shape[0]), tag, layer_idx)
+                _view_opaque_row(base, phys, target_shape, target_dtype).copy_(tensor[b])
 
     def run_decode_batch(
         self,
@@ -675,6 +812,7 @@ class Qwen4_5PagedStateBridge:
             if kv_cache is not None
             else None
         )
+        is_padded = _is_padded_group(attention_inputs, FULL_ATTN_KV_TAG)
         max_prev = max(seq_lens_before) if seq_lens_before else 0
 
         emb = model.embed_tokens(input_ids_2d)
@@ -708,17 +846,36 @@ class Qwen4_5PagedStateBridge:
                         PLE_NGRAM_CTX_TAG,
                         lid,
                         fill_value=self.cfg.eos_token_id,
+                        allow_zero_padded=is_padded,
                     ),
                     conv_state=self._read_opaque_batch(
-                        ple_st_cache, bt_st, seq_lens_before, PLE_STATE_TAG, lid
+                        ple_st_cache,
+                        bt_st,
+                        seq_lens_before,
+                        PLE_STATE_TAG,
+                        lid,
+                        target_dtype=dtype,
+                        allow_zero_padded=is_padded,
                     ),
                 )
                 hyper_hidden = layer.ple(hyper_hidden, input_ids_2d, state=ple_state)
                 self._write_opaque_batch(
-                    ple_st_cache, bt_st, new_lens, ple_state.conv_state, PLE_STATE_TAG, lid
+                    ple_st_cache,
+                    bt_st,
+                    new_lens,
+                    ple_state.conv_state,
+                    PLE_STATE_TAG,
+                    lid,
+                    allow_zero_padded=is_padded,
                 )
                 self._write_opaque_batch(
-                    ple_ctx_cache, bt_ctx, new_lens, ple_state.ngram_context, PLE_NGRAM_CTX_TAG, lid
+                    ple_ctx_cache,
+                    bt_ctx,
+                    new_lens,
+                    ple_state.ngram_context,
+                    PLE_NGRAM_CTX_TAG,
+                    lid,
+                    allow_zero_padded=is_padded,
                 )
 
             # 2. Attn Hyper-Connection
@@ -771,11 +928,46 @@ class Qwen4_5PagedStateBridge:
                                 ssm_buf[b].copy_(ssm_b)
                                 q_conv_buf[b].copy_(conv_b)
                         q_state = GDNLayerState(conv_state=q_conv_buf, ssm_state=ssm_buf)
+                    elif GDN_SSM_STATE_TAG in layer_caches:
+                        c_ssm = layer_caches[GDN_SSM_STATE_TAG]
+                        bt_ssm = _block_table_for_tag(attention_inputs, GDN_SSM_STATE_TAG)
+                        ssm_buf = self._read_opaque_batch(
+                            c_ssm,
+                            bt_ssm,
+                            seq_lens_before,
+                            GDN_SSM_STATE_TAG,
+                            lid,
+                            target_dtype=torch.float32,
+                            allow_zero_padded=is_padded,
+                        )
+                        if GDN_CONV_STATE_TAG in layer_caches:
+                            c_conv = layer_caches[GDN_CONV_STATE_TAG]
+                            bt_q = _block_table_for_tag(attention_inputs, GDN_CONV_STATE_TAG)
+                            q_conv_buf = self._read_opaque_batch(
+                                c_conv,
+                                bt_q,
+                                seq_lens_before,
+                                GDN_CONSUMER_Q_CONV_TAG,
+                                lid,
+                                target_dtype=dtype,
+                                allow_zero_padded=is_padded,
+                            )
+                        else:
+                            q_conv_buf = torch.zeros(
+                                (bsz, *self.gdn_consumer_conv_shape), dtype=dtype, device=device
+                            )
+                        q_state = GDNLayerState(conv_state=q_conv_buf, ssm_state=ssm_buf)
                     elif GDN_CONSUMER_Q_CONV_TAG in layer_caches:
                         c_q = layer_caches[GDN_CONSUMER_Q_CONV_TAG]
                         bt_q = _block_table_for_tag(attention_inputs, GDN_CONSUMER_Q_CONV_TAG)
                         q_conv_buf = self._read_opaque_batch(
-                            c_q, bt_q, seq_lens_before, GDN_CONSUMER_Q_CONV_TAG, lid
+                            c_q,
+                            bt_q,
+                            seq_lens_before,
+                            GDN_CONSUMER_Q_CONV_TAG,
+                            lid,
+                            target_dtype=dtype,
+                            allow_zero_padded=is_padded,
                         )
                         q_state = GDNLayerState(
                             conv_state=q_conv_buf,
@@ -798,14 +990,39 @@ class Qwen4_5PagedStateBridge:
                         assert q_state.ssm_state is not None
                         for b, nlen in enumerate(new_lens):
                             page = (nlen - 1) // tpb_lin_c
+                            raw_phys = int(bt_lin_c[b, page].item())
+                            if is_padded and raw_phys == 0:
+                                continue
                             phys = _check_phys_block(
-                                int(bt_lin_c[b, page].item()),
+                                raw_phys,
                                 int(base_lin_c.shape[0]),
                                 LINEAR_ATTN_TAG,
                                 lid,
                             )
                             _pack_linear_block(
                                 base_lin_c[phys], q_state.ssm_state[b], q_state.conv_state[b]
+                            )
+                    elif q_state is not None and GDN_SSM_STATE_TAG in layer_caches:
+                        assert q_state.ssm_state is not None
+                        bt_ssm = _block_table_for_tag(attention_inputs, GDN_SSM_STATE_TAG)
+                        self._write_opaque_batch(
+                            layer_caches[GDN_SSM_STATE_TAG],
+                            bt_ssm,
+                            new_lens,
+                            q_state.ssm_state,
+                            GDN_SSM_STATE_TAG,
+                            lid,
+                            allow_zero_padded=is_padded,
+                        )
+                        if GDN_CONV_STATE_TAG in layer_caches and bt_q is not None:
+                            self._write_opaque_batch(
+                                layer_caches[GDN_CONV_STATE_TAG],
+                                bt_q,
+                                new_lens,
+                                q_state.conv_state,
+                                GDN_CONV_STATE_TAG,
+                                lid,
+                                allow_zero_padded=is_padded,
                             )
                     elif q_state is not None and GDN_CONSUMER_Q_CONV_TAG in layer_caches and bt_q is not None:
                         self._write_opaque_batch(
@@ -815,36 +1032,100 @@ class Qwen4_5PagedStateBridge:
                             q_state.conv_state,
                             GDN_CONSUMER_Q_CONV_TAG,
                             lid,
+                            allow_zero_padded=is_padded,
                         )
                 else:
-                    lin_cache = layer_caches[LINEAR_ATTN_TAG]
-                    bt_lin = _block_table_for_tag(attention_inputs, LINEAR_ATTN_TAG)
-                    tpb = int(lin_cache.seq_size_per_block)
-                    base_lin = lin_cache.kv_cache_base
-                    conv_buf = torch.zeros((bsz, *self.gdn_conv_shape), dtype=dtype, device=device)
-                    ssm_buf = torch.zeros((bsz, *self.ssm_shape), dtype=torch.float32, device=device)
-                    for b, plen in enumerate(seq_lens_before):
-                        if plen > 0:
-                            page = (plen - 1) // tpb
-                            phys = _check_phys_block(int(bt_lin[b, page].item()), int(base_lin.shape[0]), LINEAR_ATTN_TAG, lid)
-                            ssm_b, conv_b = _unpack_linear_block(
-                                base_lin[phys], self.ssm_shape, self.gdn_conv_shape, dtype
+                    if GDN_SSM_STATE_TAG in layer_caches:
+                        c_ssm = layer_caches[GDN_SSM_STATE_TAG]
+                        bt_ssm = _block_table_for_tag(attention_inputs, GDN_SSM_STATE_TAG)
+                        ssm_buf = self._read_opaque_batch(
+                            c_ssm,
+                            bt_ssm,
+                            seq_lens_before,
+                            GDN_SSM_STATE_TAG,
+                            lid,
+                            target_dtype=torch.float32,
+                            allow_zero_padded=is_padded,
+                        )
+                        if GDN_CONV_STATE_TAG in layer_caches:
+                            c_conv = layer_caches[GDN_CONV_STATE_TAG]
+                            bt_conv = _block_table_for_tag(attention_inputs, GDN_CONV_STATE_TAG)
+                            conv_buf = self._read_opaque_batch(
+                                c_conv,
+                                bt_conv,
+                                seq_lens_before,
+                                GDN_CONV_STATE_TAG,
+                                lid,
+                                target_dtype=dtype,
+                                allow_zero_padded=is_padded,
                             )
-                            ssm_buf[b].copy_(ssm_b)
-                            conv_buf[b].copy_(conv_b)
-                    gdn_state = GDNLayerState(conv_state=conv_buf, ssm_state=ssm_buf)
-                    attn_out, published = layer.linear_attn(
-                        attn_in,
-                        state=gdn_state,
-                        shared=None,
-                        enable_yoco_decode=yoco_on,
-                    )
-                    if published is not None:
-                        shared_gdn[lid] = published
-                    for b, nlen in enumerate(new_lens):
-                        page = (nlen - 1) // tpb
-                        phys = _check_phys_block(int(bt_lin[b, page].item()), int(base_lin.shape[0]), LINEAR_ATTN_TAG, lid)
-                        _pack_linear_block(base_lin[phys], gdn_state.ssm_state[b], gdn_state.conv_state[b])
+                        else:
+                            bt_conv = None
+                            conv_buf = torch.zeros((bsz, *self.gdn_conv_shape), dtype=dtype, device=device)
+                        gdn_state = GDNLayerState(conv_state=conv_buf, ssm_state=ssm_buf)
+                        attn_out, published = layer.linear_attn(
+                            attn_in,
+                            state=gdn_state,
+                            shared=None,
+                            enable_yoco_decode=yoco_on,
+                        )
+                        if published is not None:
+                            shared_gdn[lid] = published
+                        assert gdn_state.ssm_state is not None
+                        self._write_opaque_batch(
+                            c_ssm,
+                            bt_ssm,
+                            new_lens,
+                            gdn_state.ssm_state,
+                            GDN_SSM_STATE_TAG,
+                            lid,
+                            allow_zero_padded=is_padded,
+                        )
+                        if GDN_CONV_STATE_TAG in layer_caches and bt_conv is not None:
+                            self._write_opaque_batch(
+                                layer_caches[GDN_CONV_STATE_TAG],
+                                bt_conv,
+                                new_lens,
+                                gdn_state.conv_state,
+                                GDN_CONV_STATE_TAG,
+                                lid,
+                                allow_zero_padded=is_padded,
+                            )
+                    else:
+                        lin_cache = layer_caches[LINEAR_ATTN_TAG]
+                        bt_lin = _block_table_for_tag(attention_inputs, LINEAR_ATTN_TAG)
+                        tpb = int(lin_cache.seq_size_per_block)
+                        base_lin = lin_cache.kv_cache_base
+                        conv_buf = torch.zeros((bsz, *self.gdn_conv_shape), dtype=dtype, device=device)
+                        ssm_buf = torch.zeros((bsz, *self.ssm_shape), dtype=torch.float32, device=device)
+                        for b, plen in enumerate(seq_lens_before):
+                            if plen > 0:
+                                page = (plen - 1) // tpb
+                                raw_phys = int(bt_lin[b, page].item())
+                                if is_padded and raw_phys == 0:
+                                    continue
+                                phys = _check_phys_block(raw_phys, int(base_lin.shape[0]), LINEAR_ATTN_TAG, lid)
+                                ssm_b, conv_b = _unpack_linear_block(
+                                    base_lin[phys], self.ssm_shape, self.gdn_conv_shape, dtype
+                                )
+                                ssm_buf[b].copy_(ssm_b)
+                                conv_buf[b].copy_(conv_b)
+                        gdn_state = GDNLayerState(conv_state=conv_buf, ssm_state=ssm_buf)
+                        attn_out, published = layer.linear_attn(
+                            attn_in,
+                            state=gdn_state,
+                            shared=None,
+                            enable_yoco_decode=yoco_on,
+                        )
+                        if published is not None:
+                            shared_gdn[lid] = published
+                        for b, nlen in enumerate(new_lens):
+                            page = (nlen - 1) // tpb
+                            raw_phys = int(bt_lin[b, page].item())
+                            if is_padded and raw_phys == 0:
+                                continue
+                            phys = _check_phys_block(raw_phys, int(base_lin.shape[0]), LINEAR_ATTN_TAG, lid)
+                            _pack_linear_block(base_lin[phys], gdn_state.ssm_state[b], gdn_state.conv_state[b])
             else:
                 assert layer.self_attn is not None and full_block_table is not None
                 if not layer.is_consumer:
@@ -852,7 +1133,13 @@ class Qwen4_5PagedStateBridge:
                     sc_c = layer_caches.get(FULL_ATTN_KV_SCONV_TAG)
                     bt_kv = _block_table_for_tag(attention_inputs, FULL_ATTN_KV_TAG)
                     ephemeral_kv = self._unpack_decode_kv_to_padded(
-                        kv_c, bt_kv, seq_lens_before, max_prev, device, dtype
+                        kv_c,
+                        bt_kv,
+                        seq_lens_before,
+                        max_prev,
+                        device,
+                        dtype,
+                        allow_zero_padded=is_padded,
                     )
                     k_sc_st: Optional[ShortConvState] = None
                     v_sc_st: Optional[ShortConvState] = None
@@ -860,7 +1147,13 @@ class Qwen4_5PagedStateBridge:
                     if sc_c is not None:
                         bt_sc = _block_table_for_tag(attention_inputs, FULL_ATTN_KV_SCONV_TAG)
                         kv_sc_buf = self._read_opaque_batch(
-                            sc_c, bt_sc, seq_lens_before, FULL_ATTN_KV_SCONV_TAG, lid
+                            sc_c,
+                            bt_sc,
+                            seq_lens_before,
+                            FULL_ATTN_KV_SCONV_TAG,
+                            lid,
+                            target_dtype=dtype,
+                            allow_zero_padded=is_padded,
                         )
                         k_sc_st = ShortConvState(kv_sc_buf[:, 0].clone())
                         v_sc_st = ShortConvState(kv_sc_buf[:, 1].clone())
@@ -903,7 +1196,17 @@ class Qwen4_5PagedStateBridge:
                     for b, plen in enumerate(seq_lens_before):
                         k_tok = ephemeral_kv.k_cache[b : b + 1, plen] if len(set(seq_lens_before)) != 1 else ephemeral_kv.k_cache[b : b + 1, max_prev]
                         v_tok = ephemeral_kv.v_cache[b : b + 1, plen] if len(set(seq_lens_before)) != 1 else ephemeral_kv.v_cache[b : b + 1, max_prev]
-                        _store_single_req_full_attn_kv(kv_c.kv_cache_base, bt_kv[b], k_tok, v_tok, plen, tpb)
+                        _store_single_req_full_attn_kv(
+                            kv_c.kv_cache_base,
+                            bt_kv[b],
+                            k_tok,
+                            v_tok,
+                            plen,
+                            tpb,
+                            num_kv_heads=self.cfg.num_key_value_heads,
+                            head_dim=self.cfg.head_dim,
+                            allow_zero_padded=is_padded,
+                        )
                     if len(set(seq_lens_before)) == 1:
                         # Repack contiguous valid KV for consumer layers on this step
                         full_kv_ephemeral[lid] = ephemeral_kv
@@ -917,7 +1220,13 @@ class Qwen4_5PagedStateBridge:
                     if sc_c is not None and bt_sc is not None and k_sc_st is not None and v_sc_st is not None:
                         packed_sc = torch.stack([k_sc_st.conv_state, v_sc_st.conv_state], dim=1)
                         self._write_opaque_batch(
-                            sc_c, bt_sc, new_lens, packed_sc, FULL_ATTN_KV_SCONV_TAG, lid
+                            sc_c,
+                            bt_sc,
+                            new_lens,
+                            packed_sc,
+                            FULL_ATTN_KV_SCONV_TAG,
+                            lid,
+                            allow_zero_padded=is_padded,
                         )
                 else:
                     src_lid = layer.kv_cache_owner
@@ -935,7 +1244,13 @@ class Qwen4_5PagedStateBridge:
                         req_outs = []
                         for b, plen in enumerate(seq_lens_before):
                             k_req, v_req = _load_single_req_full_attn_kv(
-                                src_base, src_bt[b], plen + 1, src_tpb
+                                src_base,
+                                src_bt[b],
+                                plen + 1,
+                                src_tpb,
+                                num_kv_heads=self.cfg.num_key_value_heads,
+                                head_dim=self.cfg.head_dim,
+                                allow_zero_padded=is_padded,
                             )
                             kv_b = FullAttnKVCache(
                                 k_cache=k_req.unsqueeze(0),
@@ -962,10 +1277,26 @@ class Qwen4_5PagedStateBridge:
                 c_ao = layer_caches[tag_out]
                 bt_ao = _block_table_for_tag(attention_inputs, tag_out)
                 ao_state = ShortConvState(
-                    self._read_opaque_batch(c_ao, bt_ao, seq_lens_before, tag_out, lid)
+                    self._read_opaque_batch(
+                        c_ao,
+                        bt_ao,
+                        seq_lens_before,
+                        tag_out,
+                        lid,
+                        target_dtype=dtype,
+                        allow_zero_padded=is_padded,
+                    )
                 )
                 attn_out = layer.attn_output_sconv(attn_out, state=ao_state)
-                self._write_opaque_batch(c_ao, bt_ao, new_lens, ao_state.conv_state, tag_out, lid)
+                self._write_opaque_batch(
+                    c_ao,
+                    bt_ao,
+                    new_lens,
+                    ao_state.conv_state,
+                    tag_out,
+                    lid,
+                    allow_zero_padded=is_padded,
+                )
             if self.cfg.clip_attn_output is not None:
                 attn_out = attn_out.clamp(-self.cfg.clip_attn_output, self.cfg.clip_attn_output)
 
@@ -986,11 +1317,25 @@ class Qwen4_5PagedStateBridge:
                 c_fo = layer_caches[FFN_OUTPUT_SCONV_TAG]
                 bt_fo = _block_table_for_tag(attention_inputs, FFN_OUTPUT_SCONV_TAG)
                 fo_state = ShortConvState(
-                    self._read_opaque_batch(c_fo, bt_fo, seq_lens_before, FFN_OUTPUT_SCONV_TAG, lid)
+                    self._read_opaque_batch(
+                        c_fo,
+                        bt_fo,
+                        seq_lens_before,
+                        FFN_OUTPUT_SCONV_TAG,
+                        lid,
+                        target_dtype=dtype,
+                        allow_zero_padded=is_padded,
+                    )
                 )
                 mlp_out = layer.ffn_output_sconv(mlp_out, state=fo_state)
                 self._write_opaque_batch(
-                    c_fo, bt_fo, new_lens, fo_state.conv_state, FFN_OUTPUT_SCONV_TAG, lid
+                    c_fo,
+                    bt_fo,
+                    new_lens,
+                    fo_state.conv_state,
+                    FFN_OUTPUT_SCONV_TAG,
+                    lid,
+                    allow_zero_padded=is_padded,
                 )
             if self.cfg.clip_mlp_output is not None:
                 mlp_out = mlp_out.clamp(-self.cfg.clip_mlp_output, self.cfg.clip_mlp_output)
@@ -1032,26 +1377,54 @@ class Qwen4_5PagedStateBridge:
             offsets.append(cur)
             cur += ln
 
+        seg_tpb = 0
+        if kv_cache is not None and not isinstance(kv_cache, LocalKVCache):
+            for lid_probe in range(len(model.layers)):
+                grps = kv_cache.get_layer_cache_groups(lid_probe)
+                if grps:
+                    seg_tpb = int(grps[0].seq_size_per_block)
+                    break
+
+        seg_specs: List[Tuple[int, int, int, int]] = []
+        for b in range(bsz):
+            t_in = input_lengths[b]
+            t_pfx = prefix_lengths[b]
+            if t_in == 0:
+                continue
+            if seg_tpb <= 0:
+                seg_specs.append((b, offsets[b], t_in, t_pfx))
+            else:
+                pos_c = t_pfx
+                rem = t_in
+                off_c = offsets[b]
+                while rem > 0:
+                    next_bound = ((pos_c // seg_tpb) + 1) * seg_tpb
+                    take = min(rem, next_bound - pos_c)
+                    seg_specs.append((b, off_c, take, pos_c))
+                    pos_c += take
+                    off_c += take
+                    rem -= take
+
+        num_segs = len(seg_specs)
         total_tokens = int(flat_input_ids.numel())
         emb_flat = model.embed_tokens(flat_input_ids)
         hyper_reqs = [
-            emb_flat[offsets[b] : offsets[b] + input_lengths[b]].unsqueeze(0).repeat(1, 1, self.cfg.hc_count)
-            for b in range(bsz)
+            emb_flat[off_c : off_c + ln_c].unsqueeze(0).repeat(1, 1, self.cfg.hc_count)
+            for _, off_c, ln_c, _ in seg_specs
         ]
         tokens_reqs = [
-            flat_input_ids[offsets[b] : offsets[b] + input_lengths[b]].unsqueeze(0)
-            for b in range(bsz)
+            flat_input_ids[off_c : off_c + ln_c].unsqueeze(0)
+            for _, off_c, ln_c, _ in seg_specs
         ]
         pos_reqs = [
-            flat_positions[offsets[b] : offsets[b] + input_lengths[b]].unsqueeze(0)
-            for b in range(bsz)
+            flat_positions[off_c : off_c + ln_c].unsqueeze(0)
+            for _, off_c, ln_c, _ in seg_specs
         ]
-        prev_latents: List[Optional[torch.Tensor]] = [None] * bsz
-        deferreds: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [None] * bsz
-        # Per-request shared YoCo state across layers (plus ephemeral pre-suffix SSM state for prefix reuse)
-        shared_gdn_reqs: List[Dict[int, Any]] = [{} for _ in range(bsz)]
-        source_prefix_ssm_reqs: List[Dict[int, Optional[torch.Tensor]]] = [{} for _ in range(bsz)]
-        full_kv_reqs: List[Dict[int, FullAttnKVCache]] = [{} for _ in range(bsz)]
+        prev_latents: List[Optional[torch.Tensor]] = [None] * num_segs
+        deferreds: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [None] * num_segs
+        shared_gdn_reqs: List[Dict[int, Any]] = [{} for _ in range(num_segs)]
+        source_prefix_ssm_reqs: List[Dict[int, Optional[torch.Tensor]]] = [{} for _ in range(num_segs)]
+        full_kv_reqs: List[Dict[int, FullAttnKVCache]] = [{} for _ in range(num_segs)]
 
         for layer in model.layers:
             assert isinstance(layer, Qwen4_5DecoderLayer)
@@ -1062,17 +1435,13 @@ class Qwen4_5PagedStateBridge:
                 else {}
             )
 
-            for b in range(bsz):
-                t_in = input_lengths[b]
-                t_pfx = prefix_lengths[b]
+            for s_idx, (bt_b, _seg_off, t_in, t_pfx) in enumerate(seg_specs):
                 t_tot = t_pfx + t_in
-                if t_in == 0:
-                    continue
-                h_b = hyper_reqs[b]
-                tok_b = tokens_reqs[b]
-                pos_b = pos_reqs[b]
-                pl_b = prev_latents[b]
-                df_b = deferreds[b]
+                h_b = hyper_reqs[s_idx]
+                tok_b = tokens_reqs[s_idx]
+                pos_b = pos_reqs[s_idx]
+                pl_b = prev_latents[s_idx]
+                df_b = deferreds[s_idx]
 
                 # 1. Optional PLE
                 if layer.ple is not None:
@@ -1087,14 +1456,19 @@ class Qwen4_5PagedStateBridge:
                         ple_state = PLELayerState(
                             ngram_context=self._read_opaque_batch(
                                 c_ctx,
-                                bt_ctx[b : b + 1],
+                                bt_ctx[bt_b : bt_b + 1],
                                 [t_pfx],
                                 PLE_NGRAM_CTX_TAG,
                                 lid,
                                 fill_value=self.cfg.eos_token_id,
                             ),
                             conv_state=self._read_opaque_batch(
-                                c_st, bt_st[b : b + 1], [t_pfx], PLE_STATE_TAG, lid
+                                c_st,
+                                bt_st[bt_b : bt_b + 1],
+                                [t_pfx],
+                                PLE_STATE_TAG,
+                                lid,
+                                target_dtype=dtype,
                             ),
                         )
                     else:
@@ -1102,10 +1476,10 @@ class Qwen4_5PagedStateBridge:
                     h_b = layer.ple(h_b, tok_b, state=ple_state)
                     if kv_cache is not None:
                         self._write_opaque_batch(
-                            c_st, bt_st[b : b + 1], [t_tot], ple_state.conv_state, PLE_STATE_TAG, lid
+                            c_st, bt_st[bt_b : bt_b + 1], [t_tot], ple_state.conv_state, PLE_STATE_TAG, lid
                         )
                         self._write_opaque_batch(
-                            c_ctx, bt_ctx[b : b + 1], [t_tot], ple_state.ngram_context, PLE_NGRAM_CTX_TAG, lid
+                            c_ctx, bt_ctx[bt_b : bt_b + 1], [t_tot], ple_state.ngram_context, PLE_NGRAM_CTX_TAG, lid
                         )
 
                 # 2. Attn HC
@@ -1136,7 +1510,7 @@ class Qwen4_5PagedStateBridge:
                             if t_pfx > 0:
                                 page = (t_pfx - 1) // tpb_lin_c
                                 phys = _check_phys_block(
-                                    int(bt_lin_c[b, page].item()),
+                                    int(bt_lin_c[bt_b, page].item()),
                                     int(base_lin_c.shape[0]),
                                     LINEAR_ATTN_TAG,
                                     lid,
@@ -1160,12 +1534,39 @@ class Qwen4_5PagedStateBridge:
                                         (1, *self.ssm_shape), dtype=torch.float32, device=device
                                     ),
                                 )
+                        elif GDN_SSM_STATE_TAG in layer_caches and kv_cache is not None:
+                            c_ssm = layer_caches[GDN_SSM_STATE_TAG]
+                            bt_ssm = _block_table_for_tag(attention_inputs, GDN_SSM_STATE_TAG)
+                            ssm_b_t = self._read_opaque_batch(
+                                c_ssm,
+                                bt_ssm[bt_b : bt_b + 1],
+                                [t_pfx],
+                                GDN_SSM_STATE_TAG,
+                                lid,
+                                target_dtype=torch.float32,
+                            )
+                            if GDN_CONV_STATE_TAG in layer_caches:
+                                c_q = layer_caches[GDN_CONV_STATE_TAG]
+                                bt_q = _block_table_for_tag(attention_inputs, GDN_CONV_STATE_TAG)
+                                conv_b_t = self._read_opaque_batch(
+                                    c_q,
+                                    bt_q[bt_b : bt_b + 1],
+                                    [t_pfx],
+                                    GDN_CONSUMER_Q_CONV_TAG,
+                                    lid,
+                                    target_dtype=dtype,
+                                )
+                            else:
+                                conv_b_t = torch.zeros(
+                                    (1, *self.gdn_consumer_conv_shape), dtype=dtype, device=device
+                                )
+                            q_state = GDNLayerState(conv_state=conv_b_t, ssm_state=ssm_b_t)
                         elif GDN_CONSUMER_Q_CONV_TAG in layer_caches and kv_cache is not None:
                             c_q = layer_caches[GDN_CONSUMER_Q_CONV_TAG]
                             bt_q = _block_table_for_tag(attention_inputs, GDN_CONSUMER_Q_CONV_TAG)
                             ephemeral_ssm: Optional[torch.Tensor] = None
                             if yoco_on and t_pfx > 0 and t_in > 1:
-                                src_pfx = source_prefix_ssm_reqs[b].get(layer.source_layer_idx)  # type: ignore[arg-type]
+                                src_pfx = source_prefix_ssm_reqs[s_idx].get(layer.source_layer_idx)  # type: ignore[arg-type]
                                 if src_pfx is not None:
                                     ephemeral_ssm = src_pfx.clone()
                             elif not yoco_on:
@@ -1174,7 +1575,12 @@ class Qwen4_5PagedStateBridge:
                                 )
                             q_state = GDNLayerState(
                                 conv_state=self._read_opaque_batch(
-                                    c_q, bt_q[b : b + 1], [t_pfx], GDN_CONSUMER_Q_CONV_TAG, lid
+                                    c_q,
+                                    bt_q[bt_b : bt_b + 1],
+                                    [t_pfx],
+                                    GDN_CONSUMER_Q_CONV_TAG,
+                                    lid,
+                                    target_dtype=dtype,
                                 ),
                                 ssm_state=ephemeral_ssm,
                             )
@@ -1185,14 +1591,14 @@ class Qwen4_5PagedStateBridge:
                         attn_out, _ = layer.linear_attn(
                             attn_in,
                             state=q_state,
-                            shared=shared_gdn_reqs[b][layer.source_layer_idx],  # type: ignore[index]
+                            shared=shared_gdn_reqs[s_idx][layer.source_layer_idx],  # type: ignore[index]
                             enable_yoco_decode=yoco_on,
                         )
                         if q_state is not None and LINEAR_ATTN_TAG in layer_caches and kv_cache is not None and bt_lin_c is not None and base_lin_c is not None:
                             assert q_state.ssm_state is not None
                             end_page = (t_tot - 1) // tpb_lin_c
                             phys = _check_phys_block(
-                                int(bt_lin_c[b, end_page].item()),
+                                int(bt_lin_c[bt_b, end_page].item()),
                                 int(base_lin_c.shape[0]),
                                 LINEAR_ATTN_TAG,
                                 lid,
@@ -1200,19 +1606,56 @@ class Qwen4_5PagedStateBridge:
                             _pack_linear_block(
                                 base_lin_c[phys], q_state.ssm_state[0], q_state.conv_state[0]
                             )
+                        elif q_state is not None and GDN_SSM_STATE_TAG in layer_caches and kv_cache is not None:
+                            assert q_state.ssm_state is not None
+                            self._write_opaque_batch(
+                                c_ssm, bt_ssm[bt_b : bt_b + 1], [t_tot], q_state.ssm_state, GDN_SSM_STATE_TAG, lid
+                            )
+                            if GDN_CONV_STATE_TAG in layer_caches:
+                                self._write_opaque_batch(
+                                    c_q, bt_q[bt_b : bt_b + 1], [t_tot], q_state.conv_state, GDN_CONV_STATE_TAG, lid
+                                )
                         elif q_state is not None and GDN_CONSUMER_Q_CONV_TAG in layer_caches and kv_cache is not None:
                             self._write_opaque_batch(
-                                c_q, bt_q[b : b + 1], [t_tot], q_state.conv_state, GDN_CONSUMER_Q_CONV_TAG, lid
+                                c_q, bt_q[bt_b : bt_b + 1], [t_tot], q_state.conv_state, GDN_CONSUMER_Q_CONV_TAG, lid
                             )
                     else:
-                        if kv_cache is not None:
+                        use_split_gdn = kv_cache is not None and GDN_SSM_STATE_TAG in layer_caches
+                        if use_split_gdn:
+                            c_ssm = layer_caches[GDN_SSM_STATE_TAG]
+                            bt_ssm = _block_table_for_tag(attention_inputs, GDN_SSM_STATE_TAG)
+                            ssm_t = self._read_opaque_batch(
+                                c_ssm,
+                                bt_ssm[bt_b : bt_b + 1],
+                                [t_pfx],
+                                GDN_SSM_STATE_TAG,
+                                lid,
+                                target_dtype=torch.float32,
+                            )
+                            if GDN_CONV_STATE_TAG in layer_caches:
+                                c_conv = layer_caches[GDN_CONV_STATE_TAG]
+                                bt_conv = _block_table_for_tag(attention_inputs, GDN_CONV_STATE_TAG)
+                                conv_t = self._read_opaque_batch(
+                                    c_conv,
+                                    bt_conv[bt_b : bt_b + 1],
+                                    [t_pfx],
+                                    GDN_CONV_STATE_TAG,
+                                    lid,
+                                    target_dtype=dtype,
+                                )
+                            else:
+                                c_conv = None
+                                bt_conv = None
+                                conv_t = torch.zeros((1, *self.gdn_conv_shape), dtype=dtype, device=device)
+                            gdn_state = GDNLayerState(conv_state=conv_t, ssm_state=ssm_t)
+                        elif kv_cache is not None:
                             lin_cache = layer_caches[LINEAR_ATTN_TAG]
                             bt_lin = _block_table_for_tag(attention_inputs, LINEAR_ATTN_TAG)
                             tpb = int(lin_cache.seq_size_per_block)
                             base_lin = lin_cache.kv_cache_base
                             if t_pfx > 0:
                                 page = (t_pfx - 1) // tpb
-                                phys = _check_phys_block(int(bt_lin[b, page].item()), int(base_lin.shape[0]), LINEAR_ATTN_TAG, lid)
+                                phys = _check_phys_block(int(bt_lin[bt_b, page].item()), int(base_lin.shape[0]), LINEAR_ATTN_TAG, lid)
                                 ssm_b, conv_b = _unpack_linear_block(
                                     base_lin[phys], self.ssm_shape, self.gdn_conv_shape, dtype
                                 )
@@ -1229,7 +1672,7 @@ class Qwen4_5PagedStateBridge:
                             gdn_state = layer.linear_attn.create_state(1, device=device, dtype=dtype)
 
                         if layer.is_source:
-                            source_prefix_ssm_reqs[b][lid] = (
+                            source_prefix_ssm_reqs[s_idx][lid] = (
                                 gdn_state.ssm_state.clone()
                                 if (t_pfx > 0 and gdn_state.ssm_state is not None)
                                 else None
@@ -1241,10 +1684,19 @@ class Qwen4_5PagedStateBridge:
                             enable_yoco_decode=yoco_on,
                         )
                         if published is not None:
-                            shared_gdn_reqs[b][lid] = published
-                        if kv_cache is not None:
+                            shared_gdn_reqs[s_idx][lid] = published
+                        if use_split_gdn:
+                            assert gdn_state.ssm_state is not None
+                            self._write_opaque_batch(
+                                c_ssm, bt_ssm[bt_b : bt_b + 1], [t_tot], gdn_state.ssm_state, GDN_SSM_STATE_TAG, lid
+                            )
+                            if c_conv is not None and bt_conv is not None:
+                                self._write_opaque_batch(
+                                    c_conv, bt_conv[bt_b : bt_b + 1], [t_tot], gdn_state.conv_state, GDN_CONV_STATE_TAG, lid
+                                )
+                        elif kv_cache is not None:
                             end_page = (t_tot - 1) // tpb
-                            phys = _check_phys_block(int(bt_lin[b, end_page].item()), int(base_lin.shape[0]), LINEAR_ATTN_TAG, lid)
+                            phys = _check_phys_block(int(bt_lin[bt_b, end_page].item()), int(base_lin.shape[0]), LINEAR_ATTN_TAG, lid)
                             _pack_linear_block(base_lin[phys], gdn_state.ssm_state[0], gdn_state.conv_state[0])
                 else:
                     assert layer.self_attn is not None
@@ -1261,7 +1713,12 @@ class Qwen4_5PagedStateBridge:
                             v_buf = torch.zeros_like(k_buf)
                             if t_pfx > 0:
                                 k_p, v_p = _load_single_req_full_attn_kv(
-                                    kv_c.kv_cache_base, bt_kv[b], t_pfx, tpb
+                                    kv_c.kv_cache_base,
+                                    bt_kv[bt_b],
+                                    t_pfx,
+                                    tpb,
+                                    num_kv_heads=self.cfg.num_key_value_heads,
+                                    head_dim=self.cfg.head_dim,
                                 )
                                 k_buf[0, :t_pfx].copy_(k_p)
                                 v_buf[0, :t_pfx].copy_(v_p)
@@ -1271,7 +1728,12 @@ class Qwen4_5PagedStateBridge:
                             if sc_c is not None:
                                 bt_sc = _block_table_for_tag(attention_inputs, FULL_ATTN_KV_SCONV_TAG)
                                 kv_sc_buf = self._read_opaque_batch(
-                                    sc_c, bt_sc[b : b + 1], [t_pfx], FULL_ATTN_KV_SCONV_TAG, lid
+                                    sc_c,
+                                    bt_sc[bt_b : bt_b + 1],
+                                    [t_pfx],
+                                    FULL_ATTN_KV_SCONV_TAG,
+                                    lid,
+                                    target_dtype=dtype,
                                 )
                                 k_sc_st = ShortConvState(kv_sc_buf[:, 0].clone())
                                 v_sc_st = ShortConvState(kv_sc_buf[:, 1].clone())
@@ -1285,17 +1747,19 @@ class Qwen4_5PagedStateBridge:
                             )
                             _store_single_req_full_attn_kv(
                                 kv_c.kv_cache_base,
-                                bt_kv[b],
+                                bt_kv[bt_b],
                                 kv_obj.k_cache[0, t_pfx:t_tot],
                                 kv_obj.v_cache[0, t_pfx:t_tot],
                                 t_pfx,
                                 tpb,
+                                num_kv_heads=self.cfg.num_key_value_heads,
+                                head_dim=self.cfg.head_dim,
                             )
-                            full_kv_reqs[b][lid] = kv_obj
+                            full_kv_reqs[s_idx][lid] = kv_obj
                             if sc_c is not None and k_sc_st is not None and v_sc_st is not None:
                                 packed_sc = torch.stack([k_sc_st.conv_state, v_sc_st.conv_state], dim=1)
                                 self._write_opaque_batch(
-                                    sc_c, bt_sc[b : b + 1], [t_tot], packed_sc, FULL_ATTN_KV_SCONV_TAG, lid
+                                    sc_c, bt_sc[bt_b : bt_b + 1], [t_tot], packed_sc, FULL_ATTN_KV_SCONV_TAG, lid
                                 )
                         else:
                             kv_obj = layer.self_attn.create_kv_cache(1, t_tot, device=device, dtype=dtype)
@@ -1308,12 +1772,12 @@ class Qwen4_5PagedStateBridge:
                                 v_sconv_state=v_sc_st,
                                 seq_offset=t_pfx,
                             )
-                            full_kv_reqs[b][lid] = kv_obj
+                            full_kv_reqs[s_idx][lid] = kv_obj
                     else:
                         attn_out = layer.self_attn(
                             attn_in,
                             positions=pos_b,
-                            kv_cache=full_kv_reqs[b][layer.kv_cache_owner],
+                            kv_cache=full_kv_reqs[s_idx][layer.kv_cache_owner],
                             seq_offset=t_pfx,
                         )
 
@@ -1328,14 +1792,21 @@ class Qwen4_5PagedStateBridge:
                         c_ao = layer_caches[tag_out]
                         bt_ao = _block_table_for_tag(attention_inputs, tag_out)
                         ao_state = ShortConvState(
-                            self._read_opaque_batch(c_ao, bt_ao[b : b + 1], [t_pfx], tag_out, lid)
+                            self._read_opaque_batch(
+                                c_ao,
+                                bt_ao[bt_b : bt_b + 1],
+                                [t_pfx],
+                                tag_out,
+                                lid,
+                                target_dtype=dtype,
+                            )
                         )
                     else:
                         ao_state = layer.attn_output_sconv.alloc_state(1, device=device, dtype=dtype)
                     attn_out = layer.attn_output_sconv(attn_out, state=ao_state)
                     if kv_cache is not None:
                         self._write_opaque_batch(
-                            c_ao, bt_ao[b : b + 1], [t_tot], ao_state.conv_state, tag_out, lid
+                            c_ao, bt_ao[bt_b : bt_b + 1], [t_tot], ao_state.conv_state, tag_out, lid
                         )
                 if self.cfg.clip_attn_output is not None:
                     attn_out = attn_out.clamp(-self.cfg.clip_attn_output, self.cfg.clip_attn_output)
@@ -1356,7 +1827,12 @@ class Qwen4_5PagedStateBridge:
                         bt_fo = _block_table_for_tag(attention_inputs, FFN_OUTPUT_SCONV_TAG)
                         fo_state = ShortConvState(
                             self._read_opaque_batch(
-                                c_fo, bt_fo[b : b + 1], [t_pfx], FFN_OUTPUT_SCONV_TAG, lid
+                                c_fo,
+                                bt_fo[bt_b : bt_b + 1],
+                                [t_pfx],
+                                FFN_OUTPUT_SCONV_TAG,
+                                lid,
+                                target_dtype=dtype,
                             )
                         )
                     else:
@@ -1364,30 +1840,27 @@ class Qwen4_5PagedStateBridge:
                     mlp_out = layer.ffn_output_sconv(mlp_out, state=fo_state)
                     if kv_cache is not None:
                         self._write_opaque_batch(
-                            c_fo, bt_fo[b : b + 1], [t_tot], fo_state.conv_state, FFN_OUTPUT_SCONV_TAG, lid
+                            c_fo, bt_fo[bt_b : bt_b + 1], [t_tot], fo_state.conv_state, FFN_OUTPUT_SCONV_TAG, lid
                         )
                 if self.cfg.clip_mlp_output is not None:
                     mlp_out = mlp_out.clamp(-self.cfg.clip_mlp_output, self.cfg.clip_mlp_output)
 
-                hyper_reqs[b] = h_b
-                prev_latents[b] = pl_b
-                deferreds[b] = (mlp_out, mlp_inj)
+                hyper_reqs[s_idx] = h_b
+                prev_latents[s_idx] = pl_b
+                deferreds[s_idx] = (mlp_out, mlp_inj)
 
             # All batch rows have finished writing layer_idx physical pages -> publish to PD CacheStore!
             if writers:
                 publish_qwen4_5_layer_caches(kv_cache, lid, writers)
 
         flat_out = torch.empty((total_tokens, self.cfg.hidden_size), dtype=dtype, device=device)
-        for b in range(bsz):
-            t_in = input_lengths[b]
-            if t_in == 0:
-                continue
-            df_b = deferreds[b]
+        for s_idx, (_bt_b, seg_off, t_in, _t_pfx) in enumerate(seg_specs):
+            df_b = deferreds[s_idx]
             assert df_b is not None
             hid_b, _, _, _ = model.hyper_connection_mixer.combine_and_mix_with_latent(
-                df_b[0], hyper_reqs[b], df_b[1], prev_latent=None
+                df_b[0], hyper_reqs[s_idx], df_b[1], prev_latent=None
             )
-            flat_out[offsets[b] : offsets[b] + t_in].copy_(hid_b[0])
+            flat_out[seg_off : seg_off + t_in].copy_(hid_b[0])
         return flat_out
 
 
@@ -1481,23 +1954,44 @@ class Qwen4_5RTPModel(_RtpGptModelBase):
         cls,
         causal_lm: Qwen4_5ForCausalLM,
         *,
+        model_config: Any = None,
+        parallelism_config: Any = None,
+        weight: Any = None,
         kv_cache: Any = None,
         max_generate_batch_size: int = 128,
+        fmha_config: Any = None,
+        py_hw_kernel_config: Any = None,
     ) -> "Qwen4_5RTPModel":
         """Wrap an initialized ``Qwen4_5ForCausalLM`` into an RTP-LLM Paged/PD runtime model."""
         from rtp_llm.config.qwen4_5_config import Qwen4_5ModelConfig
 
-        mcfg = Qwen4_5ModelConfig(arch_config=causal_lm.config)
+        mcfg = (
+            model_config
+            if model_config is not None
+            else Qwen4_5ModelConfig(arch_config=causal_lm.config)
+        )
         return cls(
             config=mcfg,
+            parallelism_config=parallelism_config,
+            weight=weight,
+            max_generate_batch_size=max_generate_batch_size,
+            fmha_config=fmha_config,
+            py_hw_kernel_config=py_hw_kernel_config,
             arch_config=causal_lm.config,
             backbone=causal_lm.model,
             lm_head=causal_lm.lm_head,
             kv_cache=kv_cache,
-            max_generate_batch_size=max_generate_batch_size,
             device=causal_lm.model.embed_tokens.weight.device,
             dtype=causal_lm.model.embed_tokens.weight.dtype,
         )
+
+    def initialize(self, init_resource: Any) -> bool:
+        """Attach engine-allocated ``KVCache`` pool from ``PyModelInitResources``."""
+        self.kv_cache = getattr(init_resource, "kv_cache", None)
+        return True
+
+    def prepare_fmha_impl(self, inputs: Any, is_cuda_graph: bool = False) -> Dict[str, Any]:
+        return {}
 
     def _wrap_outputs(self, hidden: torch.Tensor) -> Any:
         if _RtpPyModelOutputs is not None and _HAS_COMPILED_GPT_BASE:
@@ -1536,9 +2030,27 @@ class Qwen4_5RTPModel(_RtpGptModelBase):
         enable_yoco_decode: Optional[bool] = None,
     ) -> Any:
         """Execute RTP-LLM Paged/PD forward returning ``PyModelOutputs(hidden_states)``."""
-        attn_inputs = getattr(inputs, "attention_inputs", None)
+        attn_by_tag = getattr(inputs, "attention_inputs_by_tag", None)
+        if isinstance(attn_by_tag, Mapping) and len(attn_by_tag) > 0:
+            attn_inputs: Any = attn_by_tag
+        else:
+            attn_inputs = getattr(inputs, "attention_inputs", None)
         if attn_inputs is None:
             raise RuntimeError("PyModelInputs.attention_inputs is required")
+
+        # Pick primary attention group (prefer "full" if present)
+        primary = _select_group_for_tag(attn_inputs, FULL_ATTN_KV_TAG)
+        is_prefill = bool(getattr(primary, "is_prefill", False))
+        flat_ids = inputs.input_ids.reshape(-1)
+        device = flat_ids.device
+
+        if self.kv_cache is None and not is_prefill:
+            hidden = torch.zeros(
+                (int(flat_ids.numel()), self.arch_config.hidden_size),
+                dtype=self.model.embed_tokens.weight.dtype,
+                device=device,
+            )
+            return self._wrap_outputs(hidden)
 
         writers = (
             prepare_qwen4_5_cache_store_writers(
@@ -1547,12 +2059,6 @@ class Qwen4_5RTPModel(_RtpGptModelBase):
             if self.kv_cache is not None
             else {}
         )
-
-        # Pick primary attention group (prefer "full" if present)
-        primary = _select_group_for_tag(attn_inputs, FULL_ATTN_KV_TAG)
-        is_prefill = bool(getattr(primary, "is_prefill", False))
-        flat_ids = inputs.input_ids.reshape(-1)
-        device = flat_ids.device
 
         dev_ctx = torch.cuda.device(device) if device.type == "cuda" else nullcontext()
         with dev_ctx:
@@ -1579,10 +2085,6 @@ class Qwen4_5RTPModel(_RtpGptModelBase):
                     enable_yoco_decode=enable_yoco_decode,
                 )
                 return self._wrap_outputs(hidden)
-
-            # Decode batch
-            if self.kv_cache is None:
-                raise RuntimeError("Qwen4_5RTPModel decode requires initialized kv_cache")
             seq_before = [int(x) for x in primary.sequence_lengths.tolist()]
             bsz = len(seq_before)
             ids_2d = flat_ids.view(bsz, 1)

@@ -9,6 +9,8 @@ Bazel/RTP-LLM binaries.
 from __future__ import annotations
 
 import json
+import logging
+import os
 from pathlib import Path
 from typing import Any, Collection, Dict, Mapping, Optional, Sequence, Type, Union
 
@@ -66,12 +68,16 @@ class Qwen4_5(_BaseModel):
         return False
 
     def support_cuda_graph(self) -> bool:
-        return getattr(self, "model_config", None) is not None
+        return False
 
     def _py_model_class(self) -> Any:
         from rtp_llm.models_py.model_desc.qwen4_5_runtime import Qwen4_5RTPModel
 
         return Qwen4_5RTPModel
+
+    @classmethod
+    def _create_config(cls, ckpt_path: str) -> Qwen4_5ModelConfig:
+        return cls.create_config(ckpt_path)
 
     @classmethod
     def create_config(
@@ -132,24 +138,30 @@ class Qwen4_5(_BaseModel):
         # Populate compiled RTP-LLM ModelConfig sub-structures when ops are available
         if _HAS_RTP_BASE_MODEL:
             try:
-                from rtp_llm.ops import HybridAttentionType
-
+                config.max_seq_len = int(arch_cfg.max_position_embeddings)
+                config.config_dtype = "bfloat16"
+                config.has_lm_head = True
+                config.has_post_decoder_layernorm = False
+                config.has_pre_decoder_layernorm = False
                 config.inter_size = arch_cfg.intermediate_size
                 config.moe_inter_size = arch_cfg.moe_intermediate_size
+                config.moe_layer_index = list(
+                    range(arch_cfg.first_k_dense_replace, arch_cfg.num_hidden_layers)
+                )
+                if hasattr(config, "special_tokens"):
+                    config.special_tokens.bos_token_id = int(arch_cfg.bos_token_id)
+                    config.special_tokens.eos_token_id = int(arch_cfg.eos_token_id)
                 if hasattr(config, "attn_config"):
                     config.attn_config.head_num = arch_cfg.num_attention_heads
                     config.attn_config.kv_head_num = arch_cfg.num_key_value_heads
                     config.attn_config.size_per_head = arch_cfg.head_dim
                 if hasattr(config, "hybrid_attention_config"):
-                    config.hybrid_attention_config.enable_hybrid_attention = True
-                    config.hybrid_attention_config.hybrid_attention_types = [
-                        (
-                            HybridAttentionType.LINEAR
-                            if lt == "linear_attention"
-                            else HybridAttentionType.NONE
-                        )
-                        for lt in arch_cfg.layer_types
-                    ]
+                    # GDN uses OPAQUE_STATE cache descriptors rather than KVCacheSpecType.LINEAR;
+                    # CacheConfigCreator requires hybrid_attention_types empty and linear_num_value_heads == 0.
+                    config.hybrid_attention_config.enable_hybrid_attention = False
+                    config.hybrid_attention_config.hybrid_attention_types = []
+                if hasattr(config, "linear_attention_config"):
+                    config.linear_attention_config.linear_num_value_heads = 0
                 config.kv_cache_spec_descs = build_qwen4_5_kv_cache_spec_descs(
                     config, arch_cfg
                 )
@@ -181,26 +193,148 @@ class Qwen4_5(_BaseModel):
             attn.size_per_head = arch_cfg.head_dim
 
         model_config.hc_mult = arch_cfg.hc_count
+        model_config.has_lm_head = True
+        model_config.has_post_decoder_layernorm = False
+        model_config.has_pre_decoder_layernorm = False
         model_config.qwen4_5_kv_cache_plan = cls.build_kv_cache_plan(arch_cfg)
         try:
-            from rtp_llm.ops import HybridAttentionType
-
             if hasattr(model_config, "hybrid_attention_config"):
-                model_config.hybrid_attention_config.enable_hybrid_attention = True
-                model_config.hybrid_attention_config.hybrid_attention_types = [
-                    (
-                        HybridAttentionType.LINEAR
-                        if lt == "linear_attention"
-                        else HybridAttentionType.NONE
-                    )
-                    for lt in arch_cfg.layer_types
-                ]
+                model_config.hybrid_attention_config.enable_hybrid_attention = False
+                model_config.hybrid_attention_config.hybrid_attention_types = []
+            if hasattr(model_config, "linear_attention_config"):
+                model_config.linear_attention_config.linear_num_value_heads = 0
             model_config.kv_cache_spec_descs = build_qwen4_5_kv_cache_spec_descs(
                 model_config, arch_cfg
             )
         except Exception:
             # Pure-Python environment without compiled rtp_llm.ops
             pass
+
+    def load(self, skip_python_model: bool = False) -> None:
+        if (
+            self.parallelism_config.pp_size > 1
+            and not self.model_config.is_mtp
+            and not self.support_pp()
+        ):
+            raise RuntimeError("Qwen4_5 does not support pipeline parallelism")
+        if (
+            self.hw_kernel_config.enable_cuda_graph
+            and self.support_cuda_graph() is False
+        ):
+            raise RuntimeError("Qwen4_5 does not support CUDA graph in py model mode")
+
+        self.custom_module = None
+        self.model_weights_loader = None
+        self.py_eplb = None
+        self.weight_manager = None
+        device_str = self._get_device_str()
+        self._load(device_str)
+        if skip_python_model:
+            return
+        logging.info(
+            f"Creating Qwen4_5 python model for {self.model_config.ckpt_path} on {device_str}"
+        )
+        self._create_python_model()
+
+    def _load(self, device: str) -> None:
+        import torch
+        import torch.distributed as dist
+
+        from rtp_llm.model_loader.model_weight_info import ModelWeights
+        from rtp_llm.models_py.model_desc.qwen4_5 import Qwen4_5ForCausalLM
+        from rtp_llm.models_py.modules.qwen4_5.checkpoint_loader import (
+            load_qwen4_5_from_checkpoint,
+        )
+        from rtp_llm.utils.model_weight import W
+
+        self.device = device
+        arch_cfg = self.model_config.arch_config
+        tp_size = int(self.parallelism_config.tp_size)
+        tp_rank = int(self.parallelism_config.tp_rank)
+        dp_size = int(self.parallelism_config.dp_size)
+        ep_size_cfg = int(getattr(self.parallelism_config, "ep_size", 1))
+
+        eff_ep_size = 1
+        eff_ep_rank = 0
+        ep_group = None
+        if tp_size > 1 and dp_size == 1:
+            eff_ep_size = tp_size
+            eff_ep_rank = tp_rank
+            if dist.is_initialized():
+                from rtp_llm.models_py.distributed.collective_torch import _get_group
+                from rtp_llm.models_py.distributed.rank_layout import Group
+
+                ep_group = _get_group(Group.TP)
+        elif ep_size_cfg > 1:
+            eff_ep_size = ep_size_cfg
+            eff_ep_rank = int(getattr(self.parallelism_config, "ep_rank", 0))
+            if dist.is_initialized():
+                from rtp_llm.models_py.distributed.collective_torch import _get_group
+                from rtp_llm.models_py.distributed.rank_layout import Group
+
+                ep_group = _get_group(Group.WORLD)
+
+        torch_dev = torch.device(device)
+        if torch_dev.type == "cuda":
+            torch.cuda.set_device(torch_dev)
+
+        causal_lm = Qwen4_5ForCausalLM(
+            arch_cfg,
+            use_triton_mxfp4=True,
+            compute_mode="bf16",
+            dtype=torch.bfloat16,
+            device=torch_dev,
+            init_mxfp4_weights=False,
+            ep_size=eff_ep_size,
+            ep_rank=eff_ep_rank,
+            ep_group=ep_group,
+        )
+        num_workers = int(os.environ.get("QWEN4_5_LOAD_WORKERS", "8"))
+        load_qwen4_5_from_checkpoint(
+            causal_lm,
+            self.model_config.ckpt_path,
+            ple_mode="gpu_sharded",
+            num_workers=num_workers,
+            verbose=True,
+        )
+        self._qwen4_5_causal_lm = causal_lm
+
+        weights = ModelWeights(
+            num_layers=int(self.model_config.num_layers),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        weights.global_weights[W.embedding] = (
+            causal_lm.model.embed_tokens.weight.detach().contiguous()
+        )
+        full_lm_head = causal_lm.lm_head.weight.detach()
+        if tp_size > 1:
+            vocab_size = full_lm_head.shape[0]
+            if vocab_size % tp_size != 0:
+                raise ValueError(
+                    f"Qwen4_5 vocab_size ({vocab_size}) must be divisible by tp_size ({tp_size})"
+                )
+            vocab_per_rank = vocab_size // tp_size
+            start = tp_rank * vocab_per_rank
+            lm_head_slice = full_lm_head[start : start + vocab_per_rank].contiguous()
+        else:
+            lm_head_slice = full_lm_head.contiguous()
+        # Do NOT populate W.final_ln_gamma; Qwen4_5Model outputs already post-normed hidden states.
+        weights.global_weights[W.lm_head] = lm_head_slice
+        self.weight = weights
+
+    def _create_python_model(self) -> None:
+        from rtp_llm.models_py.model_desc.qwen4_5_runtime import Qwen4_5RTPModel
+
+        self.py_model = Qwen4_5RTPModel.from_causal_lm(
+            self._qwen4_5_causal_lm,
+            model_config=self.model_config,
+            parallelism_config=self.parallelism_config,
+            weight=self.weight,
+            max_generate_batch_size=self.max_generate_batch_size,
+            fmha_config=self.fmha_config,
+            py_hw_kernel_config=self.hw_kernel_config,
+        )
 
     @classmethod
     def build_kv_cache_plan(

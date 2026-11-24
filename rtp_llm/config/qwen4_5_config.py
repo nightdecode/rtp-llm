@@ -613,6 +613,9 @@ class Qwen4_5ModelConfig(_BaseModelConfig):
             "qwen4_5_quant_config",
             "qwen4_5_ple_prefetch_mb",
             "qwen4_5_enable_yoco_decode",
+            "qwen4_5_kv_cache_plan",
+            "qwen4_5_param_and_state_estimate",
+            "qwen4_5_raw_config",
         }
 
     def __init__(
@@ -754,3 +757,71 @@ class Qwen4_5ModelConfig(_BaseModelConfig):
             ),
             kv_dtype_bytes=kv_dtype_bytes,
         )
+
+    if _HAS_RTP_MODEL_CONFIG:
+
+        def init_precision_config(
+            self, kv_cache_config: Optional[Any], act_type: Optional[str]
+        ) -> None:
+            qcfg = self._qwen4_5_quant_config
+            if qcfg is not None and qcfg.is_mxfp4_routed_experts:
+                from rtp_llm.config.model_config import apply_quant_scope_to_pricing
+                from rtp_llm.config.quant_config import MXFp4QuarkQuantConfig
+                from rtp_llm.ops import KvCacheDataType
+                from rtp_llm.utils.weight_type import WEIGHT_TYPE
+
+                gsize = int(getattr(qcfg, "mxfp4_group_size", MXFP4_GROUP_SIZE))
+                quant_config = MXFp4QuarkQuantConfig(
+                    bits=4,
+                    group_size=gsize,
+                    is_quanted=True,
+                )
+                self.quant_algo.setQuantAlgo("mxfp4-quark", 4, gsize)
+                apply_quant_scope_to_pricing(self, quant_config)
+                self.expert_weight_dtype = "fp4"
+                self.dense_weight_dtype = "bf16"
+
+                if kv_cache_config is not None and kv_cache_config.fp8_kv_cache:
+                    self.attn_config.kv_cache_dtype = KvCacheDataType.FP8
+                else:
+                    self.attn_config.kv_cache_dtype = KvCacheDataType.BASE
+
+                dt = WEIGHT_TYPE.from_str(act_type) if act_type else WEIGHT_TYPE.BF16
+                self.data_type = dt.to_str()
+                self.quant_config = quant_config
+                return
+
+            super().init_precision_config(kv_cache_config, act_type)
+
+        def eval_model_weight_size(self) -> float:
+            if self._qwen4_5_arch_config is not None:
+                est = getattr(self, "qwen4_5_param_and_state_estimate", None)
+                if est is None:
+                    est = self.estimate_params_and_state()
+                return float(est.checkpoint_total_bytes)
+            return super().eval_model_weight_size()
+
+        def eval_model_weight_size_per_rank(
+            self, tp_size: int, ep_size: int
+        ) -> float:
+            if tp_size <= 0 or ep_size <= 0:
+                raise ValueError(
+                    f"tp_size and ep_size must be positive, got {tp_size}, {ep_size}"
+                )
+            if self._qwen4_5_arch_config is not None:
+                est = getattr(self, "qwen4_5_param_and_state_estimate", None)
+                if est is None:
+                    est = self.estimate_params_and_state()
+                total_bytes = float(est.checkpoint_total_bytes)
+                eff_ep = max(int(ep_size), int(tp_size))
+                if eff_ep <= 1:
+                    return total_bytes
+                # Routed experts + PLE table are EP-sharded; dense/embed/lm_head (~6%)
+                # stay replicated (with lm_head TP-sliced). Keep a small conservative buffer.
+                replicated_bytes = max(
+                    float(est.embed_and_lm_head_params * 2),
+                    total_bytes * 0.06,
+                )
+                sharded_bytes = max(0.0, total_bytes - replicated_bytes)
+                return sharded_bytes / float(eff_ep) + replicated_bytes
+            return super().eval_model_weight_size_per_rank(tp_size, ep_size)

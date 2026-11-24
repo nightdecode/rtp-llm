@@ -37,10 +37,11 @@ py_test(
 
 py_test(
     name = "qwen4_5_pd_serving_test",
-    srcs = ["test_qwen4_5_pd_serving.py"],
+    srcs = ["test_qwen4_5_pd_serving.py", "test_e2e_qwen4_5_model.py"],
     main = "test_qwen4_5_pd_serving.py",
+    env = {"GPU_COUNT": "2"},
     deps = [
-        "//rtp_llm/models/qwen4_5:qwen4_5",
+        "//rtp_llm:testlib",
         "//rtp_llm/models_py:models",
         "//rtp_llm/models_py:modules",
     ],
@@ -48,10 +49,11 @@ py_test(
 
 py_test(
     name = "qwen4_5_accuracy_bench",
-    srcs = ["bench_qwen4_5_accuracy.py"],
+    srcs = ["bench_qwen4_5_accuracy.py", "test_e2e_qwen4_5_model.py"],
     main = "bench_qwen4_5_accuracy.py",
+    env = {"GPU_COUNT": "2"},
     deps = [
-        "//rtp_llm/models/qwen4_5:qwen4_5",
+        "//rtp_llm:testlib",
         "//rtp_llm/models_py:models",
         "//rtp_llm/models_py:modules",
     ],
