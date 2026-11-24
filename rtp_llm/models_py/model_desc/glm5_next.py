@@ -17,6 +17,7 @@ Hybrid architecture ported from the SGLang reference implementation
 """
 
 import logging
+import os
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -35,6 +36,11 @@ from rtp_llm.models_py.model_desc.block_map import (
     select_attention_inputs_for_layer,
 )
 from rtp_llm.models_py.model_desc.glm5 import Glm5MoeLayer
+from rtp_llm.models_py.model_desc.glm5_mhc_ppu import (
+    fused_hc_supported,
+    hc_post_fused,
+    hc_pre_norm_fused,
+)
 from rtp_llm.models_py.model_desc.kimi_linear import (
     KimiLinearKDA,
     KimiLinearMetadata,
@@ -49,6 +55,7 @@ from rtp_llm.models_py.modules import (
     RMSNorm,
 )
 from rtp_llm.models_py.model_desc.generic_moe import GenericMoeLayer
+from rtp_llm.models_py.modules.hybrid import indexer as indexer_mod
 from rtp_llm.models_py.triton_kernels.causal_conv1d import (
     prepare_causal_conv1d_metadata,
 )
@@ -296,6 +303,7 @@ class Glm5NextDecoderLayer(nn.Module):
             weights[W.post_ln_gamma], eps=config.layernorm_eps
         )
 
+        self.fused_hc = False
         if self.use_mhc:
             self.hc_attn_fn = weights[W.hc_attn_fn]
             self.hc_attn_scale = weights[W.hc_attn_scale]
@@ -303,15 +311,62 @@ class Glm5NextDecoderLayer(nn.Module):
             self.hc_ffn_fn = weights[W.hc_ffn_fn]
             self.hc_ffn_scale = weights[W.hc_ffn_scale]
             self.hc_ffn_base = weights[W.hc_ffn_base]
+            # Both sublayers share one decision: the two mixing projections
+            # have the same shape and the two RMSNorm weights the same width.
+            # RTP_GLM_FUSED_MHC=0 keeps the unfused torch path, i.e. the
+            # behaviour before the fused kernels, for baselines and A/B runs.
+            self.fused_hc = os.environ.get(
+                "RTP_GLM_FUSED_MHC", "1"
+            ) != "0" and fused_hc_supported(
+                self.hc_mult,
+                config.hidden_size,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                self.input_layernorm.weight.data,
+                self.rms_eps,
+                self.hc_eps,
+                self.sinkhorn_iters,
+                _MHC_POST_MULT_VALUE,
+                self.input_layernorm.variance_epsilon,
+            ) and fused_hc_supported(
+                self.hc_mult,
+                config.hidden_size,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+                self.post_attention_layernorm.weight.data,
+                self.rms_eps,
+                self.hc_eps,
+                self.sinkhorn_iters,
+                _MHC_POST_MULT_VALUE,
+                self.post_attention_layernorm.variance_epsilon,
+            )
 
-    def _hc_pre(
+    def _hc_pre_norm(
         self,
         streams: torch.Tensor,
         hc_fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
+        norm: RMSNorm,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return hc_pre(
+        """MHC pre plus the sublayer RMSNorm; returns (normed, comb, post)."""
+        if self.fused_hc:
+            return hc_pre_norm_fused(
+                streams,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                self.hc_mult,
+                self.rms_eps,
+                self.hc_eps,
+                self.sinkhorn_iters,
+                _MHC_POST_MULT_VALUE,
+                norm.weight.data,
+                norm.variance_epsilon,
+            )
+        layer_input, h_res, h_post = hc_pre(
             streams,
             hc_fn,
             hc_scale,
@@ -321,6 +376,18 @@ class Glm5NextDecoderLayer(nn.Module):
             self.hc_eps,
             self.sinkhorn_iters,
         )
+        return norm(layer_input), h_res, h_post
+
+    def _hc_post(
+        self,
+        x: torch.Tensor,
+        streams: torch.Tensor,
+        h_post: torch.Tensor,
+        h_res: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.fused_hc:
+            return hc_post_fused(x, streams, h_post, h_res, self.hc_mult)
+        return hc_post(x, streams, h_post, h_res, self.hc_mult)
 
     def forward(
         self,
@@ -332,10 +399,13 @@ class Glm5NextDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         """streams: [T, hc_mult * H] in, [T, hc_mult * H] out."""
         if self.use_mhc:
-            layer_input, h_res, h_post = self._hc_pre(
-                streams, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+            normed, h_res, h_post = self._hc_pre_norm(
+                streams,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                self.input_layernorm,
             )
-            normed = self.input_layernorm(layer_input)
         else:
             # Plain-residual fallback (not used by the GLM-5.3 main model;
             # kept for structural completeness).
@@ -357,11 +427,14 @@ class Glm5NextDecoderLayer(nn.Module):
             )
 
         if self.use_mhc:
-            streams = hc_post(attn_out, streams, h_post, h_res, self.hc_mult)
-            layer_input, h_res, h_post = self._hc_pre(
-                streams, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+            streams = self._hc_post(attn_out, streams, h_post, h_res)
+            normed, h_res, h_post = self._hc_pre_norm(
+                streams,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+                self.post_attention_layernorm,
             )
-            normed = self.post_attention_layernorm(layer_input)
         else:
             streams = streams + attn_out
             normed = self.post_attention_layernorm(streams)
@@ -369,7 +442,7 @@ class Glm5NextDecoderLayer(nn.Module):
         ffn_out = self.mlp(normed)
 
         if self.use_mhc:
-            streams = hc_post(ffn_out, streams, h_post, h_res, self.hc_mult)
+            streams = self._hc_post(ffn_out, streams, h_post, h_res)
         else:
             streams = streams + ffn_out
         return streams
@@ -430,6 +503,15 @@ class Glm5NextModel(GptModelBase):
             self._capture_canonical_layer,
             self._capture_canonical_final,
         )
+        # 池 key 是不是单独一个缓存组，由 models/glm5_next.py 的同一个开关决定。
+        # 声明成缓存组之后它才会随 KV cache 跨机传输——PD 分离下这是正确性前提，
+        # 模块私有的旁路缓冲传不过去。两处必须读同一个环境变量，否则这里会去取
+        # 一个没被声明的组、直接抛「available tags=[...]」。
+        self._full_attention_cache_tags = (
+            ("default", "indexer_kv", "kpool")
+            if os.environ.get("RTP_GLM_KPOOL_CACHE", "0") == "1"
+            else ("default", "indexer_kv")
+        )
 
     def _capture_canonical_layer(
         self, hidden_states: torch.Tensor, residual: Optional[torch.Tensor]
@@ -453,7 +535,13 @@ class Glm5NextModel(GptModelBase):
             for layer_idx, layer in enumerate(self.layers)
             if layer.layer_type != HybridAttentionType.LINEAR
         )
-        return get_group_tags_for_layers(self.kv_cache, full_attention_layers)
+        tags = get_group_tags_for_layers(self.kv_cache, full_attention_layers)
+        # 池缓存组只是一块随 KV 一起传输的存储，没有对应的注意力实现。
+        # 不剔掉的话上层会给它建一个 FMHA route，而稀疏 MLA 那边按
+        # {default, indexer_kv} 严格比对 route 集合，多一个就直接抛。
+        if tags is not None and "kpool" in tags:
+            tags = [t for t in tags if t != "kpool"]
+        return tags
 
     def _linear_attention_inputs(
         self, inputs: PyModelInputs, fallback: PyAttentionInputs
@@ -499,6 +587,8 @@ class Glm5NextModel(GptModelBase):
         return fmha_impl
 
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
+        # 新的一次前向：各 DSA 层 indexer 共用的 decode 下标换算从这里开始重算
+        indexer_mod.begin_forward()
         input_ids: torch.Tensor = inputs.input_ids
         hidden_states = self.embed_tokens(input_ids)
 
@@ -508,8 +598,7 @@ class Glm5NextModel(GptModelBase):
         full_prefill_conv1d_meta = None
         full_prefill_cu_seqlens = None
         cp_restore_indices = None
-        cp_local_extract_indices = None
-        cp_local_valid_mask = None
+        cp_unpad_restore_indices = None
         if attention_inputs.is_prefill and not is_target_verify:
             # KDA recurs along the sequence, so under context parallel every
             # rank has to see the full sequence; build the gather/restore
@@ -522,8 +611,7 @@ class Glm5NextModel(GptModelBase):
                     full_prefill_conv1d_meta,
                     full_prefill_cu_seqlens,
                     cp_restore_indices,
-                    cp_local_extract_indices,
-                    cp_local_valid_mask,
+                    cp_unpad_restore_indices,
                 ) = build_cp_linear_attn_metadata(
                     linear_attention_inputs,
                     self.parallelism_config,
@@ -540,8 +628,7 @@ class Glm5NextModel(GptModelBase):
             full_prefill_conv1d_meta=full_prefill_conv1d_meta,
             full_prefill_cu_seqlens=full_prefill_cu_seqlens,
             cp_restore_indices=cp_restore_indices,
-            cp_local_extract_indices=cp_local_extract_indices,
-            cp_local_valid_mask=cp_local_valid_mask,
+            cp_unpad_restore_indices=cp_unpad_restore_indices,
         )
 
         if fmha_impl is None:
@@ -569,7 +656,7 @@ class Glm5NextModel(GptModelBase):
                 layer_fmha_impl = fmha_impl
                 layer_kv_cache = (
                     get_layer_caches_for_groups(
-                        self.kv_cache, idx, ("default", "indexer_kv")
+                        self.kv_cache, idx, self._full_attention_cache_tags
                     )
                     if self.kv_cache is not None
                     else None

@@ -688,6 +688,35 @@ class Glm5Next(BaseModel):
             indexer_desc.entry_dtype = DataType.TYPE_UINT8
             indexer_desc.entry_elems = indexer_head_dim + indexer_head_dim // 128 * 4
 
+        # 池 key 单独一个压缩缓存组。
+        #
+        # 为什么必须是缓存组而不是模块私有的旁路缓冲：PD 分离下 prefill 和 decode
+        # 在两台机器上，提示词的池在 prefill 机算出来，decode 机要用。跨机传输按
+        # **已声明的缓存组**搬运，私有缓冲不在其中；而 decode 的写入路每步只覆盖
+        # 当次生成的那一个 token，永远不会补上提示词范围。结果是 decode 读到那些
+        # 物理页上**上一个请求**留下的池，输出偏掉而不报错（2026-11-21 实测：
+        # 32768 档首个分歧步 1.0，把打分改回每步重算则为 27.84，判据通过）。
+        #
+        # 每池一条、每条 head_dim 个 FP8 字节加一个 FP32 scale，共 132 字节，
+        # 每核心块 kernel_block / ratio 条（256 / 4 = 64 条，正好是分页打分算子
+        # 写死的 block_kv）。DeepSeek V4 的压缩池用的是同一套声明方式。
+        #
+        # 置 RTP_GLM_KPOOL_CACHE=1 才声明。默认关时行为与声明之前完全一致。
+        kpool_desc = None
+        if ratio > 1 and os.environ.get("RTP_GLM_KPOOL_CACHE", "0") == "1":
+            kpool_desc = KVCacheSpecDesc()
+            kpool_desc.tag = "kpool"
+            kpool_desc.cache_type = KVCacheSpecType.OPAQUE_KV
+            # 池是从 key 和门控算出来的内容，不是跨步演进的状态；
+            # 和 DeepSeek V4 的压缩池一样显式标成非状态缓存。
+            kpool_desc.is_state_cache = False
+            kpool_desc.entry_count_mode = (
+                OpaqueBlockEntryCountMode.KERNEL_BLOCK_COMPRESSED
+            )
+            kpool_desc.compression_ratio = ratio
+            kpool_desc.entry_dtype = DataType.TYPE_UINT8
+            kpool_desc.entry_elems = indexer_head_dim + 4
+
         descs = []
         for layer_type in model_config.hybrid_attention_config.hybrid_attention_types:
             if layer_type == HybridAttentionType.LINEAR:
@@ -696,7 +725,10 @@ class Glm5Next(BaseModel):
                 full_desc = KVCacheSpecDesc()
                 full_desc.tag = "default"
                 full_desc.cache_type = KVCacheSpecType.MLA
-                descs.append([full_desc, indexer_desc])
+                layer_descs = [full_desc, indexer_desc]
+                if kpool_desc is not None:
+                    layer_descs.append(kpool_desc)
+                descs.append(layer_descs)
         model_config.kv_cache_spec_descs = descs
 
     def support_cuda_graph(self) -> bool:
