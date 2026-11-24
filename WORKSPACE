@@ -35,6 +35,26 @@ local_repository(
     path = "deps",
 )
 
+# Never overridden: the pip surface (requirements locks + pip.bzl) resolves to
+# this repository in both trees, so internal checkouts share the public copy
+# instead of mirroring it; index selection is injected through pip.bzl's
+# envsubst channel, not through this repository.
+local_repository(
+    name = "rtp_pip_deps",
+    path = "deps",
+)
+
+local_repository(
+    name = "arch_config",
+    path = "arch_config",
+)
+
+# CUDA 13 builds can select platform pins without replacing either repository above.
+local_repository(
+    name = "rtp_cuda13_profile",
+    path = "arch_config",
+)
+
 # Closed-impl seam: the public default is the internal_impls/ stub; the closed
 # checkout overrides the repository with internal_source/impls.bzl.
 local_repository(
@@ -45,14 +65,6 @@ local_repository(
 load("@internal_impls//:impls.bzl", "internal_only_deps")
 
 internal_only_deps()
-
-# Overlays can supply the platform locks and wheel metadata before the public
-# defaults are registered. Both repositories resolve locally in an open build.
-load("@bazel_tools//tools/build_defs/repo:utils.bzl", "maybe")
-
-maybe(local_repository, name = "rtp_pip_deps", path = "deps")
-maybe(local_repository, name = "arch_config", path = "arch_config")
-
 
 load("@rtp_deps//:http.bzl", "http_deps")
 

@@ -1,4 +1,4 @@
-load(":cuda13_requirements.bzl", "CUDA13_ARM_COMPILER", "CUDA13_X86_COMPILER")
+load("@rtp_cuda13_profile//:cuda13_requirements.bzl", "CUDA13_ARM_COMPILER", "CUDA13_X86_COMPILER")
 load("@pip_arm_torch//:requirements.bzl", requirement_arm = "requirement")
 
 # to wrapper target relate with different system config
