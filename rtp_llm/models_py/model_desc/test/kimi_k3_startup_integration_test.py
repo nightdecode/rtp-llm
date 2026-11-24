@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from rtp_llm.config.engine_config import EngineConfig
+from rtp_llm.config.model_config import ModelConfig
 from rtp_llm.config.py_config_modules import PyEnvConfigs
 from rtp_llm.model_factory import ModelFactory
 from rtp_llm.models_py.model_desc import kimi_k3
@@ -140,12 +141,12 @@ class KimiK3StartupIntegrationTest(unittest.TestCase):
         engine = EngineConfig.create(PyEnvConfigs())
         engine.pd_sep_config.role_type = RoleType.PDFUSION
         engine.runtime_config.fifo_scheduler_config.prefill_chunk_size = 128
-        model = NS(
-            num_layers=1,
-            max_seq_len=4096,
-            model_name="noncausal",
-            attn_config=NS(tokens_per_block=64, is_causal=False),
-        )
+        model = ModelConfig()
+        model.num_layers = 1
+        model.max_seq_len = 4096
+        model.model_name = "noncausal"
+        model.attn_config.tokens_per_block = 64
+        model.attn_config.is_causal = False
         ModelFactory.update_engine_config_from_model_config(engine, model)
         self.assertEqual(
             engine.runtime_config.fifo_scheduler_config.prefill_chunk_size, 128

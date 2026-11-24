@@ -270,7 +270,7 @@ TEST_F(ModelDataTest, testShapeHintsCarryTpControlPlaneAndCacheGeometry) {
     // All current control flags are set; the removed decode-entrance bit 8 stays clear.
     EXPECT_EQ(flags,
               ((1u << 8) - 1u) | kControlOpaqueKvCacheStore | kControlShutdown | kControlMiddleChunkOnly
-                  | kControlDraftExtend);
+                  | kControlDraftExtend | kControlMtpDraftUpdate);
     EXPECT_TRUE(has(GptModelInputControlFlag::kControlOpaqueKvCacheStore));
     EXPECT_EQ(hints[GptModelInputIndex::kvBlockStrideBytes], 4096);
     EXPECT_EQ(hints[GptModelInputIndex::kvScaleStrideBytes], 256);

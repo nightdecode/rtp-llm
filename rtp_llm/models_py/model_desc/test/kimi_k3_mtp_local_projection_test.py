@@ -11,6 +11,7 @@ from rtp_llm.models_py.model_desc.kimi_k3_mtp import KimiK3MtpModel
 from rtp_llm.models_py.modules import Embedding, RMSNorm
 from rtp_llm.models_py.modules.factory.linear.impl.cuda.f16_linear import CudaF16Linear
 from rtp_llm.models_py.modules.hybrid.query_layout import QueryLayout
+from rtp_llm.models_py.modules.kimi_k3.attention import KimiK3MLA
 from rtp_llm.ops import ParallelismConfig, RoleType
 from rtp_llm.utils.model_weight import W
 
@@ -31,10 +32,10 @@ class KimiK3MtpLocalProjectionTest(unittest.TestCase):
         model._max_moe_tokens = 262144
         model._projection_staging_tokens = model._max_moe_tokens
         model._fp8_collective = None
-        attention = nn.Module()
+        attention = object.__new__(KimiK3MLA)
+        nn.Module.__init__(attention)
         attention._fp8_collective = None
         attention._fp8_input_collective = None
-        attention.supports_fp8_activation = True
         for name in ("input", "output"):
             setattr(
                 attention,
@@ -127,7 +128,9 @@ class KimiK3MtpLocalProjectionTest(unittest.TestCase):
                             max_seq_len=1048576,
                             gen_num_per_cycle=2,
                             is_mtp=False,
-                            k3_runtime_config=SimpleNamespace(attn_res_block_size=0),
+                            k3_runtime_config=SimpleNamespace(
+                                attn_res_block_size=0, dsa=None
+                            ),
                             layernorm_eps=1e-5,
                         )
                         parallel = SimpleNamespace(
@@ -173,7 +176,7 @@ class KimiK3MtpLocalProjectionTest(unittest.TestCase):
         model.config = SimpleNamespace(
             hidden_size=8,
             is_mtp=True,
-            k3_runtime_config=SimpleNamespace(attn_res_block_size=0),
+            k3_runtime_config=SimpleNamespace(attn_res_block_size=0, dsa=None),
         )
         model._max_moe_tokens = 64
         model._projection_staging_tokens = model._max_moe_tokens
@@ -406,7 +409,7 @@ class KimiK3MtpLocalProjectionTest(unittest.TestCase):
             is_mtp=True,
             layernorm_eps=1e-6,
             capture_aux_hidden_layer_ids=[],
-            k3_runtime_config=SimpleNamespace(attn_res_block_size=0),
+            k3_runtime_config=SimpleNamespace(attn_res_block_size=0, dsa=None),
         )
         shard_width = hidden_size // parallel.tp_size
         weights = {

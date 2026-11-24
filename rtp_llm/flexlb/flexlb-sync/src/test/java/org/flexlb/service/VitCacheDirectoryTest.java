@@ -94,7 +94,7 @@ class VitCacheDirectoryTest {
     @Test
     void selectedWorkerIsRevalidatedByAddressAndGeneration() throws Exception {
         b = worker(b.getIp(), "one");
-        live.put(b.getIpPort(), b);
+        live.put(b.getLogicalIpPort(), b);
         snapshot(a, "a1", "zero");
         snapshot(b, "b1", "one");
         assertEquals(a.getIp(), selector.select(context("zero"), "one").getServerIp());
@@ -114,7 +114,7 @@ class VitCacheDirectoryTest {
             assertEquals(b.getPort(), pinned.serverStatus().getHttpPort());
             assertEquals(b.getGenerationId(), pinned.serverStatus().getWorkerGeneration());
         }
-        live.put(b.getIpPort(), worker(b.getIp(), "one"));
+        live.put(b.getLogicalIpPort(), worker(b.getIp(), "one"));
         assertFalse(selector.validate(ctx, "one").isSuccess());
     }
 

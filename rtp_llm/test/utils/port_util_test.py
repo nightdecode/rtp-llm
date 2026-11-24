@@ -108,14 +108,16 @@ class TestPortManager(unittest.TestCase):
             try:
                 self.assertEqual(ports, [12001, 12002, 12003, 12004])
                 self.assertEqual([lock.port for lock in locks], ports + [15003])
-                self.assertFalse((self.test_dir / "port_12000.lock").exists())
+                with ExpiredLockFile(self.test_dir / "port_12000.lock", 12000):
+                    pass
                 with self.assertRaises(PortInUseError):
                     with ExpiredLockFile(self.test_dir / "port_15003.lock", 15003):
                         pass
             finally:
                 for lock in locks:
                     lock.__exit__(None, None, None)
-            self.assertFalse((self.test_dir / "port_15003.lock").exists())
+            with ExpiredLockFile(self.test_dir / "port_15003.lock", 15003):
+                pass
 
     def test_get_consecutive_ports_reuse(self):
         ports1, locks1 = self.port_manager.get_consecutive_ports(2)

@@ -223,9 +223,9 @@ protected:
         stream->generate_status_->status = StreamState::RUNNING;
     }
 
-    static GenerateStreamPtr createMtpProbabilityStream(bool streaming) {
+    static GenerateStreamPtr createMtpProbabilityStream(bool streaming, RoleType role = RoleType::PDFUSION) {
         GenerateStreamBuilder builder;
-        auto                  stream = builder.createChunkedContextStream({9}, RoleType::PDFUSION, 0);
+        auto                  stream = builder.createChunkedContextStream({9}, role, 0);
         markRunning(stream);
         auto config              = stream->generateConfig();
         config->return_all_probs = ReturnAllProbsMode::DEFAULT;
@@ -446,11 +446,13 @@ TEST_F(GenerateStreamTest, mtpProbabilitiesMatchOrdinaryOutputWindows) {
             for (int final_count : {3, 4}) {
                 SCOPED_TRACE(::testing::Message() << "mode=" << static_cast<int>(mode) << " output_mode=" << output_mode
                                                   << " final_count=" << final_count);
-                auto stream              = createMtpProbabilityStream(output_mode == 1);
+                const bool streaming = output_mode == 1;
+                const bool pd_decode = output_mode == 2;
+                auto stream = createMtpProbabilityStream(streaming, pd_decode ? RoleType::DECODE : RoleType::PDFUSION);
                 auto config              = stream->generateConfig();
                 config->max_new_tokens   = 8;
                 config->min_new_tokens   = 8;
-                config->pd_separation    = output_mode == 2;
+                config->pd_separation    = pd_decode;
                 config->aux_info         = false;
                 config->return_all_probs = mode;
                 auto expected_tokens     = torch::arange(10, 19, torch::kInt32).reshape({1, 9});
@@ -464,17 +466,19 @@ TEST_F(GenerateStreamTest, mtpProbabilitiesMatchOrdinaryOutputWindows) {
                     probs.copy_(expected_probs.narrow(1, generated, count));
                     StreamSpecUpdateInfo update{expected_tokens.narrow(1, generated, count), count, {}, {}, {}};
                     update.all_probs              = probs;
-                    update.update_remote_generate = false;
+                    const bool pd_handoff = pd_decode && generated == 0;
+                    update.update_remote_generate = pd_decode && !pd_handoff;
+                    stream->step();
                     stream->specUpdate(update);
                     staging.fill_(-1);
                     generated = std::min(generated + count, 8);
-                    if (output_mode == 0 && generated < 8) {
+                    if (!streaming && !pd_handoff && generated < 8) {
                         EXPECT_FALSE(stream->hasOutput());
                         continue;
                     }
-                    const int frames = output_mode == 1 ? generated - emitted : 1;
+                    const int frames = streaming ? generated - emitted : 1;
                     for (int frame = 0; frame < frames; ++frame) {
-                        const int end    = output_mode == 1 ? emitted + 1 : generated;
+                        const int end    = streaming ? emitted + 1 : generated;
                         auto      result = stream->nextOutput(100);
                         ASSERT_TRUE(result.ok()) << result.status().ToString();
                         const auto& output = result.value().generate_outputs.at(0);

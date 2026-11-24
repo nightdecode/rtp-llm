@@ -88,10 +88,8 @@ class _Peer(rpc.RpcServiceServicer):
         self.mode_aware, self.new, self.sp = mode_aware, new, sp
         self.fail_first, self.empty = fail_first, empty
         self.inputs = []
-        self.saved = {}
         self.unsafe = 0
         self.calls = 0
-        self.fetch_calls = 0
         self.cancelled = asyncio.Event()
         self.release = asyncio.Event()
 
@@ -106,7 +104,6 @@ class _Peer(rpc.RpcServiceServicer):
             await context.abort(
                 grpc.StatusCode.FAILED_PRECONDITION, "unsafe legacy SP logprobs"
             )
-        self.saved[request.request_id] = (request, mode)
         return mode
 
     async def stream(self, request, mode):
@@ -145,12 +142,6 @@ class _Peer(rpc.RpcServiceServicer):
         async for response in self.stream(request, mode):
             yield response
 
-    async def FetchResponse(self, request, context):
-        self.fetch_calls += 1
-        original, mode = self.saved[request.request_id]
-        async for response in self.stream(original, mode):
-            yield response
-
     async def BatchGenerateCall(self, request, context):
         response = pb.BatchGenerateOutputsPB()
         for item in request.inputs:
@@ -160,25 +151,29 @@ class _Peer(rpc.RpcServiceServicer):
 
 
 class _Master(flex_rpc.FlexlbServiceServicer):
-    def __init__(self, peer):
-        self.peer = peer
+    def __init__(self, prefill_peer, prefill_address):
+        self.prefill_peer = prefill_peer
+        self.prefill_port = int(prefill_address.rsplit(":", 1)[1])
         self.port = 0
         self.payloads = []
 
     async def Schedule(self, request, context):
         self.payloads.append(request.generate_input)
-        # This is the master's enqueue wire boundary. Retain the complete PB;
-        # only its selected endpoint changes, as in FlexLB's mergeFrom path.
+        # Model the Prefill admission performed by the master before the frontend
+        # opens a generation stream at Decode.
         original = pb.GenerateInputPB.FromString(request.generate_input)
-        await self.peer.admit(original, context)
+        await self.prefill_peer.admit(original, context)
         return flex_pb.FlexlbScheduleResponsePB(
             success=True,
             code=200,
             enqueued_by_master=True,
             server_status=[
                 flex_pb.FlexlbServerStatusPB(
-                    role="PREFILL", server_ip="127.0.0.1", grpc_port=self.port
-                )
+                    role="PREFILL", server_ip="127.0.0.1", grpc_port=self.prefill_port
+                ),
+                flex_pb.FlexlbServerStatusPB(
+                    role="DECODE", server_ip="127.0.0.1", grpc_port=self.port
+                ),
             ],
         )
 
@@ -372,27 +367,33 @@ class SpeculativeLogprobsWireCompatTest(unittest.IsolatedAsyncioTestCase):
             for request in peer.inputs:
                 self.assert_guarded_wire(request, request.request_id)
 
-    async def test_master_enqueue_serialization_reaches_the_actual_fetch_request(self):
-        peer = _Peer()
-        master = _Master(peer)
-        async with _serve(peer, master) as address:
-            visitor = self.visitor(address)
-            visitor.host_service.service_available = True
-            visitor.host_service.get_master_addr = (
-                lambda: f"127.0.0.1:{master.port - FLEXLB_GRPC_PORT_OFFSET}"
-            )
-            request = self.request(ReturnAllProbsMode.ORIGINAL)
-            error = await self.failed_consume(visitor, request)
-            self.assertEqual(peer.unsafe, 0)
-            self.assertEqual(error.exception_type, ExceptionType.UNSUPPORTED_OPERATION)
-            self.assertTrue(request.enqueued_by_master)
-            self.assertEqual(peer.fetch_calls, 1)
-            self.assertEqual(len(master.payloads), 1)
-            self.assert_guarded_wire(
-                pb.GenerateInputPB.FromString(master.payloads[0]),
-                ReturnAllProbsMode.ORIGINAL,
-            )
-            await asyncio.wait_for(peer.cancelled.wait(), 1)
+    async def test_master_enqueue_serialization_reaches_decode_stream(self):
+        prefill_peer, decode_peer = _Peer(), _Peer()
+        mode = ReturnAllProbsMode.ORIGINAL
+        async with _serve(prefill_peer) as prefill_address:
+            master = _Master(prefill_peer, prefill_address)
+            async with _serve(decode_peer, master):
+                visitor = self.visitor(prefill_address)
+                visitor.host_service.service_available = True
+                visitor.host_service.get_master_addr = (
+                    lambda: f"127.0.0.1:{master.port - FLEXLB_GRPC_PORT_OFFSET}"
+                )
+                request = self.request(mode)
+                error = await self.failed_consume(visitor, request)
+                self.assertEqual(
+                    error.exception_type, ExceptionType.UNSUPPORTED_OPERATION
+                )
+                self.assertTrue(request.enqueued_by_master)
+                self.assertEqual(len(master.payloads), 1)
+                self.assertEqual(prefill_peer.unsafe, 0)
+                self.assertEqual(prefill_peer.calls, 0)
+                self.assertEqual(len(prefill_peer.inputs), 1)
+                self.assert_guarded_wire(prefill_peer.inputs[0], mode)
+                self.assertEqual(decode_peer.unsafe, 0)
+                self.assertEqual(decode_peer.calls, 1)
+                self.assertTrue(decode_peer.inputs[0].enqueued_by_master)
+                self.assert_guarded_wire(decode_peer.inputs[0], mode)
+                await asyncio.wait_for(decode_peer.cancelled.wait(), 1)
 
     async def test_transport_retry_keeps_marker_and_original_transport_error(self):
         peer = _Peer(fail_first=True)

@@ -144,6 +144,10 @@ protected:
 TEST_F(KVCacheManagerCPSlotMapperTest, ExplicitCompactPrefillTp8AndDecodeTp4AllocateOwnedPages) {
     for (const auto role : {RoleType::PREFILL, RoleType::DECODE}) {
         const size_t tp_size = role == RoleType::PREFILL ? 8 : 4;
+        RuntimeConfig runtime;
+        for (size_t lane = 0; lane < tp_size; ++lane) {
+            runtime.worker_grpc_addrs.push_back("127.0.0.1:" + std::to_string(12345 + lane));
+        }
         for (size_t rank = 0; rank < tp_size; ++rank) {
             SCOPED_TRACE(rank);
             auto model = makePageRrModelConfig();
@@ -157,9 +161,10 @@ TEST_F(KVCacheManagerCPSlotMapperTest, ExplicitCompactPrefillTp8AndDecodeTp4Allo
             par.prefill_cp_config.prefill_cp_size  = 8;
             auto config = finalizeCacheConfig(CacheConfigCreator::createConfig(model, par, {}), 20);
             PDSepConfig pd;
-            pd.role_type = role;
+            pd.role_type             = role;
+            pd.cache_store_rdma_mode = false;
             auto manager = std::make_shared<KVCacheManager>(
-                config, false, nullptr, KVCacheConfig{}, par, RuntimeConfig{}, SpeculativeExecutionConfig{}, pd);
+                config, false, nullptr, KVCacheConfig{}, par, runtime, SpeculativeExecutionConfig{}, pd);
             ASSERT_TRUE(manager->init());
             ASSERT_NE(manager->cpSlotMapper(), nullptr);
             EXPECT_EQ(manager->cpSlotMapper()->cpRank(), rank);

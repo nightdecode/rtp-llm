@@ -24,6 +24,7 @@ from rtp_llm.config.py_config_modules import (
 )
 from rtp_llm.frontend.frontend_app import FrontendApp
 from rtp_llm.frontend.frontend_server import FrontendServer
+from rtp_llm.frontend.request_id_generator import EPOCH_2020_MS
 from rtp_llm.frontend.shutdown_manager import FrontendShutdownManager
 from rtp_llm.openai.openai_endpoint import OpenaiEndpoint
 from rtp_llm.openai.renderers.kimi_k3_renderer import KimiK3Renderer
@@ -186,10 +187,13 @@ class Controller:
 
     def __init__(self):
         self.active = 0
+        self.next_slot = EPOCH_2020_MS << 12
 
-    def increment(self):
+    def increment(self, request_count: int = 1) -> int:
+        slot = self.next_slot
+        self.next_slot += request_count
         self.active += 1
-        return self.active
+        return slot
 
     def decrement(self):
         self.active -= 1

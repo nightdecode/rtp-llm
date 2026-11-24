@@ -6923,7 +6923,7 @@ TEST_F(FIFOSchedulerTest, testChunkedPrefillChecksCyclicGroupBlocks) {
         {"shared_unaligned_with_reuse", 64, 256, false, true, true, false, true, all_tail_blocks, 256, true},
         {"shared_unaligned_group", 192, 256, false, false, true, false, true, all_tail_blocks, 256, true},
         {"shared_aligned", 128, 256, false, false, true, false, false, all_tail_blocks, 128, true},
-        {"shared_cp_below_alignment", 512, 256, false, false, true, false, true, all_tail_blocks, 256, true},
+        {"shared_state_larger_than_chunk", 512, 256, false, false, true, false, false, all_tail_blocks, 256, true},
         {"shared_cp_at_alignment", 512, 512, false, false, true, false, false, all_tail_blocks, 256, true},
         {"shared_chunk_disabled", 64, 0, false, false, true, false, false, all_tail_blocks, 64, true},
         {"cp_round_robin", 256, 768, false, false, true, false, true, all_tail_blocks, 256, false, 2, true},
@@ -6950,17 +6950,6 @@ TEST_F(FIFOSchedulerTest, testChunkedPrefillChecksCyclicGroupBlocks) {
         env.model_config.max_seq_len                       = 4096;
         env.resource_context.reuse_cache                   = test_case.global_reuse;
         env.resource_context.ignore_request_cache_switches = test_case.ignore_request_switches;
-        const auto& cache_config = env.cache_manager->cacheConfig();
-        int64_t alignment = cache_config.seq_size_per_block;
-        for (const auto& group : cache_config.groups()) {
-            alignment = std::lcm(alignment, static_cast<int64_t>(group.seqSizePerBlock()));
-        }
-        if (env.runtime_config.fifo_scheduler_config.prefill_chunk_size > 0
-            && env.runtime_config.fifo_scheduler_config.prefill_chunk_size < alignment) {
-            ASSERT_TRUE(test_case.reject);
-            EXPECT_ANY_THROW(env.init());
-            return;
-        }
         ASSERT_TRUE(env.init());
         if (test_case.cp_size > 0) {
             env.cache_manager->cp_slot_mapper_ =

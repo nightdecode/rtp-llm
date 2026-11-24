@@ -250,6 +250,7 @@ class KimiK3MultimodalEmbeddingCpuTest(unittest.TestCase):
         model.prefill_query_cp = False
         model._query_layout = None
         model._outer_layout = None
+        model.register_buffer("_mtp_prefill_hidden_buffer", None, persistent=False)
         model.num_blocks = 0
         model.use_paged_conv_prefill = False
         model.kv_cache = None
@@ -650,6 +651,7 @@ class KimiK3MultimodalEmbeddingCudaTest(unittest.TestCase):
         model.prefill_query_cp = False
         model._query_layout = None
         model._outer_layout = None
+        model.register_buffer("_mtp_prefill_hidden_buffer", None, persistent=False)
         model.embed_tokens = Embedding(
             SimpleNamespace(),
             SimpleNamespace(get_attn_tp_size=lambda: tp),

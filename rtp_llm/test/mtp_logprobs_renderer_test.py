@@ -40,12 +40,10 @@ class _Tokenizer:
 
 
 def _output(token_ids, probability_rows):
-    return SimpleNamespace(
+    return GenerateOutput(
         output_ids=torch.tensor(token_ids),
         all_probs=torch.tensor(probability_rows, dtype=torch.float32),
-        aux_info=SimpleNamespace(
-            input_len=4, output_len=len(token_ids), reuse_len=0, multimodal_lengths={}
-        ),
+        aux_info=AuxInfo(input_len=4, output_len=len(token_ids)),
     )
 
 
