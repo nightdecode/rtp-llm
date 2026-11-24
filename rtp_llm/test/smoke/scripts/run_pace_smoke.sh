@@ -2,18 +2,33 @@
 set -euo pipefail
 
 usage() {
-    printf '%s\n' 'Usage: run_pace_smoke.sh [--bazelrc=SOURCE_BAZELRC] [COMMON_BAZEL_ARGS...]' \
-        'Run as the command of start_pace_smoke_stack.sh. Its transport selects the test.' \
-        'The launcher selects the source SDK/Manager in --source mode.' \
-        'For manual --bazelrc=SOURCE_BAZELRC, provide BIN_DIR from the same build.'
+    printf '%s\n' 'Usage: run_pace_smoke.sh [--namespace] [--bazelrc=SOURCE_BAZELRC] [COMMON_BAZEL_ARGS...]' \
+        '       run_pace_smoke.sh --namespace --source PUBLIC_SHA INTERNAL_SHA MEMPOOL_SHA [COMMON_BAZEL_ARGS...]' \
+        'Without --namespace, run as the command of start_pace_smoke_stack.sh.' \
+        'With --namespace, set PACE_SMOKE_TRANSPORT (default tcp) and PACE_SMOKE_RDMA_DEVICE for RDMA.' \
+        'To use an existing source build, pair --bazelrc=SOURCE_BAZELRC with its PACE_SMOKE_BIN_DIR.'
 }
 
 if [[ ${1:-} == --help ]]; then
     usage
     exit 0
 fi
-if [[ -z ${PACE_SMOKE_STATE:-} || $(uname -sm) != "Linux x86_64" ]]; then
+namespace=0
+if [[ ${1:-} == --namespace ]]; then
+    namespace=1
+    shift
+    export PACE_SMOKE_TRANSPORT=${PACE_SMOKE_TRANSPORT:-tcp}
+fi
+if [[ $(uname -sm) != "Linux x86_64" ]]; then
+    printf 'PACE smoke requires an x86_64 Linux CUDA13 environment.\n' >&2
+    exit 2
+fi
+if (( ! namespace )) && [[ -z ${PACE_SMOKE_STATE:-} ]]; then
     usage >&2
+    exit 2
+fi
+if (( namespace )) && { (( EUID == 0 )) || ! command -v sudo >/dev/null; }; then
+    printf 'Run --namespace as a non-root user with noninteractive sudo.\n' >&2
     exit 2
 fi
 
@@ -45,13 +60,52 @@ fi
 bazel_args=(--config=cuda13 --config=remote_kv_cache)
 if ! capabilities=${PACE_SMOKE_CUDA_CAPABILITIES:-$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | sort -Vu | paste -sd,)} ||
     [[ ! $capabilities =~ ^[0-9]+\.[0-9]+(,[0-9]+\.[0-9]+)*$ ]]; then
-    printf 'Expose a CUDA GPU to the RTP test container (for example, --gpus device=GPU_UUID).\n' >&2
+    printf 'Expose a CUDA GPU to the RTP test environment, including for the TCP contract.\n' >&2
     exit 2
 fi
 for env_flag in repo_env action_env host_action_env; do
     bazel_args+=("--$env_flag=TF_CUDA_COMPUTE_CAPABILITIES=$capabilities")
 done
 source_rc=${PACE_SMOKE_SOURCE_BAZELRC:-}
+if (( namespace )) && [[ ${1:-} == --source ]]; then
+    if (( $# < 4 )) || [[ -n $source_rc || -n ${PACE_SMOKE_BIN_DIR:-} ||
+        ! $2 =~ ^[[:xdigit:]]{40}$ || ! $3 =~ ^[[:xdigit:]]{40}$ || ! $4 =~ ^[[:xdigit:]]{40}$ ]]; then
+        printf 'Pass three full Git SHAs to --source without source artifact overrides.\n' >&2
+        exit 2
+    fi
+    : "${PACE_SMOKE_KVCM_INTERNAL_REPO:?set the KVCM internal Git URL or path}"
+    : "${PACE_SMOKE_MEMPOOL_REPO:?set the mempool Git URL or path}"
+    source_pins=("--kvcm-public-commit=${2,,}" "--kvcm-internal-commit=${3,,}" "--mempool-commit=${4,,}")
+    shift 4
+    if [[ ${1:-} == --bazelrc=* ]]; then
+        printf 'Use either --source or --bazelrc, not both.\n' >&2
+        exit 2
+    fi
+    IFS=, read -r -a architectures <<< "$capabilities"
+    cuda_archs=()
+    for arch in "${architectures[@]}"; do
+        sm=${arch/./}
+        cuda_archs+=("compute_$sm:sm_$sm")
+    done
+    build_key=$(printf '%s\n' "${source_pins[@]}" "$capabilities" | sha256sum | cut -d' ' -f1)
+    source_output="$cache_dir/source/$build_key"
+    build_args=("${source_pins[@]}" "--kvcm-internal-repo=$PACE_SMOKE_KVCM_INTERNAL_REPO"
+                "--mempool-repo=$PACE_SMOKE_MEMPOOL_REPO" "--cuda-archs=$(IFS=';'; echo "${cuda_archs[*]}")"
+                "--jobs=${PACE_SMOKE_BUILD_JOBS:-8}" "--bazel=$bazel" --cmake-arg=-DTENT_ENABLE_AFT=OFF
+                --bazel-arg=--config=py310)
+    if [[ -n ${PACE_SMOKE_KVCM_PUBLIC_REPO:-} ]]; then
+        build_args+=("--kvcm-public-repo=$PACE_SMOKE_KVCM_PUBLIC_REPO")
+    fi
+    mkdir -p -- "$source_output"
+    printf 'Preparing pinned PACE/KVCM binaries and SDK. Log: %s/build.log\n' "$source_output" >&2
+    if ! python3 "$script_dir/build_pace_smoke.py" "${build_args[@]}" --output "$source_output" \
+        >> "$source_output/build.log" 2>&1; then
+        tail -n 30 -- "$source_output/build.log" >&2
+        exit 1
+    fi
+    export PACE_SMOKE_BIN_DIR="$source_output/pace/bin"
+    source_rc="$source_output/rtp-smoke.bazelrc"
+fi
 if [[ ${1:-} == --bazelrc=* ]]; then
     if [[ ${PACE_SMOKE_PREPARE:-0} == 1 || -n $source_rc ]]; then
         printf 'Use either launcher --source, or manual --bazelrc with an explicit BIN_DIR.\n' >&2
@@ -73,7 +127,28 @@ fi
 bazel_args+=("$@")
 prepare="$script_dir/prepare_pace_smoke.py"
 test_wrapper=//tools:nvidia_wheel_env
-if [[ ${PACE_SMOKE_PREPARE:-0} == 1 ]]; then
+namespace_env=()
+if (( namespace )); then
+    if [[ -z $source_rc ]]; then
+        if [[ -n ${PACE_SMOKE_BIN_DIR:-} ]]; then
+            printf 'Pair PACE_SMOKE_BIN_DIR with the Bazel configuration from the same source build.\n' >&2
+            exit 2
+        fi
+        model_args+=(--artifacts)
+    else
+        : "${PACE_SMOKE_BIN_DIR:?set the PACE runtime directory from the same source build}"
+        PACE_SMOKE_BIN_DIR=$(realpath -e -- "$PACE_SMOKE_BIN_DIR")
+        export PACE_SMOKE_BIN_DIR
+    fi
+    if (( ${#model_args[@]} )); then
+        checkpoint=$(python3 "$prepare" "$cache_dir" "${model_args[@]}")
+        if [[ -n $checkpoint ]]; then export CHECKPOINT_PATH="$checkpoint"; fi
+    fi
+    test_wrapper=//rtp_llm/test/smoke:pace_namespace_env
+    namespace_env=(--test_env=PACE_SMOKE_TRANSPORT --test_env=PACE_SMOKE_BIN_DIR --test_env=PACE_SMOKE_FAULTS
+                   --test_env=PACE_SMOKE_RDMA_DEVICE --test_env=PACE_SMOKE_RDMA_PORT --test_env=PACE_SMOKE_GID_INDEX
+                   --test_env=CUDA_VISIBLE_DEVICES --test_env=REMOTE_JIT_DIR)
+elif [[ ${PACE_SMOKE_PREPARE:-0} == 1 ]]; then
     runtime=()
     if [[ -z $source_rc ]]; then
         model_args+=(--artifacts)
@@ -90,23 +165,26 @@ if [[ ${PACE_SMOKE_PREPARE:-0} == 1 ]]; then
     exit 0
 fi
 
-: "${KVCM_PACE_FIXTURE:?start the PACE stack before testing}"
-if [[ ${PACE_SMOKE_TRANSPORT} == aft ]]; then
-    export CHECKPOINT_PATH
-    if [[ -s $PACE_SMOKE_STATE/checkpoint ]]; then
-        CHECKPOINT_PATH=$(< "$PACE_SMOKE_STATE/checkpoint")
-    else
-        CHECKPOINT_PATH=$(python3 "$prepare" "$cache_dir" --model)
+if (( ! namespace )); then
+    : "${KVCM_PACE_FIXTURE:?start the PACE stack before testing}"
+    if [[ ${PACE_SMOKE_TRANSPORT} == aft ]]; then
+        export CHECKPOINT_PATH
+        if [[ -s $PACE_SMOKE_STATE/checkpoint ]]; then
+            CHECKPOINT_PATH=$(< "$PACE_SMOKE_STATE/checkpoint")
+        else
+            CHECKPOINT_PATH=$(python3 "$prepare" "$cache_dir" --model)
+        fi
     fi
+    touch "$PACE_SMOKE_STATE/test-start"
 fi
-touch "$PACE_SMOKE_STATE/test-start"
 result=0
 "$bazel" "${bazel_startup[@]}" test "${bazel_args[@]}" \
     --test_strategy=standalone --strategy=TestRunner=local \
     --run_under="$test_wrapper" \
     --test_env=KVCM_PACE_FIXTURE --test_env=CHECKPOINT_PATH --test_env=LD_LIBRARY_PATH \
     --test_env=NO_PROXY --test_env=no_proxy --test_env=RTP_GPU_ACQUIRE_TIMEOUT \
-    --nocache_test_results --test_output=all --test_timeout=600 "$target" || result=$?
+    "${namespace_env[@]}" --nocache_test_results --test_output=all --test_timeout=600 "$target" || result=$?
+if (( namespace )); then exit "$result"; fi
 testlogs="bazel-testlogs/${target#//}"
 testlogs=${testlogs/:/\/}
 if [[ $testlogs/test.log -nt $PACE_SMOKE_STATE/test-start ]]; then

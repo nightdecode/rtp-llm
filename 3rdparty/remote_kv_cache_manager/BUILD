@@ -3,6 +3,7 @@ load("//bazel:defs.bzl", "rpm_library", "runfiles_alias")
 config_setting(
     name = "pace_smoke_prebuilt",
     define_values = {"pace_smoke_prebuilt": "true"},
+    visibility = ["//rtp_llm/test/smoke:__pkg__"],
 )
 
 alias(

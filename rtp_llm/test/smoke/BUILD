@@ -147,6 +147,21 @@ _PACE_SMOKE_DATA = [
     "//3rdparty/remote_kv_cache_manager:remote_kv_cache_manager_server_bin",
 ]
 
+sh_binary(
+    name = "pace_namespace_env",
+    srcs = ["scripts/start_pace_smoke_namespace.sh"],
+    testonly = True,
+    tags = ["manual"],
+    data = [
+        "scripts/pace_smoke_faults.py",
+        "scripts/start_pace_smoke.py",
+        "//tools:nvidia_wheel_env",
+    ] + select({
+        "//3rdparty/remote_kv_cache_manager:pace_smoke_prebuilt": ["//3rdparty/pace_test_runtime:runtime"],
+        "//conditions:default": [],
+    }),
+)
+
 py_test(
     name = "remote_cache_pace_contract",
     srcs = ["pace_contract_smoke.py"],
@@ -154,7 +169,8 @@ py_test(
     deps = [":pace_smoke_fixture"],
     data = _PACE_SMOKE_DATA,
     args = ["--sdk", "$(location :pace_sdk_smoke)"],
-    tags = ["manual", "smoke_case", "no-remote", "requires-pace", "exclusive"],
+    exec_properties = {"gpu": "L20_CU13", "gpu_count": "1"},
+    tags = ["manual", "smoke_case", "requires-pace", "L20_CU13"],
     timeout = "long",
     legacy_create_init = 0,
 )

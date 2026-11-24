@@ -1,5 +1,66 @@
 # Local PACE smoke
 
+## One Linux environment (no Docker needed by the launcher)
+
+From the RTP checkout, on an x86_64 Linux machine or in an existing CUDA13 RTP
+development environment:
+
+```bash
+scripts=rtp_llm/test/smoke/scripts
+bash "$scripts/run_pace_smoke.sh" --namespace
+```
+
+This runs the TENT TCP byte-round-trip case with the pinned binaries and SDK.
+It gives Provider its own IP and `/dev/shm`. Consumer and the RTP test share
+the other IP and `/dev/shm`; Meta and the test's KVCM Manager run there too.
+The launcher uses `sudo -n` for namespace setup and TCP fault control only;
+the binaries and the test run as the original user, with the usual NVIDIA
+libraries and GPU lock. When the test exits, its processes and namespaces go
+away. Service logs and counters are saved under `pace/` in the Bazel test's
+undeclared outputs. Set `BAZEL_OUTPUT_USER_ROOT` to reuse a worktree's Bazel
+cache, and pass any common Bazel options after `--namespace` or the source pins.
+
+Use a non-root account with noninteractive `sudo` and permission to create
+network, mount, IPC and PID namespaces, mount `tmpfs` and create a `veth` pair.
+The environment needs `unshare`, `nsenter`, `setpriv`, `ip`, `mount`, `curl`,
+Python 3, Bazel, a CUDA device (also for the current TCP SDK), and the runtime
+libraries below. If starting from an existing container, its security policy
+must already allow these operations. The launcher does not install host
+packages or change host networking or mounts.
+
+Set the mode once on the launcher; the test reads it from the fixture:
+
+```bash
+PACE_SMOKE_FAULTS=1 bash "$scripts/run_pace_smoke.sh" --namespace
+PACE_SMOKE_TRANSPORT=aft-gdr PACE_SMOKE_RDMA_DEVICE="$hca" \
+  bash "$scripts/run_pace_smoke.sh" --namespace
+```
+
+For the model recovery case use `PACE_SMOKE_TRANSPORT=aft`. RDMA modes need a
+shared RDMA namespace, an active HCA and unlimited `memlock` in the test.
+The AFT modes expose only the selected HCA to the test stack. For TENT RDMA
+or GDR, `PACE_SMOKE_RDMA_PORT` and `PACE_SMOKE_GID_INDEX` default to `1` and `0`.
+TCP faults also need `tc` and kernel `prio`, `flower` and `netem` support.
+
+To use three commits rather than the pinned releases:
+
+```bash
+PACE_SMOKE_KVCM_INTERNAL_REPO="$KVCM_INTERNAL_REPO" PACE_SMOKE_MEMPOOL_REPO="$MEMPOOL_REPO" \
+  bash "$scripts/run_pace_smoke.sh" --namespace \
+  --source "$KVCM_PUBLIC_SHA" "$KVCM_INTERNAL_SHA" "$MEMPOOL_SHA"
+```
+
+Use Git URLs or absolute paths and a CUDA13 environment with access to all
+three repos and the PACE/KVCM build dependencies (including CMake, the C++ and
+libibverbs development libraries, and `rpmbuild`). Complete builds are reused
+from the `source/` subdirectory of `PACE_SMOKE_CACHE_DIR` per commit tuple and
+CUDA architecture list; use a separate cache when changing toolchains. Manager
+and the SDK come from the same source build. To reuse an existing build, set
+`PACE_SMOKE_BIN_DIR` to its `pace/bin` directory and pass its
+`--bazelrc=/path/to/rtp-smoke.bazelrc` instead of `--source`.
+
+## Two containers
+
 `scripts/start_pace_smoke_stack.sh` starts two containers on the same Docker
 host: one for Meta and Provider, and one for Consumer and the RTP tests. The
 containers get different IPs on a fresh bridge and separate `/dev/shm` mounts.
@@ -18,7 +79,7 @@ transport counters and Bazel test outputs in the new run directory.
 | `tcp` (default) | TENT TCP SDK smoke with byte-for-byte readback. Add `--faults` for slow reads, slow writes, and packet loss. No RTP thaw assertion. |
 | `rdma RDMA_DEVICE` or `gdr RDMA_DEVICE` | Existing TENT transport diagnostics. Checks payload and transport counters only. |
 
-Use an x86_64 Linux CUDA13 RTP development image. All AFT modes need a native
+Use an x86_64 Linux CUDA13 RTP development environment. All AFT modes need a native
 AFT-compatible HCA with port 1 active; `aft-gdr` and `aft` also need a
 GPUDirect-capable GPU.
 The model build needs `internal_source` and compiles the late KVCM read-safety
@@ -101,11 +162,10 @@ engine must serve another request with the Provider still down. The time limit
 applies to this profile (one-second Meta polling, eviction after three failed
 probes), not to arbitrary production configurations.
 
-With `--faults tcp`, `remote_cache_pace_contract` applies `tc`/`netem` only to
+With TCP faults enabled, `remote_cache_pace_contract` applies `tc`/`netem` only to
 the test TCP data connection. It verifies a fault hit and SDK timeout, then
 healthy payload I/O after fault removal. It doesn't run a model, require a
-freeze, or wait for a thaw. Only the TCP fault container needs `NET_ADMIN` and
-the runner kernel's `prio`, `flower`, and `netem` support.
+freeze, or wait for a thaw.
 
 ## Runtime and artifacts
 
@@ -211,7 +271,7 @@ mode `aft` remains a separate model case. An explicit `--test_arg=--transport=..
 must agree with the fixture. Use this argument to set the mode for older
 fixtures without the field.
 
-### Build from three commits
+### Build from three commits in containers
 
 Set these variables before running the same launcher command above. No
 separate build, service startup, or SDK override command is needed.
