@@ -7117,7 +7117,6 @@ TEST_F(FIFOSchedulerTest, testChunkedPrefillRejectsInvalidConfigAtConstruction) 
             EXPECT_ANY_THROW(env.init());
         } else {
             ASSERT_TRUE(env.init());
-            EXPECT_EQ(env.scheduler().prefill_chunk_alignment_, 2048);
         }
     }
 }
@@ -7133,7 +7132,6 @@ TEST_F(FIFOSchedulerTest, testChunkedPrefillCpBudgetPreservesLinearCheckpoint) {
     ASSERT_TRUE(env.init());
     ASSERT_NE(env.cache_manager->cpSlotMapper(), nullptr);
     ASSERT_EQ(env.cache_manager->cpSlotMapper()->cpSize(), 8);
-    ASSERT_EQ(env.scheduler().prefill_chunk_alignment_, 2048);
 
     auto short_stream = env.makeStream(std::vector<int>(2048, 1), 1);
     auto long_stream  = env.makeStream(std::vector<int>(131072, 2), 1);

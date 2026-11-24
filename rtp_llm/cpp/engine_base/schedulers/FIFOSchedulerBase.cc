@@ -4,7 +4,6 @@
 #include <chrono>
 #include <limits>
 #include <mutex>
-#include <numeric>
 #include <unordered_set>
 #include <sstream>
 
@@ -19,37 +18,13 @@
 using namespace std;
 namespace rtp_llm {
 
-namespace {
-
-int64_t combineChunkAlignment(int64_t alignment, int64_t tokens) {
-    if (alignment <= 0 || tokens <= 0) {
-        return 0;
-    }
-    const auto factor = alignment / std::gcd(alignment, tokens);
-    if (factor > std::numeric_limits<int>::max() / tokens) {
-        return 0;
-    }
-    return factor * tokens;
-}
-
-}  // namespace
-
-int64_t computeChunkGrant(int64_t budget, int64_t rows, int64_t remaining, int64_t alignment, int64_t prefix) {
-    if (budget <= 0 || rows <= 0 || remaining <= 0 || alignment <= 0 || prefix < 0) {
+int64_t computeChunkGrant(int64_t budget, int64_t rows, int64_t remaining, int64_t block_size) {
+    if (budget <= 0 || rows <= 0 || remaining <= 0 || block_size <= 0) {
         return 0;
     }
 
     const int64_t max_len = budget / rows;
-    if (remaining <= max_len) {
-        return remaining;
-    }
-
-    // Align the absolute end; a loaded prefix may only be base-page aligned.
-    const int64_t first_boundary = (alignment - prefix % alignment) % alignment;
-    if (max_len < first_boundary) {
-        return 0;
-    }
-    return first_boundary + ((max_len - first_boundary) / alignment) * alignment;
+    return remaining <= max_len ? remaining : (max_len / block_size) * block_size;
 }
 
 FIFOSchedulerBase::FIFOSchedulerBase(const RuntimeConfig&                   runtime_config,
@@ -73,16 +48,13 @@ FIFOSchedulerBase::FIFOSchedulerBase(const RuntimeConfig&                   runt
     need_fill_fake_stream_(parallelism_config.dp_size > 1 && parallelism_config.tp_rank == 0),
     metrics_reporter_(metrics_reporter) {
     if (prefill_chunk_size_ > 0) {
-        const auto& config       = cache_manager_->cacheConfig();
-        prefill_chunk_alignment_ = config.seq_size_per_block;
-        for (const auto& group : config.groups()) {
-            prefill_chunk_alignment_ = combineChunkAlignment(prefill_chunk_alignment_, group.seqSizePerBlock());
-        }
-        RTP_LLM_CHECK_WITH_INFO(prefill_chunk_alignment_ > 0 && prefill_chunk_size_ >= prefill_chunk_alignment_,
-                                "[chunked_prefill] invalid configuration: prefill_chunk_size=%ld, "
-                                "intermediate_chunk_alignment=%ld; requires 0 < alignment <= prefill_chunk_size",
+        const int64_t block_size = cache_manager_->cacheConfig().seq_size_per_block;
+        RTP_LLM_CHECK_WITH_INFO(block_size > 0 && block_size <= std::numeric_limits<int>::max()
+                                    && prefill_chunk_size_ >= block_size,
+                                "[chunked_prefill] invalid configuration: prefill_chunk_size=%ld, block_size=%ld; "
+                                "requires a positive block size that fits int and does not exceed prefill_chunk_size",
                                 prefill_chunk_size_,
-                                prefill_chunk_alignment_);
+                                block_size);
         const auto& cp = parallelism_config.prefill_cp_config;
         if (pd_sep_config.role_type == RoleType::PREFILL && parallelism_config.dp_size == 1
             && parallelism_config.tp_size > 1 && cp.is_enabled() && cp.preserve_tp_layout) {
@@ -94,9 +66,7 @@ FIFOSchedulerBase::FIFOSchedulerBase(const RuntimeConfig&                   runt
                                              runtime_config.fifo_scheduler_config.max_context_batch_size,
                                              prefill_chunk_cp_size_);
         }
-        RTP_LLM_LOG_INFO("[chunked_prefill] token_budget=%ld, intermediate_chunk_alignment=%ld",
-                         prefill_chunk_size_,
-                         prefill_chunk_alignment_);
+        RTP_LLM_LOG_INFO("[chunked_prefill] token_budget=%ld, block_size=%ld", prefill_chunk_size_, block_size);
     }
 }
 
@@ -227,7 +197,7 @@ absl::Status FIFOSchedulerBase::checkChunkedPrefillRequest(const GenerateStreamP
     const int64_t seq_length = stream->seqLength();
     const int64_t rows       = stream->currentBatchSize();
     const int64_t block_size = stream->seqSizePerBlock();
-    if (seq_length > 0 && rows > 0 && block_size > 0 && prefill_chunk_alignment_ > 0) {
+    if (seq_length > 0 && rows > 0 && block_size > 0) {
         for (const auto& group : cache_config.groups()) {
             const bool linear_reuse = reuse_cache && group.policy.enable_prefix_reuse
                                       && group.policy.group_type == CacheGroupType::LINEAR;
@@ -267,7 +237,7 @@ absl::Status FIFOSchedulerBase::checkChunkedPrefillRequest(const GenerateStreamP
 
     std::ostringstream error_msg;
     error_msg << "[chunked_prefill] invalid request shape: seq_length=" << seq_length << ", rows=" << rows
-              << ", block_size=" << block_size << ", alignment=" << prefill_chunk_alignment_;
+              << ", block_size=" << block_size;
     stream->reportError(ErrorCode::ERROR_GENERATE_CONFIG_FORMAT, error_msg.str());
     return absl::InvalidArgumentError(error_msg.str());
 }
@@ -373,7 +343,7 @@ std::list<GenerateStreamPtr> FIFOSchedulerBase::selectPrefillPrefix(std::list<Ge
             const int64_t stripe = 2 * prefill_chunk_cp_size_;
             grant_budget         = std::min(grant_budget, padded_budget_left / rows / stripe * stripe * rows);
         }
-        const int64_t grant = computeChunkGrant(grant_budget, rows, remaining, prefill_chunk_alignment_, reuse);
+        const int64_t grant = computeChunkGrant(grant_budget, rows, remaining, block_size);
 
         if (grant <= 0) {
             if (!selected.empty()) {
@@ -385,7 +355,6 @@ std::list<GenerateStreamPtr> FIFOSchedulerBase::selectPrefillPrefix(std::list<Ge
                                            + std::to_string(prefill_chunk_size_) + ", rows=" + std::to_string(rows)
                                            + ", block_size=" + std::to_string(block_size)
                                            + ", remaining=" + std::to_string(remaining)
-                                           + ", alignment=" + std::to_string(prefill_chunk_alignment_)
                                            + "); increase prefill_chunk_size or reduce num_return_sequences");
             continue;
         }
