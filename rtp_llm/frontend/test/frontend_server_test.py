@@ -637,6 +637,58 @@ class FrontendServerTest(TestCase):
                         0,
                     )
 
+    def test_openai_batch_rejects_logprobs_per_item(self):
+        from rtp_llm.openai.api_datatype import BatchChatCompletionRequest
+        from rtp_llm.openai.openai_endpoint import OpenaiEndpoint
+
+        endpoint = OpenaiEndpoint.__new__(OpenaiEndpoint)
+        endpoint._prepare_chat_input = MagicMock(
+            side_effect=lambda request_id, _: (
+                SimpleNamespace(request_id=request_id),
+                GenerateConfig(),
+            )
+        )
+        enqueue = AsyncMock(return_value=["first", "last"])
+        endpoint.backend_rpc_server_visitor = SimpleNamespace(batch_enqueue=enqueue)
+        endpoint._render_single_output = AsyncMock(
+            side_effect=lambda output, *_: FakePipelinResponse(res=output)
+        )
+        self.frontend_server._openai_endpoint = endpoint
+        scored = ChatCompletionRequest(messages=[], logprobs=True)
+        request = BatchChatCompletionRequest(
+            requests=[
+                ChatCompletionRequest(messages=[]),
+                scored,
+                ChatCompletionRequest(messages=[]),
+            ]
+        )
+
+        result = asyncio.run(
+            self.frontend_server.batch_chat_completion(request, FakeRawRequest())
+        )
+        self.assertEqual(result.status_code, 200)
+        responses = json.loads(result.body)["responses"]
+        self.assertEqual(responses[0], {"res": "first"})
+        self.assertEqual(
+            responses[1]["error"]["error_code"], ExceptionType.INVALID_PARAMS
+        )
+        self.assertEqual(responses[2], {"res": "last"})
+        enqueue.assert_awaited_once()
+        self.assertEqual(len(enqueue.await_args.args[0]), 2)
+        self.assertEqual(
+            [call.args[1] for call in endpoint._prepare_chat_input.call_args_list],
+            [request.requests[0], request.requests[2]],
+        )
+
+        enqueue.reset_mock()
+        request = BatchChatCompletionRequest(requests=[scored, scored])
+        result = asyncio.run(
+            self.frontend_server.batch_chat_completion(request, FakeRawRequest())
+        )
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(json.loads(result.body)["responses"], [responses[1]] * 2)
+        enqueue.assert_not_awaited()
+
     def test_native_batch_rpc_errors_preserve_item_results_and_metrics(self):
         import struct
 

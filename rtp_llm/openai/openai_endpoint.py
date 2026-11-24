@@ -8,7 +8,6 @@ from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
 from fastapi import Request
 
 from rtp_llm.config.exceptions import ExceptionType, FtRuntimeException
-from rtp_llm.server.misc import format_exception
 from rtp_llm.config.generate_config import (
     GenerateConfig,
     ReturnAllProbsMode,
@@ -53,6 +52,7 @@ from rtp_llm.openai.renderers.custom_renderer import (
 )
 from rtp_llm.ops import SpecialTokens
 from rtp_llm.server.backend_rpc_server_visitor import BackendRPCServerVisitor
+from rtp_llm.server.misc import format_exception
 from rtp_llm.server.request_headers import extract_request_headers
 from rtp_llm.utils.base_model_datatypes import FrontendMetricFrame
 from rtp_llm.utils.complete_response_async_generator import (
@@ -918,15 +918,30 @@ class OpenaiEndpoint(object):
         request_ids: Optional[List[int]] = None,
     ) -> list:
         inputs = []
-        all_configs = []
+        prepared_items = []
+        responses: list[ChatCompletionResponse | dict[str, Any] | None] = [None] * len(
+            batch_request.requests
+        )
         for i, chat_request in enumerate(batch_request.requests):
+            if chat_request.logprobs:
+                responses[i] = {
+                    "error": format_exception(
+                        FtRuntimeException(
+                            ExceptionType.INVALID_PARAMS,
+                            "batch chat completion does not support logprobs. "
+                            "Use /v1/chat/completions for requests with logprobs.",
+                        )
+                    )
+                }
+                continue
             if chat_request.stream:
                 raise ValueError(
                     f"batch chat completion does not support streaming (request index {i})"
                 )
             chat_request.stream = False
             gen_input, generate_config = self._prepare_chat_input(
-                request_ids[i] if request_ids is not None else base_request_id + i, chat_request
+                request_ids[i] if request_ids is not None else base_request_id + i,
+                chat_request,
             )
             generate_config.is_streaming = False
             if frontend_metric_observer is not None:
@@ -955,19 +970,21 @@ class OpenaiEndpoint(object):
                 gen_input.frontend_metric_observer = raw_metric_observer
             gen_input.frontend_metric_tags = dict(frontend_metric_tags or {})
             inputs.append(gen_input)
-            all_configs.append(generate_config)
+            prepared_items.append((i, generate_config))
+
+        if not inputs:
+            return responses
 
         batch_outputs = await self.backend_rpc_server_visitor.batch_enqueue(inputs)
-
-        responses = []
-        for i, outputs in enumerate(batch_outputs):
+        for (i, generate_config), outputs in zip(
+            prepared_items, batch_outputs, strict=True
+        ):
             if isinstance(outputs, FtRuntimeException):
-                responses.append({"error": format_exception(outputs)})
+                responses[i] = {"error": format_exception(outputs)}
                 continue
-            complete_response = await self._render_single_output(
-                outputs, batch_request.requests[i], all_configs[i]
+            responses[i] = await self._render_single_output(
+                outputs, batch_request.requests[i], generate_config
             )
-            responses.append(complete_response)
 
         return responses
 
