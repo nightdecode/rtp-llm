@@ -1355,23 +1355,23 @@ bool GenerateStream::prepareMtpCacheForNextStep() {
             std::copy(blocks.begin(), blocks.end(), host.data_ptr<int32_t>() + row * width);
         }
         const auto& previous = kernel ? state.next_kv_cache_kernel_block_id_gpu : state.next_kv_cache_block_id_gpu;
-        auto        device = host.to(previous.options(), /*non_blocking=*/true);
+        // PyTorch's pinned allocator delays reuse until the copy completes.
+        auto device = host.to(previous.options(), /*non_blocking=*/true);
         for (size_t row = 0; row < tags.size(); ++row) {
             const int64_t prefix = kernel ? previous_kernel_sizes[row] : previous_linear_blocks[row].size();
             if (prefix > 0) {
                 device.select(0, row).narrow(1, 0, prefix).copy_(previous.select(0, row).narrow(1, 0, prefix));
             }
         }
-        return std::make_pair(std::move(device), std::move(host));
+        return device;
     };
     auto                        physical = rebuild(false);
     auto                        kernel   = rebuild(true);
     std::lock_guard<std::mutex> state_lock(*mtp_async_state_mutex_);
     RTP_LLM_CHECK_WITH_INFO(mtp_async_state_.epoch == state.epoch,
                             "MTP cache reservation raced another state publication");
-    mtp_async_state_.next_kv_cache_block_id_gpu        = std::move(physical.first);
-    mtp_async_state_.next_kv_cache_kernel_block_id_gpu = std::move(kernel.first);
-    mtp_async_state_.cache_snapshot_host_buffers       = {std::move(physical.second), std::move(kernel.second)};
+    mtp_async_state_.next_kv_cache_block_id_gpu        = std::move(physical);
+    mtp_async_state_.next_kv_cache_kernel_block_id_gpu = std::move(kernel);
     return true;
 }
 

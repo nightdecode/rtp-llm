@@ -764,8 +764,6 @@ public:
         // once bookkeeping catches up.
         // -1 = unset (first iter / cleared).
         int next_seq_len_upper_bound = -1;
-        // Immutable sources of replacement page tables, retained through H2D.
-        std::vector<torch::Tensor> cache_snapshot_host_buffers;
     };
 
     uint64_t setMtpAsyncDeviceState(MtpAsyncDeviceState state) {

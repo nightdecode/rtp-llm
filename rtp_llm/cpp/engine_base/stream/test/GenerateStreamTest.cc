@@ -1924,11 +1924,6 @@ TEST_F(GenerateStreamTest, MtpCacheReservationExtendsFullAndPageRRTablesWithoutJ
         EXPECT_TRUE(torch::equal(next.next_kv_cache_kernel_block_id_gpu.cpu(), cacheTable(stream, true)));
         EXPECT_TRUE(torch::equal(original.next_kv_cache_block_id_gpu.cpu(), original_physical));
         EXPECT_TRUE(torch::equal(original.next_kv_cache_kernel_block_id_gpu.cpu(), original_kernel));
-        ASSERT_EQ(next.cache_snapshot_host_buffers.size(), 2u);
-        EXPECT_TRUE(next.cache_snapshot_host_buffers[0].is_pinned());
-        EXPECT_TRUE(next.cache_snapshot_host_buffers[1].is_pinned());
-        EXPECT_TRUE(torch::equal(next.cache_snapshot_host_buffers[0], cacheTable(stream)));
-        EXPECT_TRUE(torch::equal(next.cache_snapshot_host_buffers[1], cacheTable(stream, true)));
 
         // The same pending round already has capacity; avoid another allocation
         // or snapshot replacement, including when Page-RR has fewer local pages.
