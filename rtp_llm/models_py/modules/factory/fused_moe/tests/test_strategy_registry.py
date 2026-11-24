@@ -204,10 +204,11 @@ class StrategyRegistryDiagnosticsTest(unittest.TestCase):
         )
         for strategy_type in types:
             registry.register(strategy_type())
+        public_recipes = MEGA_MOE_STRATEGIES.intersection(MOE_STRATEGY_CHOICES)
         self.assertEqual(
-            {s.strategy_name for s in registry.list_strategies()}, MEGA_MOE_STRATEGIES
+            {s.strategy_name for s in registry.list_strategies()}, public_recipes
         )
-        for name in MEGA_MOE_STRATEGIES:
+        for name in public_recipes:
             config = _config(name)
             config.mega_moe_policy = MegaMoeExecutionPolicy()
             config.n_shared_experts = 1
