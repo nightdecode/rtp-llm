@@ -82,3 +82,42 @@ class PpuFp8PerBlockEpLowLatencyDeepGemmStrategy(MoeStrategy):
                 block_shape=[128, 128],
             ),
         )
+
+
+class PpuFp8PerBlockPureCpDeepGemmStrategy(MoeStrategy):
+    """CP prefill without all-to-all: all-gather tokens over the CP group, run
+    the local experts with FP8 expert GEMMs, reduce-scatter the partial sums.
+
+    Opt-in only (``--moe_strategy fp8_per_block_pure_cp``), as on CUDA: the
+    name is what server_config_setup keys on to keep use_all_gather on under
+    CP, and ``auto`` keeps choosing DeepEP normal.
+    """
+
+    QUANT_METHOD = "FP8_PER_BLOCK"
+    STRATEGY = "fp8_per_block_pure_cp"
+    strategy_name = STRATEGY
+
+    @classmethod
+    def check_conditions(cls, checker: Any, config: MoEConfigAdapter) -> None:
+        resolver = MoeConfigResolver()
+        checker.check(config.moe_strategy == cls.STRATEGY)
+        checker.check(resolver.get_quant_method(config) == cls.QUANT_METHOD)
+        checker.check(config.dp_size == 1)
+        checker.check(resolver.is_cp_equal_ep(config))
+        checker.check(config.ep_size > 1)
+        checker.check(config.parallelism_config.prefill_cp_config.is_enabled())
+        checker.check(resolver.use_all_gather(config))
+        checker.check(not config.enable_cuda_graph)
+
+    def get_attributes(self) -> StrategyAttributes:
+        from ..executors.deepgemm_hybrid_executor import DeepGemmFp8HybridExecutor
+        from ..routers.pure_cp_router import PpuPureCpRouterFp8PerBlock
+
+        return StrategyAttributes(
+            router_class=PpuPureCpRouterFp8PerBlock,
+            executor_class=DeepGemmFp8HybridExecutor,
+            quant_config=FusedMoEQuantConfig(
+                quant_dtype=torch.float8_e4m3fn,
+                block_shape=[128, 128],
+            ),
+        )
