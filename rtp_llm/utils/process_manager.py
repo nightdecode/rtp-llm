@@ -3,7 +3,7 @@ import os
 import signal
 import threading
 import time
-from multiprocessing import Event, Process, RawValue
+from multiprocessing import Process, RawValue
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set
 
 if TYPE_CHECKING:
@@ -63,9 +63,6 @@ class SharedDrainingFlag:
 
 
 def create_service_draining():
-    # Default to the crash-safe flag; set to 0 to restore the legacy Event.
-    if os.environ.get("RTP_LLM_USE_SHARED_DRAINING_FLAG", "1") == "0":
-        return Event()
     return SharedDrainingFlag()
 
 

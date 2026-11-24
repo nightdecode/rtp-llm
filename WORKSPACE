@@ -49,7 +49,8 @@ local_repository(
     path = "arch_config",
 )
 
-# CUDA 13 builds can select platform pins without replacing either repository above.
+# Share CUDA 13 pip locks and wheel requirements by default. A build profile
+# can override this repository to select a matching pair for each architecture.
 local_repository(
     name = "rtp_cuda13_profile",
     path = "arch_config",
