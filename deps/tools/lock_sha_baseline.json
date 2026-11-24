@@ -21,6 +21,24 @@
       "67bba01c854fe3b06397c297d49724e16029984a37124d05047a78ff48e7c44f"
      ]
     }
+   },
+   "requirements_lock_torch_ppu.txt": {
+    "deep-gemm-mega": {
+     "from": [
+      "48039c6fbac4832b8990fdc1ace9ce1b5bfc3a7c4d7fa02a9b5172e01f78c392"
+     ],
+     "reason": "DeepSeek-V4-Flash-0731 PPU exact W4A8 path: MegaMoE wheel r1 replaced by the r2 build (rtp-opensource OSS)",
+     "to": [
+      "15f0417db43792e77233ab2752ff9208c1da7c43a6fe924b4bad89faf25af277"
+     ]
+    },
+    "deep-gemm-route-a": {
+     "from": [],
+     "reason": "new PPU Decode Route A dependency (routea2 wheel, GitHub release pr1708-precision-deps-20261124) for the exact W4A8 path",
+     "to": [
+      "8ad3d230d7539c3d0514a6197f6d0831d90f1c109e4263b93ea21cede3de9c81"
+     ]
+    }
    }
   }
  },
@@ -29676,7 +29694,10 @@
    "7e42900e3e86927f874daac8466f2d8611efe9b0c2ffeea30a306fe5e445a0cd"
   ],
   "deep-gemm-mega": [
-   "48039c6fbac4832b8990fdc1ace9ce1b5bfc3a7c4d7fa02a9b5172e01f78c392"
+   "15f0417db43792e77233ab2752ff9208c1da7c43a6fe924b4bad89faf25af277"
+  ],
+  "deep-gemm-route-a": [
+   "8ad3d230d7539c3d0514a6197f6d0831d90f1c109e4263b93ea21cede3de9c81"
   ],
   "einops": [
    "54058201ac7087911181bfec4af6091bb59380360f069276601256a76af08193",
