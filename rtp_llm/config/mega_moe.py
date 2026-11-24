@@ -12,9 +12,15 @@ class MegaMoeExecutionPolicy:
     fast_math: bool = False
 
 
-FP4_MEGA_MOE_STRATEGIES = frozenset({"mega_moe", "mega_moe_se", "mega_moe_fused"})
+FP4_MEGA_MOE_STRATEGIES = {"mega_moe", "mega_moe_se", "mega_moe_fused"}
 FP8_MEGA_MOE_STRATEGIES = frozenset({"mega_moe_fp8", "mega_moe_fp8_se"})
 MEGA_MOE_STRATEGIES = FP4_MEGA_MOE_STRATEGIES | FP8_MEGA_MOE_STRATEGIES
-FUSED_SHARED_STRATEGIES = frozenset(
-    {"mega_moe_se", "mega_moe_fp8_se", "mega_moe_fused"}
-)
+FUSED_SHARED_STRATEGIES = {"mega_moe_se", "mega_moe_fp8_se", "mega_moe_fused"}
+
+
+def register_prepared_fp4_strategy(name: str, *, fused_shared: bool) -> None:
+    """Register an extension's weight layout for loader and execution policy selection."""
+    FP4_MEGA_MOE_STRATEGIES.add(name)
+    MEGA_MOE_STRATEGIES.add(name)
+    if fused_shared:
+        FUSED_SHARED_STRATEGIES.add(name)

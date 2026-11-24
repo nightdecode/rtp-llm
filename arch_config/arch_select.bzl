@@ -1,3 +1,4 @@
+load(":cuda13_requirements.bzl", "CUDA13_ARM_COMPILER", "CUDA13_X86_COMPILER")
 load("@pip_arm_torch//:requirements.bzl", requirement_arm = "requirement")
 
 # to wrapper target relate with different system config
@@ -174,9 +175,7 @@ def whl_deps():
             "tilelang==0.1.15",
             "apache-tvm-ffi==0.1.12",
             # FlashAttention 3 remains deferred on CUDA13.
-            "nvidia-cutlass-dsl==4.4.2",
-            "nvidia-cutlass-dsl-libs-cu13==4.4.2",
-        ],
+        ] + CUDA13_X86_COMPILER,
         "@rtp_llm//:using_cuda13_arm": [
             "torch==2.11.0+cu130",
             "torchvision==0.26.0+cu130",
@@ -194,9 +193,7 @@ def whl_deps():
             "apache-tvm-ffi==0.1.12",
             # FlashAttention wheels remain deferred on CUDA13 ARM.
             "fast-hadamard-transform@https://rtp-opensource.oss-cn-hangzhou.aliyuncs.com/rtp_llm/cu129/fast_hadamard_transform-1.0.4.post1-cp310-cp310-linux_aarch64.whl",
-            "nvidia-cutlass-dsl==4.5.0",
-            "nvidia-cutlass-dsl-libs-base==4.5.0",
-        ],
+        ] + CUDA13_ARM_COMPILER,
         "@rtp_llm//:using_cuda12_9_x86": [
             # torch 2.8.0+cu129: the upstream wheel (http.bzl torch_2.8_py310_cuda
             # fetches the same file); the artlab pytorch mirror copy is the

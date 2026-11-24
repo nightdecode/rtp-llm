@@ -269,6 +269,14 @@ class MegaMoeExecutor(Fp8Fp4ExecutorBase):
 
         self._setup_buffer_and_warmup()
 
+    def _routed_transform(self):
+        import deep_gemm
+
+        return getattr(deep_gemm, self._fp4_transform_name)
+
+    def _shared_transform(self):
+        return None
+
     def setup_weights_from_fp4(self, w1_w, w1_s, w2_w, w2_s, w1_layout="gate_up"):
         self._setup_fp4_weights(
             {W.moe_w1: w1_w, W.moe_s1: w1_s, W.moe_w2: w2_w, W.moe_s2: w2_s},
@@ -300,6 +308,7 @@ class MegaMoeExecutor(Fp8Fp4ExecutorBase):
             w2_w,
             w2_s,
             fp8_routed=self._fp8_routed,
+            transform=self._shared_transform(),
             allow_requant=self._prepared_policy is not None,
             expected_num_experts=(
                 None if self._prepared_policy is not None else self.cfg.n_shared_experts
@@ -385,7 +394,7 @@ class MegaMoeExecutor(Fp8Fp4ExecutorBase):
             else transform_fp8_to_fp4_mega_weights
         )
         if not self._fp8_routed:
-            kwargs["transform_name"] = self._fp4_transform_name
+            kwargs["transform"] = self._routed_transform()
         l1, l2 = transform(self.cfg, *args, **kwargs)
         self._mega_l1_w, self._mega_l1_sf = l1
         self._mega_l2_w, self._mega_l2_sf = l2
@@ -472,7 +481,7 @@ class MegaMoeExecutor(Fp8Fp4ExecutorBase):
 
         # Mega MoE transform: L1 gate/up interleave (gran=8 along N) +
         # both SFs UTCCP-transposed. Drop inputs immediately after.
-        (l1_w, l1_sf), (l2_w, l2_sf) = getattr(deep_gemm, self._fp4_transform_name)(
+        (l1_w, l1_sf), (l2_w, l2_sf) = self._routed_transform()(
             (w13, s13_int),
             (w2, s2_int),
         )
