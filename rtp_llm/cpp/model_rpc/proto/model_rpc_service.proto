@@ -951,6 +951,7 @@ enum TransferCompletionForgetStatusPB {
 
 message TransferCompletionForgetRequestPB {
     repeated TransferCompletionKeyPB keys = 1;
+    bool kvcm_read_released = 2;
 }
 
 message TransferCompletionForgetEntryPB {

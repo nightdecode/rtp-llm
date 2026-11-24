@@ -1,9 +1,108 @@
 # Local PACE smoke
 
-`scripts/start_pace_smoke_stack.sh` starts a memory-backed Meta, a Provider and
-a Consumer once for the test command. Each PACE smoke case receives the same
-`KVCM_PACE_FIXTURE`, starts its own KVCM Manager and configures PACE storage.
-The launcher stops PACE when the whole command exits.
+`scripts/start_pace_smoke_stack.sh` starts two containers on the same Docker
+host: one for Meta and Provider, and one for Consumer and the RTP tests. The
+containers get different IPs on a fresh bridge and separate `/dev/shm` mounts.
+Each PACE smoke case uses the same `KVCM_PACE_FIXTURE` and starts its own KVCM
+Manager binary. The launcher removes both containers and the bridge when the
+test command exits. It returns the test exit code and keeps component logs,
+transport counters and Bazel test outputs in the new run directory.
+
+## Choose a test
+
+| Launcher mode | Test |
+| --- | --- |
+| `aft RDMA_DEVICE` | Primary RDMA test: one Qwen Prefill with native AFT and GDR reads. Takes the Provider offline and verifies safe release of the original RTP frozen blocks. |
+| `tcp` (default) | TENT TCP SDK smoke with byte-for-byte readback. Add `--faults` for slow reads, slow writes, and packet loss. No RTP thaw assertion. |
+| `rdma RDMA_DEVICE` or `gdr RDMA_DEVICE` | Existing TENT transport diagnostics. Checks payload and transport counters only. |
+
+Use an x86_64 Linux CUDA13 RTP development image. For `aft`, expose a
+GPUDirect-capable GPU and a native AFT-compatible HCA with port 1 active.
+The model build needs `internal_source` and compiles the late KVCM read-safety
+recovery from this checkout; no source overlay is needed. Keep the KVCM SDK
+and PACE Consumer compatible with late read-safety queries when building them
+from custom commits. AFT will not fall back to TCP or host staging for the read.
+The test uses DRAM Push without SSD, and the Consumer waits for the RTP client's
+GPU memory registration before advertising its connections.
+
+Run from the public checkout (`repo`). Set `test_user` to the launcher user's
+non-root `UID:GID`, except that a root launcher can select a non-root test user.
+The user must exist in the image or a mounted passwd file. `checkout_root`
+covers both the public checkout and its `internal_source` path; `run` must
+not already exist. Set `git_options` as shown below before running the command.
+
+```bash
+scripts="$repo/rtp_llm/test/smoke/scripts"
+transport=(tcp)                  # Or (aft "$hca"), (rdma "$hca"), (gdr "$hca").
+faults=()                         # Use (--faults) for TCP fault cases.
+source_args=()                    # Set the three pins below to build from source.
+runtime=-                        # Use the pinned prebuilt runtime by default.
+bash "$scripts/start_pace_smoke_stack.sh" "${faults[@]}" "${source_args[@]}" \
+  "$test_user" "$image" "$runtime" "$run" \
+  "${transport[@]}" -- \
+  --gpus "device=$gpu" \
+  --volume "$checkout_root:$checkout_root" \
+  --volume /etc/passwd:/etc/passwd:ro --volume /etc/group:/etc/group:ro \
+  "${git_options[@]}" \
+  -- bash "$scripts/run_pace_smoke.sh"
+```
+
+Set `git_options=()` if the image already has access to the Git dependencies.
+Otherwise, give the build and test containers your normal Git credentials.
+For SSH, mount a socket from an already authorized SSH agent and a trusted
+`known_hosts` file rather than baking credentials into the image:
+
+```bash
+git_options=(
+  --mount "type=bind,source=$SSH_AUTH_SOCK,target=/run/git-agent"
+  --mount "type=bind,source=$known_hosts,target=/run/git-known-hosts,readonly"
+  --env SSH_AUTH_SOCK=/run/git-agent
+  --env 'GIT_SSH_COMMAND=ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/run/git-known-hosts'
+)
+```
+
+Pass additional Docker options between the two `--` separators. They apply
+to the Consumer/test container and, in source mode, to the temporary PACE
+build container, never to the Provider. The launcher owns networking and IPC.
+
+The launcher installs missing runtime RPMs from the image's configured package
+repositories, including `iproute-tc` in the Consumer when using TCP faults.
+With `BIN_DIR=-`, `run_pace_smoke.sh` prepares the pinned PACE and KVCM
+artifacts before the stack starts and picks the test from the launcher mode.
+Only the AFT model case needs the Qwen checkpoint. Downloads use
+the test account's existing registry and artifact access. Images that allow
+anonymous pull are downloaded directly; otherwise the script uses `crane` with
+the caller's Docker credentials and supplies a pinned build if needed. If
+GitHub downloads are slow or blocked, pass
+`--env PACE_SMOKE_CRANE_URL=<mirror-archive-url>`; the same SHA256 is checked.
+
+The model is Qwen2.5-0.5B-Instruct at revision `7ae557604adf67be50417f59c2c2f167def9a775`.
+The entry verifies a mounted copy or downloads the pinned files from Hugging
+Face. Pass `--env CHECKPOINT_PATH` to use a mounted copy, `--env HF_ENDPOINT`
+to choose a download mirror, or `--env PACE_SMOKE_CACHE_DIR` to choose a mounted
+persistent download cache. To reuse the Bazel output cache, mount it and pass
+`--env BAZEL_OUTPUT_USER_ROOT=/path/to/cache` as a Docker option. Extra
+arguments to `run_pace_smoke.sh` are common Bazel build and test options.
+
+### What counts as recovery?
+
+`remote_cache_pace_provider_offline` first requires a real remote hit and a
+positive Consumer GDR read byte delta. The launcher pauses only its test
+Provider, allows a cold-prefix read to enter the data path, and kills that
+Provider process while leaving Meta running. The test requires an SDK timeout
+that freezes RTP DEVICE blocks, Meta's eviction and notification, and late
+buffer-safety evidence from Consumer. The original read's blocks must all
+release naturally within 10 seconds of Provider pause, with forced release
+disabled. The faulted request must recompute the same output, and the same RTP
+engine must serve another request with the Provider still down. The time limit
+applies to this profile (one-second Meta polling, eviction after three failed
+probes), not to arbitrary production configurations.
+
+With `--faults tcp`, `remote_cache_pace_contract` applies `tc`/`netem` only to
+the test TCP data connection. It verifies a fault hit and SDK timeout, then
+healthy payload I/O after fault removal. It doesn't run a model, require a
+freeze, or wait for a thaw. Only the TCP fault container needs `NET_ADMIN` and
+the runner kernel's `prio`, `flower`, and `netem` support.
 
 ## Runtime and artifacts
 
@@ -43,13 +142,20 @@ glibc, libstdc++, libibverbs, librdmacm, Boost, Prometheus, glog, OpenSSL, hired
 MySQL client and jemalloc), `rpm2cpio`, and `cpio`. The CUDA13 SDK initializes a
 CUDA device even for the CPU-buffer contract.
 
-## Run a group of tests
+## Run selected targets
 
-The launcher isolates Provider networking and shared memory on the Linux test
-machine. Run it as root with permission to create mount and network namespaces.
-It runs the binaries and tests as the supplied non-root `UID:GID`. In a container,
-grant `SYS_ADMIN` and `NET_ADMIN` and set `--ulimit memlock=-1`. The launcher needs
-ports 24910–24917 and subnet `198.18.78.0/30`.
+Use a Docker daemon that can start both containers, mount the checkout and
+artifacts, and expose the required devices. The launcher does not need host
+networking, `SYS_ADMIN`, or an AppArmor override. On Aone, run the same command
+on a GPU runner with that Docker access and use paths visible to the daemon
+(for DinD, bind mounts must be under the job workspace). The `services` field
+alone is not sufficient because containers in the same job Pod share an IP.
+Use a separate run directory per mode and publish it as the job's artifacts
+even on failure. Keep the source, download, and Bazel caches outside that
+directory so later jobs can mount them again.
+The test UID must exist in the image or in a passwd file mounted by the daemon.
+Without a writable mounted home, the launcher uses a temporary home inside the
+containers. Pass cache mounts and credential locations explicitly to reuse them.
 
 Use `rtp_config=cuda13` on x86_64 or `rtp_config=cuda13_arm` on aarch64.
 Set `distfiles` to the directory containing the authenticated downloads for
@@ -61,31 +167,26 @@ bazel build --config="$rtp_config" --distdir="$distfiles" \
   //3rdparty/pace_test_runtime:runtime
 ```
 
-Set `test_user` to the test user's non-root `UID:GID`. Omit the transport
-arguments to use TENT TCP. For RDMA or GDR, supply the mode and active HCA,
-optionally followed by its port and GID index (defaults 1 and 0). GDR requires
-a GPUDirect-capable GPU and HCA. Pass all test targets that should share
-PACE to the same command. The example includes one SDK contract and one
-model smoke. The model smoke requires its configured model files and GPU.
+Pass all compatible targets that should share PACE to the same command.
+Run the AFT Provider-offline test on its own stack, since it kills that
+stack's Provider. For the optional TENT RDMA/GDR diagnostics, the HCA can be
+followed by a port and GID index (defaults 1 and 0). Bazel's default test
+wrapper locates the NVIDIA wheel libraries and locks the GPU.
 
 ```bash
 scripts="$PWD/rtp_llm/test/smoke/scripts"
 bin="$PWD/bazel-bin/3rdparty/pace_test_runtime"
-transport=()  # For RDMA or GDR, use (rdma mlx5_2) or (gdr mlx5_2).
-bazel_rc=()
-artifact_config=(--config=pace_prebuilt --distdir="$distfiles")
-run="/tmp/pace-smoke-$(date +%s)-$$"
-
-bash "$scripts/start_pace_smoke_stack.sh" "$test_user" "$bin" "$run" \
-  "${transport[@]}" -- \
-  bazel --batch "${bazel_rc[@]}" test \
-  --config="$rtp_config" --config=remote_kv_cache "${artifact_config[@]}" \
+bash "$scripts/start_pace_smoke_stack.sh" "$test_user" "$image" "$bin" "$run" \
+  tcp -- \
+  --gpus "device=$gpu" \
+  --volume "$checkout_root:$checkout_root" --volume "$distfiles:$distfiles:ro" \
+  --volume /etc/passwd:/etc/passwd:ro --volume /etc/group:/etc/group:ro \
+  -- bazel --batch test \
+  --config="$rtp_config" --config=remote_kv_cache --config=pace_prebuilt --distdir="$distfiles" \
   --test_strategy=standalone \
-  --run_under=//rtp_llm/test/utils:gpu_lock \
   --test_env=KVCM_PACE_FIXTURE --test_env=LD_LIBRARY_PATH \
   --test_env=NO_PROXY --test_env=no_proxy --nocache_test_results --test_output=all \
-  //rtp_llm/test/smoke:remote_cache_pace_contract \
-  //rtp_llm/test/smoke:remote_cache_pace_basic
+  //rtp_llm/test/smoke:remote_cache_pace_contract
 ```
 
 The cases run serially and PACE state persists between them. The existing
@@ -106,28 +207,31 @@ fixtures without the field.
 
 ### Build from three commits
 
-Provide Git URLs or local paths for the private repositories and full commit
-SHAs. Git uses the developer's existing repository access. Build PACE in a
-CMake environment with libibverbs headers and KVCM in its CUDA build
-environment with Bazelisk and `rpmbuild`.
+Set these variables before running the same launcher command above. No
+separate build, service startup, or SDK override command is needed.
 
 ```bash
-pins=(
-  --kvcm-public-commit "$KVCM_PUBLIC_SHA"
-  --kvcm-internal-repo "$KVCM_INTERNAL_REPO"
-  --kvcm-internal-commit "$KVCM_INTERNAL_SHA"
-  --mempool-repo "$MEMPOOL_REPO"
-  --mempool-commit "$MEMPOOL_SHA"
-  --cuda-archs "$CUDA_ARCHS"
-)
-python3 "$scripts/build_pace_smoke.py" "${pins[@]}" --component=pace \
-  --cmake-arg=-DTENT_ENABLE_AFT=OFF --output "$artifacts/pace"
-python3 "$scripts/build_pace_smoke.py" "${pins[@]}" --component=kvcm \
-  --bazel-arg=--config=py310 --output "$artifacts/kvcm"
+export PACE_SMOKE_KVCM_INTERNAL_REPO="$KVCM_INTERNAL_REPO"
+export PACE_SMOKE_MEMPOOL_REPO="$MEMPOOL_REPO"
+source_args=(--source "$KVCM_PUBLIC_SHA" "$KVCM_INTERNAL_SHA" "$MEMPOOL_SHA")
+runtime="$source_cache"
 ```
 
-Use `bin="$artifacts/pace/pace/bin"`,
-`bazel_rc=(--bazelrc="$artifacts/kvcm/rtp-smoke.bazelrc")`, and
-`artifact_config=(--config=pace_source)` in the launcher command. Keep the
-artifacts at the same paths when running the test so Bazel can resolve the
-KVCM Manager and SDK overrides.
+Use full 40-character SHAs and Git URLs or paths mounted in the build
+containers. `PACE_SMOKE_KVCM_PUBLIC_REPO` can override the default GitHub URL.
+Use a mirror containing the same commit if the runner cannot reach GitHub.
+For the known legacy Poco and Havenask pins, the builder uses the upstream
+public repositories without changing the pinned revisions or Bazel patches.
+The source cache must be writable by `test_user`.
+The launcher builds Meta and both PACE roles from the mempool pin in the PACE
+build image, and builds the Manager and SDK together in the RTP CUDA13 image.
+The test links that SDK, not the prebuilt SDK. The cache reuses complete
+artifacts for the same three pins, visible CUDA architectures and build images.
+The run directory records the pins in `sources.json`.
+`PACE_SMOKE_PACE_BUILD_IMAGE` and `PACE_SMOKE_BUILD_JOBS` can override the PACE
+build image and source build parallelism.
+
+For AFT, the pinned Consumer and SDK must support late read-safety evidence,
+and the Provider must support DRAM Push and GPU memory-registration exchange.
+No fault-enabled PACE binary is required. TENT TCP faults use `--faults`;
+real RDMA/GDR Provider-loss recovery uses `aft`, not a `tc` rule on the HCA.

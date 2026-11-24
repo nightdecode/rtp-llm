@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -12,9 +13,17 @@
 #include <utility>
 #include <vector>
 
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/un.h>
+#include <unistd.h>
+
 #include "kvcm_client/meta_client.h"
 #include "kvcm_client/HostCacheStateCompat.h"
+#include "kvcm_client/TransferClientCompat.h"
 #include "kvcm_client/transfer_client.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/storage_backend/kvcm/SdkBufferSafety.h"
 
 #if defined(USING_CUDA13)
 #include <cuda_runtime_api.h>
@@ -33,12 +42,13 @@ void check(ClientErrorCode code, const std::string& operation) {
     require(code == ER_OK, operation + " failed: " + std::to_string(code));
 }
 
+constexpr size_t full_block_bytes = 262144;
+constexpr size_t gpu_pool_bytes = 2 * 1024 * 1024;
+
 #if defined(USING_CUDA13)
 void checkCuda(cudaError_t code, const char* operation) {
     require(code == cudaSuccess, std::string(operation) + ": " + cudaGetErrorString(code));
 }
-
-constexpr size_t gpu_pool_bytes = 2 * 1024 * 1024;
 #endif
 
 class GpuPool {
@@ -122,6 +132,62 @@ BlockBuffers buffers(std::vector<std::vector<uint8_t>>& data, uint8_t* gpu) {
     return result;
 }
 
+template<typename Code>
+bool expectedTimeout(Code code) {
+    if (code == Code::ER_SDK_TIMEOUT) {
+        return true;
+    }
+    if constexpr (rtp_llm::kvcm::detail::HasExplicitBufferSafeCodes<Code>::value) {
+        return code == Code::ER_SDK_TIMEOUT_BUFFER_SAFE;
+    }
+    return false;
+}
+
+void exerciseFault(TransferClient& transfer, const std::string& uri, const BlockBuffers& block_buffers,
+                   const std::string& scenario, const std::string& socket_path) {
+    require(uri.rfind("pace://", 0) == 0, "Fault requires a PACE URI");
+    require(rtp_llm::kvcm::detail::HasTransferDeadline<TransferClient>::value,
+            "TCP faults require a KVCM SDK with per-call deadlines");
+    struct Connection {
+        const int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        ~Connection() {
+            if (fd >= 0) {
+                close(fd);
+            }
+        }
+    } connection;
+    require(connection.fd >= 0, "Cannot create PACE fault socket");
+    require(fcntl(connection.fd, F_SETFD, FD_CLOEXEC) == 0, "Cannot initialize PACE fault socket");
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    require(socket_path.size() < sizeof(address.sun_path), "PACE fault socket path is too long");
+    std::memcpy(address.sun_path, socket_path.c_str(), socket_path.size() + 1);
+    const timeval timeout{25, 0};
+    require(setsockopt(connection.fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0
+                && setsockopt(connection.fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) == 0,
+            "Cannot set PACE fault socket timeouts");
+    require(connect(connection.fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0,
+            "Cannot connect to PACE fault control at " + socket_path);
+    const auto exchange = [&](const std::string& request) {
+        char reply = 0;
+        require(send(connection.fd, request.data(), request.size(), MSG_NOSIGNAL)
+                    == static_cast<ssize_t>(request.size())
+                    && recv(connection.fd, &reply, 1, 0) == 1 && reply == '1',
+                "PACE fault control failed for " + scenario + ". See faults.log");
+    };
+
+    const UriStrVec uris{uri};
+    exchange(scenario + "\n");
+    const auto deadline_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch() + std::chrono::seconds(1)).count();
+    const auto code = scenario == "slow-write"
+        ? rtp_llm::kvcm::saveSdkKvCaches(transfer, uris, block_buffers, deadline_ms, nullptr).first
+        : rtp_llm::kvcm::loadSdkKvCaches(transfer, uris, block_buffers, deadline_ms, nullptr);
+    exchange("\n");
+    require(expectedTimeout(code), scenario + " returned unexpected SDK status " + std::to_string(code));
+    std::cout << "PASS: " << scenario << " hit, SDK status=" << code << '\n';
+}
+
 void verifyPool(TransferClient& transfer, WriteLocation& write, const std::string& spec_name, size_t bytes,
                 const GpuPool& pool, bool save = true) {
     UriStrVec uris;
@@ -194,9 +260,16 @@ void verifyPool(TransferClient& transfer, WriteLocation& write, const std::strin
 int main(int argc, char** argv) {
     using namespace kv_cache_manager;
     try {
-        require(argc == 3 || (argc == 4 && std::string(argv[3]) == "--gdr"),
-                "Expected config path, backend type, and optional --gdr");
-        const bool use_gpu = argc == 4;
+        const std::string usage = "Expected config path, backend type, [--gdr] [--fault CASE SOCKET]";
+        require(argc >= 3, usage);
+        const bool use_gpu = argc > 3 && std::string(argv[3]) == "--gdr";
+        const int fault_arg = use_gpu ? 4 : 3;
+        require(argc == fault_arg || (argc == fault_arg + 3 && std::string(argv[fault_arg]) == "--fault"), usage);
+        const std::string fault = argc > fault_arg ? argv[fault_arg + 1] : "";
+        const std::string fault_socket = argc > fault_arg ? argv[fault_arg + 2] : "";
+        const bool tcp_fault = fault == "slow-read" || fault == "slow-write" || fault == "packet-loss";
+        require(argc == fault_arg || (!use_gpu && tcp_fault && !fault_socket.empty()),
+                "Invalid PACE fault mode or socket");
         std::ifstream input(argv[1]);
         require(input.good(), "Cannot read SDK config");
         const std::string config((std::istreambuf_iterator<char>(input)), {});
@@ -206,6 +279,12 @@ int main(int argc, char** argv) {
         params.storage_configs = meta->GetStorageConfig();
         GpuPool full_pool(use_gpu);
         GpuPool state_pool(use_gpu);
+        std::vector<std::vector<uint8_t>> fault_data;
+        BlockBuffers fault_buffers;
+        if (!fault.empty()) {
+            fault_data.emplace_back(full_block_bytes, 0x5A);
+            fault_buffers = buffers(fault_data, nullptr);
+        }
         auto full = full_pool.createClient(config, params);
         params.self_location_spec_name = "state";
         auto state = state_pool.createClient(config, params);
@@ -222,7 +301,7 @@ int main(int argc, char** argv) {
         auto [pending_code, pending] = meta->MatchLocation(trace, QueryType::QT_BATCH_GET, keys, {}, BlockMaskOffset{0}, 0, {});
         check(pending_code, "Pending match");
         require(count(pending) == 0, "Uncommitted writes became visible");
-        verifyPool(*full, write, "full", 262144, full_pool);
+        verifyPool(*full, write, "full", full_block_bytes, full_pool);
         verifyPool(*state, write, "state", 65536, state_pool);
         check(meta->FinishWrite(trace, write.write_session_id, BlockMaskOffset{keys.size()}, write.locations), "FinishWrite");
 
@@ -236,7 +315,7 @@ int main(int argc, char** argv) {
         check(read_code, "Read published URIs");
         WriteLocation published;
         published.locations = std::move(read_locations);
-        verifyPool(*full, published, "full", 262144, full_pool, false);
+        verifyPool(*full, published, "full", full_block_bytes, full_pool, false);
         verifyPool(*state, published, "state", 65536, state_pool, false);
 
         auto [offset_code, offset_match] = meta->MatchLocation(
@@ -273,10 +352,14 @@ int main(int argc, char** argv) {
         if (!reuse.write_session_id.empty()) {
             check(meta->FinishWrite(trace, reuse.write_session_id, BlockMaskOffset{0}, reuse.locations), "Finish skipped write");
         }
+        if (!fault.empty() && fault != "slow-write") {
+            exerciseFault(*full, published.locations.at(0).at(0).uri, fault_buffers, fault, fault_socket);
+            verifyPool(*full, published, "full", full_block_bytes, full_pool, false);
+        }
         auto [replica_code, replica] = meta->StartWrite(trace, keys, {}, {"Ffull", "Ffull", "FfullLstate"}, 60, 2);
         check(replica_code, "Allocate second replica");
         require(count(replica.locations) == 3, "min_replica_count=2 was ignored");
-        verifyPool(*full, replica, "full", 262144, full_pool);
+        verifyPool(*full, replica, "full", full_block_bytes, full_pool);
         verifyPool(*state, replica, "state", 65536, state_pool);
         check(meta->FinishWrite(trace, replica.write_session_id, BlockMaskOffset{keys.size()}, replica.locations), "Publish second replica");
         auto [two_code, two] = meta->StartWrite(trace, keys, {}, {"Ffull", "Ffull", "FfullLstate"}, 60, 2);
@@ -309,14 +392,19 @@ int main(int argc, char** argv) {
         const std::vector<int64_t> aborted_keys{nonce + 5};
         auto [abort_code, aborted] = meta->StartWrite(trace, aborted_keys, {}, {"Ffull"}, 60, 1);
         check(abort_code, "Abort allocation");
-        check(meta->FinishWrite(trace, aborted.write_session_id, BlockMaskOffset{0}, aborted.locations), "Abort finish");
+        if (fault == "slow-write") {
+            require(count(aborted.locations) == 1, "Incomplete fault allocation");
+            exerciseFault(*full, aborted.locations.at(0).at(0).uri, fault_buffers, fault, fault_socket);
+        } else {
+            check(meta->FinishWrite(trace, aborted.write_session_id, BlockMaskOffset{0}, aborted.locations), "Abort finish");
+        }
         auto [abort_match_code, abort_match] = meta->MatchLocation(trace, QueryType::QT_BATCH_GET, aborted_keys, {}, BlockMaskOffset{0}, 0, {});
         check(abort_match_code, "Abort match");
-        require(count(abort_match) == 0, "Aborted write became visible");
+        require(count(abort_match) == 0, "Unpublished write became visible");
         const std::vector<int64_t> partial_keys{nonce + 6, nonce + 7, nonce + 8};
         auto [partial_code, partial] = meta->StartWrite(trace, partial_keys, {}, {"Ffull", "Ffull", "Ffull"}, 60, 1);
         check(partial_code, "Partial allocation");
-        verifyPool(*full, partial, "full", 262144, full_pool);
+        verifyPool(*full, partial, "full", full_block_bytes, full_pool);
         check(meta->FinishWrite(trace, partial.write_session_id, BlockMaskVector{true, false, true}, partial.locations), "Partial finish");
         auto [partial_match_code, partial_match] = meta->MatchLocation(trace, QueryType::QT_BATCH_GET, partial_keys, {}, BlockMaskOffset{0}, 0, {});
         check(partial_match_code, "Partial match");

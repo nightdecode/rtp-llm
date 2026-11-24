@@ -91,22 +91,31 @@ def main():
             metrics_url = fixture_config.get("consumer_metrics_url") if transport != "local" else None
             if transport != "local" and not metrics_url:
                 parser.error("the PACE fixture needs consumer_metrics_url for transport verification")
+            fault_socket = fixture_config.get("fault_socket")
+            scenarios = [None]
+            if "fault_socket" in fixture_config:
+                if not isinstance(fault_socket, str) or not fault_socket or transport != "tcp":
+                    parser.error("PACE SDK fault cases require a TCP fixture with a fault socket")
+                scenarios = ["slow-read", "slow-write", "packet-loss"]
 
             if not server.start_server():
                 raise RuntimeError("KVCM manager did not start")
             env = os.environ.copy()
             env.update(server.client_env())
             instance_id = f"pace_contract_{server.rpc_port}"
-            config = server.pace_fixture.sdk_config(server, instance_id)
             config_path = Path(directory) / "client.json"
-            config_path.write_text(json.dumps(config), encoding="utf-8")
             command = [args.sdk, str(config_path), str(server.pace_fixture.storage_type)]
             if transport == "gdr":
                 command.append("--gdr")
-            before = read_counters(metrics_url) if metrics_url else None
-            subprocess.run(command, env=env, check=True, timeout=120)
-            if before is not None:
-                check_transport(metrics_url, before, transport)
+            for scenario in scenarios:
+                fault_args = ["--fault", scenario, fault_socket] if scenario else []
+                case_id = f"{instance_id}_{scenario.replace('-', '_')}" if scenario else instance_id
+                config = server.pace_fixture.sdk_config(server, case_id)
+                config_path.write_text(json.dumps(config), encoding="utf-8")
+                before = read_counters(metrics_url) if metrics_url else None
+                subprocess.run(command + fault_args, env=env, check=True, timeout=120)
+                if before is not None:
+                    check_transport(metrics_url, before, transport)
         finally:
             try:
                 server.close()

@@ -97,6 +97,10 @@ class RemoteKVCMServer:
     def http_port(self) -> int:
         return self._http_port
 
+    @property
+    def access_log_path(self) -> str:
+        return os.path.join(self._kvcm_src_logs_path, "access.log")
+
     def address(self) -> str:
         return self._address
 

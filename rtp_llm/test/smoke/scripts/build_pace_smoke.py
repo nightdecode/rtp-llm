@@ -20,10 +20,11 @@ def commit_sha(value):
     return value.lower()
 
 
-def run(*command, cwd, capture=False):
+def run(*command, cwd, capture=False, env=None):
     return subprocess.run(
         [str(arg) for arg in command],
         cwd=cwd,
+        env=env,
         check=True,
         universal_newlines=True,
         stdout=subprocess.PIPE if capture else None,
@@ -38,31 +39,37 @@ def stage_file(source, destination):
 
 
 def checkout(path, repo, sha):
-    if not (path / ".git").is_dir():
-        path.mkdir(exist_ok=True)
-        if any(path.iterdir()):
-            raise RuntimeError(f"cannot initialize checkout in nonempty directory {path}")
-        run("git", "init", "--quiet", cwd=path)
-        run("git", "remote", "add", "origin", repo, cwd=path)
     try:
-        try:
-            actual = run(
-                "git", "rev-parse", "--verify", "--quiet", "HEAD", cwd=path, capture=True
-            ).strip()
-        except subprocess.CalledProcessError:
-            run("git", "fetch", "--no-tags", "--depth=1", "origin", sha, cwd=path)
-            run("git", "checkout", "--quiet", "--detach", "FETCH_HEAD", cwd=path)
-            actual = run("git", "rev-parse", "HEAD", cwd=path, capture=True).strip()
+        if (path / ".git").is_dir():
+            actual = run("git", "rev-parse", "--verify", "HEAD", cwd=path, capture=True).strip()
+            if actual != sha:
+                raise RuntimeError(f"{path} is at {actual}, expected {sha}")
+            return
+        if path.exists() and any(path.iterdir()):
+            raise RuntimeError(f"cannot initialize checkout in nonempty directory {path}")
+        with tempfile.TemporaryDirectory(dir=path.parent, prefix=f".{path.name}-") as staging:
+            pending = Path(staging) / "repo"
+            pending.mkdir()
+            run("git", "init", "--quiet", cwd=pending)
+            run("git", "remote", "add", "origin", repo, cwd=pending)
+            run("git", "fetch", "--no-tags", "--depth=1", "origin", sha, cwd=pending)
+            run("git", "checkout", "--quiet", "--detach", "FETCH_HEAD", cwd=pending)
+            actual = run("git", "rev-parse", "HEAD", cwd=pending, capture=True).strip()
+            if actual != sha:
+                raise RuntimeError(f"{path} fetched {actual}, expected {sha}")
+            pending.replace(path)
     except subprocess.CalledProcessError as error:
         raise RuntimeError(
-            f"failed to check out {path.name} at {sha}; check Git access and the commit"
+            f"failed to check out {path.name} at {sha}; check Git access, the commit, and any incomplete cache at {path}"
         ) from error
-    if actual != sha:
-        raise RuntimeError(f"{path} is at {actual}, expected {sha}")
 
 
 def build_pace(args, source, output):
-    run("git", "submodule", "update", "--init", "--recursive", "--depth=1", cwd=source)
+    poco = run("git", "ls-tree", "HEAD", "lib/poco", cwd=source, capture=True).split()
+    git_options = []
+    if poco[:3] == ["160000", "commit", "02c86d4cddb14de293eabdb795e4a7c61745eb2b"]:
+        git_options = ["-c", "submodule.lib/poco.url=https://github.com/pocoproject/poco.git"]
+    run("git", *git_options, "submodule", "update", "--init", "--recursive", "--depth=1", cwd=source)
     build_dir = output / "pace-build"
     run(
         "cmake", "-S", source, "-B", build_dir, *args.cmake_arg,
@@ -100,6 +107,18 @@ def build_kvcm(args, public, mempool, output):
         stub.unlink()
         stub.symlink_to("../internal_source")
 
+    env = os.environ.copy()
+    legacy_havenask = re.search(
+        r'name\s*=\s*"havenask"\s*,\s*remote\s*=\s*"(git@gitlab\.alibaba-inc\.com:[^"]+)"\s*,\s*'
+        r'commit\s*=\s*"f7317cb70a2e04c62d3b6a5f7f3c6ae75ab2149c"',
+        (stub / "deps/git.bzl").read_text(),
+    )
+    if legacy_havenask:
+        index = int(env.get("GIT_CONFIG_COUNT", "0"))
+        env[f"GIT_CONFIG_KEY_{index}"] = "url.https://github.com/alibaba/havenask.git.insteadOf"
+        env[f"GIT_CONFIG_VALUE_{index}"] = legacy_havenask[1]
+        env["GIT_CONFIG_COUNT"] = str(index + 1)
+
     override = output / "tair_mempool"
     override.mkdir(exist_ok=True)
     for entry in mempool.iterdir():
@@ -119,6 +138,7 @@ def build_kvcm(args, public, mempool, output):
         f"--@rules_cuda//cuda:archs={args.cuda_archs}",
         "//package/rpm/client:kv-cache-manager-client-rpm",
         cwd=public,
+        env=env,
     )
     stage_file(public / "bazel-bin/package/rpm/client/kv-cache-manager-client.rpm", sdk / "sdk.rpm")
     (sdk / "BUILD.bazel").write_text(
@@ -127,7 +147,7 @@ def build_kvcm(args, public, mempool, output):
     (sdk.parent / "WORKSPACE").write_text("")
 
     manager = output / "kvcm-manager"
-    run(*bazel, "--action_env=PATH", "//kv_cache_manager:kv_cache_manager_bin", cwd=public)
+    run(*bazel, "--action_env=PATH", "//kv_cache_manager:kv_cache_manager_bin", cwd=public, env=env)
     (manager / "bin").mkdir(parents=True, exist_ok=True)
     stage_file(
         public / "bazel-bin/kv_cache_manager/kv_cache_manager_bin",
@@ -169,12 +189,11 @@ def main():
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error("--jobs must be positive")
-    if args.component != "pace":
-        if not args.kvcm_internal_repo:
-            parser.error("--kvcm-internal-repo is required when building KVCM")
-        if not shutil.which("rpmbuild"):
-            parser.error("install rpm-build in the KVCM build environment first")
+    if args.component != "pace" and not args.kvcm_internal_repo:
+        parser.error("--kvcm-internal-repo is required when building KVCM")
     os.environ.setdefault("GIT_TERMINAL_PROMPT", "0")
+    os.environ.setdefault("GIT_HTTP_LOW_SPEED_LIMIT", "1")
+    os.environ.setdefault("GIT_HTTP_LOW_SPEED_TIME", "120")
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     spec = {
@@ -191,18 +210,43 @@ def main():
         manifest = output / "sources.json"
         if manifest.exists() and json.loads(manifest.read_text()) != spec:
             raise RuntimeError(f"{output} already belongs to a different build")
-        manifest.write_text(json.dumps(spec, indent=2) + "\n")
-        mempool = output / "mempool-src"
-        checkout(mempool, args.mempool_repo, args.mempool_commit)
-        if args.component in ("all", "kvcm"):
-            internal = output / "kvcm-src"
-            public = internal / "github-opensource"
-            checkout(internal, args.kvcm_internal_repo, args.kvcm_internal_commit)
-            checkout(public, args.kvcm_public_repo, args.kvcm_public_commit)
-        if args.component in ("all", "pace"):
-            build_pace(args, mempool, output)
-        if args.component in ("all", "kvcm"):
-            build_kvcm(args, public, mempool, output)
+        if not manifest.exists():
+            manifest.write_text(json.dumps(spec, indent=2) + "\n")
+        artifacts = {
+            "pace": (
+                "pace/bin/tair_mempool_meta_service",
+                "pace/bin/tair_mempool_server",
+                "pace/bin/libtent_shared.so.5",
+            ),
+            "kvcm": (
+                "kvcm-sdk/file/sdk.rpm",
+                "kvcm-manager/bin/kv_cache_manager_bin",
+                "kvcm-manager/etc/default_startup_config.json",
+                "rtp-smoke.bazelrc",
+            ),
+        }
+        for component in artifacts if args.component == "all" else (args.component,):
+            ready = output / (component + ".ready")
+            if ready.is_file() and all((output / artifact).is_file() for artifact in artifacts[component]):
+                print(f"Reusing {component} artifacts: {output}")
+                continue
+            if ready.exists():
+                ready.unlink()
+            mempool = output / "mempool-src"
+            checkout(mempool, args.mempool_repo, args.mempool_commit)
+            if component == "pace":
+                build_pace(args, mempool, output)
+            else:
+                if not shutil.which("rpmbuild"):
+                    raise RuntimeError("install rpm-build in the KVCM build environment first")
+                internal = output / "kvcm-src"
+                public = internal / "github-opensource"
+                checkout(internal, args.kvcm_internal_repo, args.kvcm_internal_commit)
+                checkout(public, args.kvcm_public_repo, args.kvcm_public_commit)
+                build_kvcm(args, public, mempool, output)
+            if not all((output / artifact).is_file() for artifact in artifacts[component]):
+                raise RuntimeError(f"{component} build did not produce the required artifacts in {output}")
+            ready.touch()
     print(f"Build artifacts: {output}")
 
 

@@ -115,6 +115,7 @@ cc_binary(
         "//3rdparty/3fs:hf3fs",
         "//3rdparty/remote_kv_cache_manager:remote_kv_cache_manager_client",
         "//3rdparty/remote_kv_cache_manager:remote_kv_cache_manager_client_headers",
+        "//rtp_llm/cpp/cache/block_tree_cache/storage_backend/kvcm:sdk_buffer_safety",
         "@grpc//:grpc++",
         "@havenask//aios/alog:alog",
         "@havenask//aios/autil:lock_free",
