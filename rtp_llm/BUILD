@@ -192,6 +192,7 @@ py_library(
     ]),
     data = glob(["utils/moe_luts/*"]),
     deps = [
+        ":request_id_generator",
         ":jit_cache_env",
         ":scr_lifecycle",
         ":torch",
@@ -500,13 +501,19 @@ py_library(
 )
 
 py_library(
+    name = "request_id_generator",
+    srcs = ["frontend/request_id_generator.py"],
+)
+
+py_library(
     name = "frontend",
     srcs = glob([
         "frontend/*.py",
         "frontend/**/*.py",
-    ]),
+    ], exclude = ["frontend/request_id_generator.py"]),
     deps = [
         ":openai_api",
+        ":request_id_generator",
         ":telemetry",
     ]
 )

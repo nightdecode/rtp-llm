@@ -268,7 +268,7 @@ def cache_store_advertise_ip(world_info, parallelism_config):
     if not local_comm_enabled(
         parallelism_config.world_size,
         parallelism_config.local_world_size,
-        world_info.num_nodes,
+        getattr(world_info, "num_nodes", 1),
     ):
         return None
     validate_local_members(world_info, parallelism_config)
@@ -289,7 +289,9 @@ def validate_local_world(world_size, local_world_size, num_nodes):
 
 def validate_local_members(world_info, parallelism_config):
     pc = parallelism_config
-    validate_local_world(pc.world_size, pc.local_world_size, world_info.num_nodes)
+    validate_local_world(
+        pc.world_size, pc.local_world_size, getattr(world_info, "num_nodes", 1)
+    )
     members = world_info.members
     # self.ip can retain the seed address while members resolve the restored Pod.
     # Validate the current topology, never equality with the checkpoint's self.ip.

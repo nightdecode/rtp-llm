@@ -13,7 +13,7 @@ from rtp_llm.distribute.distributed_server import DistributedServer, get_world_i
 from rtp_llm.metrics import kmonitor
 from rtp_llm.model_factory import ModelFactory
 from rtp_llm.models_py.distributed.collective_torch import init_distributed_environment
-from rtp_llm.ops import TaskType
+from rtp_llm.ops import RoleType, TaskType
 from rtp_llm.server.server_args.hw_kernel_group_args import (
     validate_hw_kernel_group_args,
 )
@@ -95,6 +95,11 @@ class BackendManager(object):
             engine_config.runtime_config,
             engine_config.parallelism_config,
             world_info,
+            role_type=getattr(
+                getattr(engine_config, "pd_sep_config", None),
+                "role_type",
+                RoleType.PDFUSION,
+            ),
         )
         self._engine_config = engine_config
         self._world_info = world_info
@@ -252,6 +257,11 @@ class BackendManager(object):
                 self._distributed_server.gang_info.read()
                 if network.enabled(self.py_env_configs.parallelism_config)
                 else None
+            ),
+            role_type=getattr(
+                getattr(self._engine_config, "pd_sep_config", None),
+                "role_type",
+                RoleType.PDFUSION,
             ),
         )
         self._world_info = world_info

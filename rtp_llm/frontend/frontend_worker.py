@@ -17,6 +17,7 @@ from pydantic import BaseModel
 
 from rtp_llm.config.engine_config import EngineConfig
 from rtp_llm.config.exceptions import ExceptionType, FtRuntimeException
+from rtp_llm.server.misc import format_exception
 from rtp_llm.config.generate_config import GenerateConfig
 from rtp_llm.distribute.distributed_server import (
     get_dp_addrs_from_world_info,
@@ -57,8 +58,12 @@ class MultiSequencesPipelineResponse(BaseModel):
     custom_output: Optional[List[Optional[CustomOutput]]] = None
 
 
+class BatchItemError(BaseModel):
+    error: Dict[str, Any]
+
+
 class BatchPipelineResponse(BaseModel):
-    response_batch: List[Union[PipelineResponse, MultiSequencesPipelineResponse]]
+    response_batch: List[Union[PipelineResponse, MultiSequencesPipelineResponse, BatchItemError]]
 
 
 class TokenizerEncodeResponse(BaseModel):
@@ -153,10 +158,13 @@ class FrontendWorker:
         generate_config: dict,
         frontend_metric_tags=None,
         frontend_metric_observer=None,
+        *,
+        request_ids: Optional[List[int]] = None,
     ) -> BatchPipelineResponse:
         responses = await self.pipeline.batch_infer(
             prompts=prompts,
             base_request_id=request_id,
+            request_ids=request_ids,
             generate_config_json=generate_config,
             generate_env_config=self.generate_env_config,
             frontend_metric_tags=frontend_metric_tags,
@@ -172,6 +180,9 @@ class FrontendWorker:
         )
         pipeline_responses = []
         for gen_response in responses:
+            if isinstance(gen_response, FtRuntimeException):
+                pipeline_responses.append(BatchItemError(error=format_exception(gen_response)))
+                continue
             out = gen_response.generate_outputs.generate_outputs[0]
             generate_texts = gen_response.generate_texts
             aux_info_dict: Dict[str, Any] = {}
