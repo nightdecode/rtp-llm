@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <mutex>
 
 using namespace std;
@@ -640,11 +641,39 @@ bool FIFOScheduler::partitionChunkContinuations() {
     return false;
 }
 
+// How long an otherwise-idle data-parallel rank parks before it emits its fake
+// stream.  See the comment in schedule() for why this is not the 10 ms used for
+// the pollable queues.  Tunable so the old behaviour can be measured again.
+static int64_t fakeStreamParkUs() {
+    static const int64_t value = [] {
+        const char* raw = std::getenv("RTP_FAKE_STREAM_PARK_US");
+        if (raw == nullptr) {
+            return static_cast<int64_t>(200);
+        }
+        const int64_t parsed = std::strtoll(raw, nullptr, 10);
+        return parsed > 0 ? parsed : static_cast<int64_t>(200);
+    }();
+    return value;
+}
+
 absl::StatusOr<list<GenerateStreamPtr>> FIFOScheduler::schedule() {
     unique_lock<mutex> lock(lock_);
-    if (need_fill_fake_stream_ || !loading_cache_streams_.empty() || !loading_cache_group_queue_.empty()
-        || !waiting_group_queue_.empty()) {
+    if (!loading_cache_streams_.empty() || !loading_cache_group_queue_.empty() || !waiting_group_queue_.empty()) {
         cond_.wait_for(lock, std::chrono::milliseconds(10), [this] { return waitPredicate(); });
+    } else if (need_fill_fake_stream_) {
+        // This rank holds no stream of its own but, under data parallelism, still has
+        // to enter the step so the expert-parallel all-to-all can proceed.  Nothing in
+        // this branch is pollable -- waiting cannot turn up work, it only delays every
+        // other rank's step, because the collective runs at the pace of the last rank
+        // to arrive.  need_fill_fake_stream_ is constant true for every DP rank (it is
+        // set from dp_size > 1 && tp_rank == 0), so before this split an idle rank
+        // parked the full 10 ms on every scheduling round.  Measured on PPU with
+        // GLM-5.3-Flash, DP8 decode: any level with at least one idle rank sat at
+        // 38~43 ms per step while concurrency 16 -- the first level where every rank
+        // holds a request -- ran at 36.9 ms despite doing twice the work.
+        // Still park briefly: returning immediately would turn an idle rank's engine
+        // loop into a busy wait.
+        cond_.wait_for(lock, std::chrono::microseconds(fakeStreamParkUs()), [this] { return waitPredicate(); });
     } else if (!waiting_streams_.empty()) {
         // No running work can release capacity. Poll PD-held block releases without turning a
         // large retryable queue into a tight malloc/eviction loop.
