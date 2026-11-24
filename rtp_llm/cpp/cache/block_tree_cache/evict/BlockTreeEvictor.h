@@ -161,11 +161,15 @@ private:
     // Caller holds the cache mutex. Select and immediately reserve a demote
     // batch in one ordered pass; return aligned descriptors and timing snapshots.
     // Target allocation, submission and rollback happen after this call returns.
-    PreparedVictims chooseAndReserveVictims(size_t group_set_id, Tier source_tier, size_t max_victim_count);
+    PreparedVictims
+    chooseAndReserveVictims(size_t group_set_id, Tier source_tier, Tier target_tier, size_t max_victim_count);
     // Check demote protections before deciding whether a heap entry is stale.
     std::optional<EvictionVictimSkipReason>
-    demoteRejectionReason(TreeNode* node, size_t group_set_id, Tier tier, const GroupSet& group_set) const;
-    bool canReclaimDeviceDrop(TreeNode* node, size_t group_set_id, EvictionBatchContext* eviction_batch_context, DropScope scope) const;
+         demoteRejectionReason(TreeNode* node, size_t group_set_id, Tier tier, const GroupSet& group_set) const;
+    bool canReclaimDeviceDrop(TreeNode*             node,
+                              size_t                group_set_id,
+                              EvictionBatchContext* eviction_batch_context,
+                              DropScope             scope) const;
     void logZeroDeviceReclaimLocked(size_t group_set_id,
                                     size_t member_group_id,
                                     size_t required_blocks,
