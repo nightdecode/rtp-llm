@@ -7,7 +7,8 @@ Hybrid architecture:
 """
 
 import logging
-from typing import Any, Dict, Optional
+import os
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -18,6 +19,7 @@ from rtp_llm.models_py.distributed.collective_torch import (
     Group,
     all_gather,
     all_reduce,
+    all_to_all,
 )
 from rtp_llm.models_py.model_desc.block_map import (
     get_group_tags_for_layers,
@@ -27,6 +29,10 @@ from rtp_llm.models_py.model_desc.block_map import (
 )
 from rtp_llm.models_py.model_desc.generic_moe import DecodeLayerOutput, GenericMoeLayer
 from rtp_llm.models_py.model_desc.module_base import GptModelBase
+from rtp_llm.models_py.model_desc.projection_packing import (
+    MAX_PACKED_PROJECTION_WIDTH,
+    packed_projection_weight,
+)
 from rtp_llm.models_py.modules import (
     DenseMLP,
     Embedding,
@@ -46,10 +52,55 @@ from rtp_llm.models_py.triton_kernels.fla.block import (
     load_initial_state_from_block_map,
     store_ssm_state_to_block_map,
 )
-from rtp_llm.models_py.triton_kernels.kimi_kda import (
-    chunk_kda,
-    fused_kda_gate,
-    fused_recurrent_kda,
+# 一处读取，后面按 head/norm 的融合点共用，避免每次前向都查环境变量。
+_KDA_FP32_STATE = os.environ.get("RTP_GLM_KDA_FP32_STATE", "0") != "0"
+
+if _KDA_FP32_STATE:
+    # FP32 recurrent-state variants of the same three entry points. The public
+    # signatures are a strict superset of the default ones -- same positional
+    # arguments, extra keyword options that all default to the old behaviour --
+    # so the call sites below are unchanged and the switch is a pure A/B.
+    from rtp_llm.models_py.triton_kernels.kimi_kda.fp32_state import (
+        chunk_kda,
+        fused_kda_gate,
+        fused_recurrent_kda,
+    )
+
+    logging.info("KDA: using the FP32-state kernels (RTP_GLM_KDA_FP32_STATE=1)")
+
+else:
+    from rtp_llm.models_py.triton_kernels.kimi_kda import (
+        chunk_kda,
+        fused_kda_gate,
+        fused_recurrent_kda,
+    )
+from rtp_llm.models_py.triton_kernels.fla.block import kda_pool_v_first
+# Layout mismatch between the two roles is silent and produces wrong
+# numbers rather than an error, so state it at startup on both sides.
+logging.info(
+    "KDA: SSM state pool layout is %s (RTP_GLM_KDA_STATE_V_FIRST)",
+    "[HV, V, K]" if os.environ.get("RTP_GLM_KDA_STATE_V_FIRST", "0") == "1"
+    else "[HV, K, V]",
+)
+if os.environ.get("RTP_GLM_KDA_PLA", "0") == "1":
+    logging.info(
+        "KDA: vendor decode kernel on for per-replica batch >= %s "
+        "(RTP_GLM_KDA_PLA_MIN_BATCH); below that the Triton recurrence "
+        "is faster end to end",
+        os.environ.get("RTP_GLM_KDA_PLA_MIN_BATCH", "8"),
+    )
+if os.environ.get("RTP_GLM_KDA_PLA_PREFILL", "0") == "1":
+    logging.info(
+        "KDA: vendor prefill kernel requested (RTP_GLM_KDA_PLA_PREFILL); "
+        "each layer logs 'PLA KDA prefill off' if it falls back to Triton"
+    )
+from rtp_llm.models_py.modules.kda_pla import (
+    flashkda_prefill,
+    fused_recurrent_kda_pla,
+    pla_kda_min_batch,
+    pla_kda_prefill_supported,
+    pla_kda_supported,
+    resolve_state_slots,
 )
 from rtp_llm.models_py.utils.typed_storage_view import LinearCacheConverter
 from rtp_llm.ops import (
@@ -77,8 +128,7 @@ class KimiLinearMetadata(object):
         full_prefill_conv1d_meta: Optional[CausalConv1dMetadata] = None,
         full_prefill_cu_seqlens: Optional[torch.Tensor] = None,
         cp_restore_indices: Optional[torch.Tensor] = None,
-        cp_local_extract_indices: Optional[torch.Tensor] = None,
-        cp_local_valid_mask: Optional[torch.Tensor] = None,
+        cp_unpad_restore_indices: Optional[torch.Tensor] = None,
     ):
         self.prefill_conv1d_meta = prefill_conv1d_meta
         self.is_target_verify = is_target_verify
@@ -89,11 +139,68 @@ class KimiLinearMetadata(object):
         self.full_prefill_conv1d_meta = full_prefill_conv1d_meta
         self.full_prefill_cu_seqlens = full_prefill_cu_seqlens
         self.cp_restore_indices = cp_restore_indices
-        self.cp_local_extract_indices = cp_local_extract_indices
-        self.cp_local_valid_mask = cp_local_valid_mask
+        # Sequence position -> row of the rank-major gathered layout, padding
+        # rows dropped: [total new tokens], int64.
+        self.cp_unpad_restore_indices = cp_unpad_restore_indices
+        self._cp_tail_blocks: Optional[torch.Tensor] = None
+        self._decode_state_slots: Optional[
+            Tuple[torch.Tensor, torch.Tensor]
+        ] = None
+
+    def decode_state_slots(
+        self, attn_inputs: PyAttentionInputs, seq_size_per_block: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Physical SSM state slots this decode step reads from and writes to.
+
+        Only needed by the PLA path, which takes the slot as an argument
+        instead of resolving it inside the kernel. All 34 KDA layers share one
+        block table, so this is resolved once per forward -- doing it per layer
+        would add a few hundred tiny launches per step and eat the gain.
+        """
+        if self._decode_state_slots is None:
+            self._decode_state_slots = resolve_state_slots(
+                attn_inputs.kv_cache_kernel_block_id_device,
+                attn_inputs.sequence_lengths_plus_1_device,
+                seq_size_per_block,
+            )
+        return self._decode_state_slots
 
     def get_prefill_conv1d_meta(self) -> Optional[CausalConv1dMetadata]:
         return self.prefill_conv1d_meta
+
+    def cp_tail_blocks(
+        self, attn_inputs: PyAttentionInputs, seq_size_per_block: int
+    ) -> torch.Tensor:
+        """Kernel block id holding each request's last new token, on device.
+
+        Built once per forward from the host block table and shared by all
+        KDA layers, which use the same linear-attention block table.
+        """
+        if self._cp_tail_blocks is None:
+            cp_info = attn_inputs.context_parallel_info
+            prefix_lengths = attn_inputs.prefix_lengths.tolist()
+            new_lengths = cp_info.prefill_actual_input_lengths_cpu.tolist()
+            block_table = attn_inputs.kv_cache_kernel_block_id
+            blocks = torch.tensor(
+                [
+                    int(block_table[i, (prefix + length - 1) // seq_size_per_block])
+                    for i, (prefix, length) in enumerate(
+                        zip(prefix_lengths, new_lengths)
+                    )
+                    if length > 0
+                ],
+                dtype=torch.int64,
+            )
+            # Clamp rather than filter. The count has to stay a pure function
+            # of the request lengths, which are replicated across ranks: it
+            # sizes an all-gather, and a rank-dependent size is a collective
+            # mismatch, not a wrong answer. Ids <= 0 are the null block (-1)
+            # or the engine's reserved dummy block (0); redirecting them to
+            # block 0 is what the cache writers already do.
+            self._cp_tail_blocks = blocks.clamp_(min=0).to(
+                attn_inputs.kv_cache_kernel_block_id_device.device
+            )
+        return self._cp_tail_blocks
 
     @property
     def is_cp_linear_attn(self) -> bool:
@@ -109,22 +216,22 @@ def build_cp_linear_attn_metadata(
     Optional[torch.Tensor],
     Optional[torch.Tensor],
     Optional[torch.Tensor],
-    Optional[torch.Tensor],
 ]:
     """Precompute the per-layer all-gather metadata for CP linear attention.
 
     Returns (full_conv1d_meta, full_cu_seqlens, restore_indices,
-             local_extract_indices, local_valid_mask). Ported verbatim from
-    Qwen3NextModel._build_cp_linear_attn_metadata; the two linear-attention
-    layouts are identical, only the recurrence kernel differs.
+             unpad_restore_indices).
+
+    Originally ported from Qwen3NextModel._build_cp_linear_attn_metadata, which
+    all-gathers the projections and slices this rank's zigzag tokens back out
+    of the full-sequence result. The head-split recurrence does not need that
+    slice -- the second all-to-all already returns this rank's tokens -- so the
+    inverse-permutation scatter that produced it is gone. ``restore_indices``
+    stays as the flag that says CP linear attention is active.
     """
     cp_info = attention_inputs.context_parallel_info
     if cp_info is None:
-        return None, None, None, None, None
-
-    # In CP mode the TP group is repurposed as the CP group, so tp_size == cp_size.
-    cp_size = parallelism_config.tp_size
-    cp_rank = parallelism_config.tp_rank
+        return None, None, None, None
 
     full_new_lengths = cp_info.prefill_actual_input_lengths_cpu
     full_cu = torch.zeros(
@@ -139,25 +246,11 @@ def build_cp_linear_attn_metadata(
     padding_mask = cp_info.prefill_qkv_padding_mask
     unpad_restore = restore_indices[padding_mask == 1]
 
-    total_ag = padding_mask.shape[0]
-    local_chunk_total = total_ag // cp_size
-    local_start = cp_rank * local_chunk_total
-
-    inv_restore = torch.full((total_ag,), -1, dtype=torch.long, device=device)
-    inv_restore[unpad_restore.long()] = torch.arange(
-        unpad_restore.shape[0], device=device
-    )
-
-    local_inv = inv_restore[local_start : local_start + local_chunk_total]
-    cp_local_valid_mask = local_inv >= 0
-    cp_local_extract_indices = local_inv[cp_local_valid_mask]
-
     return (
         full_conv1d_meta,
         full_cu,
         restore_indices,
-        cp_local_extract_indices,
-        cp_local_valid_mask,
+        unpad_restore.to(device=device, dtype=torch.long),
     )
 
 
@@ -233,6 +326,15 @@ class KimiLinearKDABase(nn.Module):
         self.conv_weights = weights[W.linear_attn_conv1d_w].squeeze(1)
         self.dt_bias = weights[W.linear_attn_dt_b_kda]
         self.alog = weights[W.linear_attn_alog]
+        # Tri-state: None until the vendor-kernel probe has run for this layer.
+        self._pla_ok: Optional[bool] = None
+        self._pla_prefill_ok: Optional[bool] = None
+        # The vendor decode kernel reads A_log and dt_bias in the activation
+        # dtype (BF16). Cast once here instead of on every decode step: inside
+        # the captured graph each `.to()` is a kernel launch, 2 x 34 layers per
+        # step (timeline 2026-11-22: 68 bfloat16_copy launches, 0.18 ms/step).
+        self._alog_bf16 = self.alog.to(torch.bfloat16)
+        self._dt_bias_bf16 = self.dt_bias.to(torch.bfloat16)
 
     def forward(
         self,
@@ -277,20 +379,25 @@ class KimiLinearKDAPrefill(KimiLinearKDABase):
         attn_inputs: PyAttentionInputs,
         metadata: Optional[CausalConv1dMetadata] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
+        channels: Optional[slice] = None,
     ) -> torch.Tensor:
         # Under context parallel the caller passes the full-sequence offsets;
-        # attn_inputs still describes this rank's local slice.
+        # attn_inputs still describes this rank's local slice. `channels`
+        # restricts the conv to a contiguous range of qkv channels (weights
+        # and cached conv state alike); conv1d is depthwise, so channels are
+        # independent.
         cu_seqlen_without_padding = (
             attn_inputs.cu_seqlens_device if cu_seqlens is None else cu_seqlens
         )
+        channels = slice(None) if channels is None else channels
         conv_states = (
-            self._get_conv_states(kv_cache_tensor).transpose(1, 2)
+            self._get_conv_states(kv_cache_tensor).transpose(1, 2)[:, channels]
             if kv_cache_tensor is not None
             else None
         )
         out = causal_conv1d_fn(
             x=mixed_qkv.transpose(0, 1),
-            weight=self.conv_weights,
+            weight=self.conv_weights[channels],
             bias=None,
             conv_states=conv_states,
             query_start_loc=cu_seqlen_without_padding,
@@ -311,15 +418,64 @@ class KimiLinearKDAPrefill(KimiLinearKDABase):
         attn_inputs: PyAttentionInputs,
         cu_seqlens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # Compute gate: [T, local_H*D] -> [1, T, local_H, D]
+        query, key, value = torch.split(
+            mixed_qkv,
+            [
+                self.local_num_k_heads * self.head_k_dim,
+                self.local_num_k_heads * self.head_k_dim,
+                self.local_num_v_heads * self.head_v_dim,
+            ],
+            dim=-1,
+        )
+        return self._recur(
+            query,
+            key,
+            value,
+            forget_gate,
+            beta,
+            kv_cache_tensor,
+            seq_size_per_block,
+            attn_inputs,
+            cu_seqlens=cu_seqlens,
+        )
+
+    def _recur(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        forget_gate: torch.Tensor,
+        beta: torch.Tensor,
+        kv_cache_tensor: Optional[torch.Tensor],
+        seq_size_per_block: int,
+        attn_inputs: PyAttentionInputs,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        heads: Optional[slice] = None,
+    ) -> torch.Tensor:
+        # `heads` restricts the recurrence to a contiguous range of heads: the
+        # gate parameters and the cached SSM state are sliced to match, and
+        # query/key/value/forget_gate/beta must already hold only those heads.
+        if heads is None:
+            num_k_heads, num_heads = self.local_num_k_heads, self.local_num_v_heads
+            a_log, dt_bias, ssm_heads = self.alog, self.dt_bias, slice(None)
+        else:
+            assert self.local_num_k_heads == self.local_num_v_heads
+            num_heads = num_k_heads = heads.stop - heads.start
+            # A_log is [H] and dt_bias is [H * head_k_dim]; both stay 1-D.
+            a_log = self.alog[heads]
+            dt_bias = self.dt_bias[
+                heads.start * self.head_k_dim : heads.stop * self.head_k_dim
+            ]
+            ssm_heads = heads
+        # Compute gate: [T, H*D] -> [1, T, H, D]
         g = forget_gate.view(
-            1, forget_gate.shape[0], self.local_num_v_heads, self.head_k_dim
+            1, forget_gate.shape[0], num_heads, self.head_k_dim
         ).contiguous()
         # beta: [token, H] -> apply sigmoid in float32 -> [1, token, H]
         beta_reshaped = beta.float().sigmoid().unsqueeze(0)
 
         ssm_states = (
-            self._get_ssm_states(kv_cache_tensor)
+            self._get_ssm_states(kv_cache_tensor)[:, ssm_heads]
             if kv_cache_tensor is not None
             else None
         )
@@ -333,10 +489,10 @@ class KimiLinearKDAPrefill(KimiLinearKDABase):
         if ssm_states is not None:
             initial_states = torch.empty(
                 context_batch_size,
-                self.local_num_v_heads,
+                num_heads,
                 self.head_k_dim,
                 self.head_v_dim,
-                device=mixed_qkv.device,
+                device=query.device,
                 dtype=self.ssm_state_dtype,
             )
             load_initial_state_from_block_map(
@@ -347,26 +503,53 @@ class KimiLinearKDAPrefill(KimiLinearKDABase):
                 seq_size_per_block,
             )
 
-        query, key, value = torch.split(
-            mixed_qkv,
-            [
-                self.local_num_k_heads * self.head_k_dim,
-                self.local_num_k_heads * self.head_k_dim,
-                self.local_num_v_heads * self.head_v_dim,
-            ],
-            dim=-1,
-        )
-        query = query.view(
-            1, query.shape[0], self.local_num_k_heads, self.head_k_dim
-        ).contiguous()
-        key = key.view(
-            1, key.shape[0], self.local_num_k_heads, self.head_k_dim
-        ).contiguous()
-        value = value.view(
-            1, value.shape[0], self.local_num_v_heads, self.head_v_dim
-        ).contiguous()
+        # Vendor prefill kernel (pla.prefill.flashkdapro, sglang-for-sail's PPU path).
+        # It takes the RAW beta and emits only the final state, which is all
+        # the block-map store writes when the LINEAR group keeps its tail block
+        # only (see kda_pla.py); flashkda_prefill audits that and returns None
+        # to send this call down the Triton path otherwise.
+        if self._pla_prefill_ok is None:
+            self._pla_prefill_ok = pla_kda_prefill_supported(
+                num_heads, self.head_k_dim, query.dtype, ssm_states, self.gate_lower_bound
+            )
+        if self._pla_prefill_ok and num_k_heads == num_heads:
+            pla = flashkda_prefill(
+                query.view(-1, num_heads, self.head_k_dim),
+                key.view(-1, num_heads, self.head_k_dim),
+                value.view(-1, num_heads, self.head_v_dim),
+                forget_gate.view(-1, num_heads, self.head_k_dim),
+                beta,
+                a_log,
+                dt_bias,
+                initial_states,
+                cu_seqlens_without_padding,
+                self.gate_lower_bound,
+                block_map=attn_inputs.kv_cache_kernel_block_id_device,
+                prefix_lengths=attn_inputs.prefix_lengths_device,
+                seq_size_per_block=seq_size_per_block,
+            )
+            if pla is not None:
+                attn_out, final_state = pla
+                if ssm_states is not None:
+                    # One chunk per request (chunk_size far above any length):
+                    # the store kernel then takes only its final-state branch,
+                    # never the per-block-boundary one that would read `h`.
+                    store_ssm_state_to_block_map(
+                        final_state,
+                        final_state,
+                        attn_inputs.prefix_lengths_device,
+                        cu_seqlens_without_padding,
+                        attn_inputs.kv_cache_kernel_block_id_device,
+                        ssm_states,
+                        seq_size_per_block,
+                        chunk_size=1 << 30,
+                    )
+                return attn_out
 
-        q_len = query.shape[1]
+        query = query.view(1, query.shape[0], num_k_heads, self.head_k_dim).contiguous()
+        key = key.view(1, key.shape[0], num_k_heads, self.head_k_dim).contiguous()
+        value = value.view(1, value.shape[0], num_heads, self.head_v_dim).contiguous()
+
         # Prefill: use chunk_kda with fused gate (use_gate_in_kernel=True)
         attn_out, final_state, h = chunk_kda(
             query,
@@ -380,14 +563,13 @@ class KimiLinearKDAPrefill(KimiLinearKDABase):
             use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=True,
             return_intermediate_states=True,
-            A_log=self.alog,
-            dt_bias=self.dt_bias,
+            A_log=a_log,
+            dt_bias=dt_bias,
             lower_bound=self.gate_lower_bound,
         )
         h_from_chunk = h
 
         if ssm_states is not None and final_state is not None:
-            _target_dtype = ssm_states.dtype
             h_for_store = (
                 h_from_chunk
                 if h_from_chunk is not None
@@ -462,40 +644,73 @@ class KimiLinearKDAPrefill(KimiLinearKDABase):
         kv_cache: Optional[LayerKVCache],
         attn_meta: KimiLinearMetadata,
     ) -> torch.Tensor:
-        """Context-parallel prefill: all-gather the projections, recur over the
-        full sequence on every rank, then take this rank's zigzag slice back.
+        """Context-parallel prefill with the recurrence split by head.
 
         Context parallel hands each rank one head chunk and one tail chunk of
-        the sequence (ZigzagProcessor). KDA carries state along the sequence, so
-        a rank that only sees its own chunks starts from a zero state in the
-        middle of the sequence and silently produces wrong output and wrong
-        cached state. Gathering first is the simplest correct scheme: it keeps
-        the kernel and the cache writes identical to the single-rank path and
-        costs one all-gather of [T, qkv + H*D + H] per layer. Splitting the
-        recurrence by head instead keeps the parallelism and belongs to the
-        performance step, not here.
+        the sequence (ZigzagProcessor), but KDA carries state along the
+        sequence, so the recurrence needs every token of a head, in order. One
+        all-to-all trades token ownership for head ownership: rank r receives
+        heads [r*H/cp, (r+1)*H/cp) of every token, runs conv1d and chunk_kda
+        over the full sequence for those heads only, and a second all-to-all
+        hands every rank its own tokens back with all heads. Each rank does
+        1/cp of the recurrence instead of all of it, and moves 1/cp of the
+        bytes an all-gather of the projections would.
 
-        Mirrors Qwen3NextGatedDeltaNet._forward_cp_prefill.
+        Each rank writes only its own heads' SSM state and conv channels;
+        _sync_cp_states then all-gathers each request's tail block, the one
+        the PD transfer hands to decode.
         """
         cp_info = attn_inputs.context_parallel_info
         assert cp_info is not None, "CP prefill requires context_parallel_info"
         full_cu = attn_meta.full_prefill_cu_seqlens
         full_conv_meta = attn_meta.full_prefill_conv1d_meta
-        assert full_cu is not None and full_conv_meta is not None
+        unpad_restore = attn_meta.cp_unpad_restore_indices
+        assert (
+            full_cu is not None
+            and full_conv_meta is not None
+            and unpad_restore is not None
+        )
+        assert self.local_num_k_heads == self.local_num_v_heads
+        # In CP mode the TP group is repurposed as the CP group.
+        cp_size = self.parallelism_config.tp_size
+        cp_rank = self.parallelism_config.tp_rank
+        num_heads = self.local_num_v_heads
+        assert num_heads % cp_size == 0, f"{num_heads} KDA heads, CP {cp_size}"
+        heads_per_rank = num_heads // cp_size
+        heads = slice(cp_rank * heads_per_rank, (cp_rank + 1) * heads_per_rank)
+        # One head slice is this wide in every field: q, k, v and the gate all
+        # carry head_k_dim == head_v_dim channels per head (asserted above).
+        width = heads_per_rank * self.head_k_dim
 
-        qkv_dim = mixed_qkv.shape[-1]
-        gate_dim = forget_gate.shape[-1]
-        packed = torch.cat([mixed_qkv, forget_gate, beta], dim=-1)
-        full_packed = all_gather(packed, group=Group.TP)
-
-        padding_mask = cp_info.prefill_qkv_padding_mask
-        restore_indices = cp_info.prefill_qkv_restore_indice
-        unpad_restore = restore_indices[padding_mask == 1]
-        full_packed = full_packed[unpad_restore]
-
-        full_mixed_qkv = full_packed[:, :qkv_dim].contiguous()
-        full_forget_gate = full_packed[:, qkv_dim : qkv_dim + gate_dim].contiguous()
-        full_beta = full_packed[:, qkv_dim + gate_dim :].contiguous()
+        # 1. Token-major -> head-major. Send slot j carries this rank's tokens
+        #    for head slice j, packed as [q_j | k_j | v_j | g_j | beta_j].
+        n_local = mixed_qkv.shape[0]
+        fields = list(mixed_qkv.split(num_heads * self.head_k_dim, dim=-1))
+        fields.append(forget_gate)
+        send = mixed_qkv.new_empty(cp_size, n_local, 4 * width + heads_per_rank)
+        for i, field in enumerate(fields):
+            send[:, :, i * width : (i + 1) * width].copy_(
+                field.view(n_local, cp_size, width).transpose(0, 1)
+            )
+        send[:, :, 4 * width :].copy_(
+            beta.view(n_local, cp_size, heads_per_rank).transpose(0, 1)
+        )
+        received = all_to_all(send, group=Group.TP)
+        del send
+        # Rows arrive rank-major, as from an all-gather; restore sequence order.
+        received = received.view(cp_size * n_local, -1)
+        bounds = [
+            (0, width),
+            (width, 2 * width),
+            (2 * width, 3 * width),
+            (3 * width, 4 * width),
+            (4 * width, 4 * width + heads_per_rank),
+        ]
+        query, key, value, gate, beta_heads = [
+            received[:, start:stop].index_select(0, unpad_restore)
+            for start, stop in bounds
+        ]
+        del received
 
         kv_cache_tensor: Optional[torch.Tensor] = None
         seq_size_per_block = 1
@@ -505,35 +720,62 @@ class KimiLinearKDAPrefill(KimiLinearKDABase):
             )
             seq_size_per_block = kv_cache.seq_size_per_block
 
-        full_mixed_qkv = self._conv1d(
-            full_mixed_qkv,
+        # 2. conv1d per q/k/v segment: this rank's channels of each segment are
+        #    contiguous, the three segments are not.
+        segment = num_heads * self.head_k_dim
+        convolved = []
+        for i, part in enumerate((query, key, value)):
+            convolved.append(
+                self._conv1d(
+                    part,
+                    kv_cache_tensor,
+                    seq_size_per_block,
+                    attn_inputs,
+                    metadata=full_conv_meta,
+                    cu_seqlens=full_cu,
+                    channels=slice(
+                        i * segment + heads.start * self.head_k_dim,
+                        i * segment + heads.stop * self.head_k_dim,
+                    ),
+                )
+            )
+        query, key, value = convolved
+        attn_out = self._recur(
+            query,
+            key,
+            value,
+            gate,
+            beta_heads,
             kv_cache_tensor,
             seq_size_per_block,
             attn_inputs,
-            metadata=full_conv_meta,
             cu_seqlens=full_cu,
+            heads=heads,
         )
-        full_attn_out = self._fla(
-            full_mixed_qkv,
-            full_forget_gate,
-            full_beta,
-            kv_cache_tensor,
-            seq_size_per_block,
-            attn_inputs,
-            cu_seqlens=full_cu,
+        del query, key, value, gate, beta_heads
+
+        # 3. Head-major -> token-major. Padding rows stay zero; they are never
+        #    read downstream.
+        rows = attn_out.new_zeros(cp_size * n_local, width)
+        rows.index_copy_(0, unpad_restore, attn_out.reshape(-1, width))
+        del attn_out
+        returned = all_to_all(rows, group=Group.TP)
+        del rows
+        local_attn_out = (
+            returned.view(cp_size, n_local, heads_per_rank, self.head_v_dim)
+            .transpose(0, 1)
+            .reshape(n_local, num_heads, self.head_v_dim)
         )
 
-        # Scatter this rank's zigzag tokens back into local order. Padding rows
-        # stay zero; they are never read downstream.
-        n_local = mixed_qkv.shape[0]
-        local_attn_out = torch.zeros(
-            n_local,
-            *full_attn_out.shape[1:],
-            device=full_attn_out.device,
-            dtype=full_attn_out.dtype,
-        )
-        valid_mask = attn_meta.cp_local_valid_mask
-        local_attn_out[valid_mask] = full_attn_out[attn_meta.cp_local_extract_indices]
+        if kv_cache_tensor is not None:
+            self._sync_cp_states(
+                kv_cache_tensor,
+                attn_inputs,
+                attn_meta,
+                seq_size_per_block,
+                cp_size,
+                heads,
+            )
 
         cache_store_inputs = attn_inputs.cache_store_inputs
         cache_store_writer = attn_inputs.cache_store_writer
@@ -544,6 +786,70 @@ class KimiLinearKDAPrefill(KimiLinearKDABase):
         ):
             cache_store_writer.write(cache_store_inputs, kv_cache)
         return local_attn_out
+
+    def _sync_cp_states(
+        self,
+        kv_cache_tensor: torch.Tensor,
+        attn_inputs: PyAttentionInputs,
+        attn_meta: KimiLinearMetadata,
+        seq_size_per_block: int,
+        cp_size: int,
+        heads: slice,
+    ) -> None:
+        """All-gather the head slices of each request's tail block.
+
+        Only the tail block needs every head, and it needs it on every rank.
+        A linear-attention group publishes just its tail block to the cache
+        store (CacheGroupType.h, active_tail_blocks = 1), and the decode side
+        picks which prefill peer to read it from at runtime: with CP prefill
+        it takes the "prefill worker has full KV cache on each rank" branch
+        (DecodeRpcServer.cc, is_prefill_enabled), which maps a decode worker
+        to a peer by worker index. Rather than depend on that mapping -- it
+        varies with the decode worker count and the peer count -- make every
+        rank's tail block identical, so any peer serves the same bytes.
+
+        Earlier blocks keep only this rank's heads. That is all a CP prefill
+        on this rank ever reads back: the next chunk's initial state and a
+        prefix-cache hit both read the heads this rank wrote itself, and the
+        head-to-rank map depends only on cp_rank, which is fixed per process.
+        """
+        blocks = attn_meta.cp_tail_blocks(attn_inputs, seq_size_per_block)
+        # Empty only when the batch has no new tokens at all, which is the
+        # same on every rank, so the early return stays collective-safe.
+        if blocks.numel() == 0:
+            return
+        num_blocks = blocks.shape[0]
+        num_heads = self.local_num_v_heads
+        width = (heads.stop - heads.start) * self.head_k_dim
+
+        ssm_states = self._get_ssm_states(kv_cache_tensor)
+        gathered = all_gather(
+            ssm_states[:, heads].index_select(0, blocks), group=Group.TP
+        )
+        ssm_states[blocks] = (
+            gathered.view(cp_size, num_blocks, -1, self.head_v_dim, self.head_k_dim)
+            .transpose(0, 1)
+            .reshape(num_blocks, num_heads, self.head_v_dim, self.head_k_dim)
+        )
+
+        # Conv channels are [q | k | v], each H*D wide; this rank owns the
+        # same head range inside each of the three segments.
+        conv_states = self._get_conv_states(kv_cache_tensor)
+        segment = num_heads * self.head_k_dim
+        starts = [s * segment + heads.start * self.head_k_dim for s in range(3)]
+        owned = torch.cat(
+            [
+                conv_states[:, :, start : start + width].index_select(0, blocks)
+                for start in starts
+            ],
+            dim=-1,
+        )
+        gathered = all_gather(owned, group=Group.TP)
+        conv_states[blocks] = (
+            gathered.view(cp_size, num_blocks, -1, 3, width)
+            .permute(1, 2, 3, 0, 4)
+            .reshape(num_blocks, -1, 3 * segment)
+        )
 
 
 class KimiLinearKDADecode(KimiLinearKDABase):
@@ -576,6 +882,24 @@ class KimiLinearKDADecode(KimiLinearKDABase):
         out = out.transpose(1, 2).reshape(origin_shape)
         return out
 
+    def _use_pla(
+        self, ssm_states: torch.Tensor, attn_inputs: PyAttentionInputs
+    ) -> bool:
+        """Whether this layer's decode step goes through the vendor kernel.
+
+        Probed once per layer and remembered: the probe logs its reason, and
+        repeating it every step would spam the log.
+        """
+        if self._pla_ok is None:
+            self._pla_ok = pla_kda_supported(
+                self.local_num_v_heads,
+                self.head_k_dim,
+                ssm_states,
+                attn_inputs.kv_cache_kernel_block_id_device,
+                attn_inputs.sequence_lengths_plus_1_device,
+            )
+        return self._pla_ok
+
     def _fla(
         self,
         mixed_qkv: torch.Tensor,
@@ -585,6 +909,7 @@ class KimiLinearKDADecode(KimiLinearKDABase):
         seq_size_per_block: int,
         attn_inputs: PyAttentionInputs,
         is_target_verify: bool,
+        attn_meta: Optional[KimiLinearMetadata] = None,
     ) -> torch.Tensor:
         batch, seq = self._get_bs_from_attention_input(
             mixed_qkv, attn_inputs, is_target_verify
@@ -611,12 +936,59 @@ class KimiLinearKDADecode(KimiLinearKDABase):
         g = forget_gate_2d.view(
             batch, seq, self.local_num_v_heads, self.head_k_dim
         ).contiguous()
-        # beta: [batch*seq, H] -> sigmoid in float32 -> [batch, seq, H]
-        beta_out = beta.reshape(batch * seq, -1).float().sigmoid()
-        beta_out = beta_out.view(batch, seq, self.local_num_v_heads)
-
         ssm_states = self._get_ssm_states(kv_cache_tensor)
 
+        # Each captured batch size gets its own graph, so a batch-dependent
+        # branch resolves at capture time -- no host-side branch at replay.
+        min_batch = pla_kda_min_batch()
+        if (
+            self._use_pla(ssm_states, attn_inputs)
+            and attn_meta is not None
+            and batch >= min_batch
+        ):
+            load_slot, store_slot = attn_meta.decode_state_slots(
+                attn_inputs, seq_size_per_block
+            )
+            try:
+                # PLA applies sigmoid(b) itself, so it takes the raw beta that
+                # the Triton path receives already sigmoided.
+                core_attn_out = fused_recurrent_kda_pla(
+                    q=query.contiguous(),
+                    k=key.contiguous(),
+                    v=value.contiguous(),
+                    g=g,
+                    beta_raw=beta.reshape(
+                        batch, seq, self.local_num_v_heads
+                    ).contiguous(),
+                    A_log=self._alog_bf16,
+                    dt_bias=self._dt_bias_bf16,
+                    initial_state=ssm_states,
+                    load_slot=load_slot,
+                    store_slot=store_slot,
+                    lower_bound=self.gate_lower_bound,
+                )
+            except Exception:
+                # The vendor kernel validates dtypes and shapes host-side and
+                # raises. Crashing every rank over a contract mismatch is worse
+                # than serving on the Triton path, so disable it for this layer
+                # and fall through -- but say so loudly: a quiet fallback is
+                # what made an earlier benchmark round unattributable.
+                logging.exception(
+                    "PLA KDA decode raised; falling back to the Triton kernel "
+                    "for this layer for the rest of the process"
+                )
+                self._pla_ok = False
+            else:
+                return core_attn_out.reshape(
+                    [-1, core_attn_out.shape[2], core_attn_out.shape[3]]
+                )
+
+        # beta: [batch*seq, H] -> sigmoid in float32 -> [batch, seq, H]. Only the
+        # Triton recurrence takes the activated beta (PLA applies sigmoid itself),
+        # so it is computed here rather than ahead of the branch: on the PLA path
+        # it was two dead launches per layer per step.
+        beta_out = beta.reshape(batch * seq, -1).float().sigmoid()
+        beta_out = beta_out.view(batch, seq, self.local_num_v_heads)
         core_attn_out, _ = fused_recurrent_kda(
             q=query.contiguous(),
             k=key.contiguous(),
@@ -634,6 +1006,11 @@ class KimiLinearKDADecode(KimiLinearKDABase):
             block_map=attn_inputs.kv_cache_kernel_block_id_device,
             seq_size_per_block=seq_size_per_block,
             sequence_lengths=attn_inputs.sequence_lengths_plus_1_device,
+            # The state pool layout is shared with prefill and with the PLA
+            # path; one switch drives all three. Only the FP32-state kernels
+            # take this argument -- the stock ones are K-first only, which is
+            # why the probe below refuses PLA without them.
+            **({"state_v_first": True} if _KDA_FP32_STATE and kda_pool_v_first() else {}),
         )
 
         res = core_attn_out.reshape(
@@ -675,6 +1052,7 @@ class KimiLinearKDADecode(KimiLinearKDABase):
             kv_cache.seq_size_per_block,
             attn_inputs,
             is_target_verify,
+            attn_meta,
         )
         return attn_out
 
@@ -815,6 +1193,73 @@ class KimiLinearKDA(nn.Module):
             quant_config=quant_config,
             hw_kernel_config=hw_kernel_config,
         )
+        # One GEMM for the three narrow projections that read hidden_states:
+        # beta [H] and the two LoRA down-projections. At decode each is a
+        # launch-bound GEMV, so merging saves two launches per layer. The QKV
+        # projection stays separate: at 3*H*D columns it is the widest weight
+        # in the layer and reading it already dominates its own GEMV, while
+        # packing it would duplicate that weight in memory.
+        self.packed_low_weight: Optional[torch.Tensor] = None
+        self.packed_low_widths: Optional[List[int]] = None
+        # RTP_GLM_KDA_PACK_PROJ=0 keeps the three separate projections, i.e. the
+        # pre-packing behaviour, so a baseline run and an A/B can share one build.
+        parts = (
+            [packed_projection_weight(proj) for proj in self.low_rank_projections()]
+            if os.environ.get("RTP_GLM_KDA_PACK_PROJ", "1") != "0"
+            else [None]
+        )
+        # Say why when packing was asked for and did not happen. The fused MHC
+        # path had the same shape of bug -- a silent capability check that left
+        # a whole benchmark round measuring the unoptimised path.
+        if os.environ.get("RTP_GLM_KDA_PACK_PROJ", "1") == "0":
+            pass
+        elif not all(part is not None for part in parts):
+            rejected = [
+                type(proj).__name__
+                for proj, part in zip(self.low_rank_projections(), parts)
+                if part is None
+            ]
+            logging.info(
+                "KDA projection packing off: %s is not a bias-free contiguous "
+                "BF16 projection",
+                ", ".join(rejected),
+            )
+        else:
+            widths = [part.shape[1] for part in parts]
+            # The packed copy is a duplicate; only accept it while narrow.
+            if sum(widths) <= MAX_PACKED_PROJECTION_WIDTH:
+                self.packed_low_widths = widths
+                self.packed_low_weight = torch.cat(parts, dim=1).contiguous()
+            else:
+                logging.info(
+                    "KDA projection packing off: packed width %d exceeds the "
+                    "%d cap, the duplicated weight would not pay for itself",
+                    sum(widths),
+                    MAX_PACKED_PROJECTION_WIDTH,
+                )
+
+    def low_rank_projections(self):
+        return (self.in_proj_b, self.f_a_proj, self.g_a_proj)
+
+    def _project_inputs(
+        self, hidden_states: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """qkv, beta, forget gate and output gate from hidden_states."""
+        if self.packed_low_weight is not None and hidden_states.ndim == 2:
+            packed = torch.mm(hidden_states, self.packed_low_weight)
+            beta_input, forget_low, gate_low = packed.split(
+                self.packed_low_widths, dim=-1
+            )
+        else:
+            beta_input = self.in_proj_b(hidden_states)
+            forget_low = self.f_a_proj(hidden_states)
+            gate_low = self.g_a_proj(hidden_states)
+        return (
+            self.in_proj_qkv(hidden_states),
+            beta_input,
+            self.f_b_proj(forget_low),
+            self.g_b_proj(gate_low),
+        )
 
     def forward(
         self,
@@ -834,11 +1279,11 @@ class KimiLinearKDA(nn.Module):
             or attn_meta.is_cp_linear_attn
         ), "prefill_conv1d_meta is required for prefill"
 
-        # 1. Projections
-        projected_qkv = self.in_proj_qkv(hidden_states)
-        beta_input = self.in_proj_b(hidden_states)  # [token, H]
-        forget_gate = self.f_b_proj(self.f_a_proj(hidden_states))  # [token, H*D]
-        g_proj = self.g_b_proj(self.g_a_proj(hidden_states))  # [token, H*D]
+        # 1. Projections: qkv [token, 3*H*D], beta [token, H], forget gate and
+        #    output gate [token, H*D] each.
+        projected_qkv, beta_input, forget_gate, g_proj = self._project_inputs(
+            hidden_states
+        )
 
         # 2. Prefill or decode
         if attention_inputs.is_prefill and not attn_meta.is_target_verify:
@@ -871,10 +1316,24 @@ class KimiLinearKDA(nn.Module):
             )
 
         # 3. o_norm with sigmoid gating: y = RMSNorm(attn_out) * sigmoid(g_proj)
-        attn_output = self.norm(
-            attn_output.reshape(-1, self.head_v_dim),
-            g_proj.reshape(-1, self.head_v_dim),
-        )
+        # 解码时走一个融合 kernel：RmsNormGated 这条路把归一化、sigmoid 和逐元素乘
+        # 拆成好几个 kernel，每层都付一次，34 个 KDA 层累起来不小。
+        if _KDA_FP32_STATE and not attention_inputs.is_prefill:
+            from rtp_llm.models_py.triton_kernels.kimi_kda.fp32_state.rms_norm_gate import (
+                kimi_kda_rms_norm_sigmoid_gate,
+            )
+
+            attn_output = kimi_kda_rms_norm_sigmoid_gate(
+                attn_output.reshape(-1, self.head_v_dim),
+                g_proj.reshape(-1, self.head_v_dim),
+                self.norm.weight,
+                self.norm.eps,
+            )
+        else:
+            attn_output = self.norm(
+                attn_output.reshape(-1, self.head_v_dim),
+                g_proj.reshape(-1, self.head_v_dim),
+            )
 
         # from [token * head, dim] -> [token, head * dim]
         attn_output = attn_output.reshape(-1, self.local_num_v_heads * self.head_v_dim)

@@ -1,9 +1,24 @@
+import os
+
 import torch
 import triton
 import triton.language as tl
 
 from rtp_llm.models_py.triton_kernels.common.offset import linear_offset_64
 from rtp_llm.models_py.triton_kernels.fla.index import prepare_chunk_indices
+
+
+def kda_pool_v_first() -> bool:
+    """SSM 状态池内层是否按 [V, K] 存。
+
+    默认 False，也就是 [K, V]，和 fused_recurrent 的 STATE_V_FIRST=False 对应。
+    置 1 换成 [V, K]——平头哥 PLA 的 decode kernel 只认这一种。
+
+    **prefill 和 decode 两个进程必须设成同一个值**：prefill 把状态写进池、
+    经 cache store 传给 decode，布局不一致不会报错，只会算出错的结果。
+    两端启动时都把这一行打到日志里，不要靠猜。
+    """
+    return os.environ.get("RTP_GLM_KDA_STATE_V_FIRST", "0") == "1"
 
 
 @triton.jit(do_not_specialize=["block_map_stride_b"])
@@ -19,6 +34,7 @@ def load_initial_state_from_block_map_kernel(
     BLOCK_V: tl.constexpr,
     SEQ_SIZE_PER_BLOCK: tl.constexpr,
     CONV_STRIDE_TOKEN: tl.constexpr,
+    POOL_V_FIRST: tl.constexpr,
 ):
 
     SSM_PER_HEAD = K * V
@@ -51,11 +67,16 @@ def load_initial_state_from_block_map_kernel(
     p_in_m0 = (p_in_i0 >= 0) & (p_in_i0 < (V))
     p_in_i1 = tl.arange(0, K).to(tl.int64) + (0)
     p_in_m1 = (p_in_i1 >= 0) & (p_in_i1 < (K))
-    p_in = (
-        (conv_states + block_idx * CONV_STRIDE_TOKEN + i_h * SSM_PER_HEAD)
-        + p_in_i0[:, None] * (K)
-        + p_in_i1[None, :] * (1)
-    )
+    # 池内一个槽位的内层布局。默认 [K, V]（和 fused_recurrent 的
+    # STATE_V_FIRST=False 一致）；置 POOL_V_FIRST 后换成 [V, K]，
+    # 也就是平头哥 PLA 的 decode kernel 唯一认的那种
+    # （它按 h0_idx*stride(0) + hv*V*K + v*K + k 寻址，内层假定连续）。
+    # 翻转只改指针算术，不多读写一个字节。
+    pool_base = conv_states + block_idx * CONV_STRIDE_TOKEN + i_h * SSM_PER_HEAD
+    if POOL_V_FIRST:
+        p_in = pool_base + p_in_i0[:, None] * (1) + p_in_i1[None, :] * (V)
+    else:
+        p_in = pool_base + p_in_i0[:, None] * (K) + p_in_i1[None, :] * (1)
 
     b_in = tl.where(
         is_zero,
@@ -96,6 +117,7 @@ def load_initial_state_from_block_map(
         SEQ_SIZE_PER_BLOCK=seq_size_per_block,
         CONV_STRIDE_TOKEN=token_stride_conv,
         BLOCK_V=block_v,
+        POOL_V_FIRST=kda_pool_v_first(),
     )
 
 
@@ -114,6 +136,7 @@ def _store_ssm_state_block(
     K: tl.constexpr,
     BLOCK_V: tl.constexpr,
     CONV_STRIDE_TOKEN: tl.constexpr,
+    POOL_V_FIRST: tl.constexpr,
 ):
     block_idx = tl.load(block_map + batch * block_map_stride_b + dest_block_pos).to(
         tl.int64
@@ -135,7 +158,10 @@ def _store_ssm_state_block(
         p_out_m0 = (p_out_i0 >= 0) & (p_out_i0 < (V))
         p_out_i1 = tl.arange(0, K).to(tl.int64) + (0)
         p_out_m1 = (p_out_i1 >= 0) & (p_out_i1 < (K))
-        p_out = (dest_ptr) + p_out_i0[:, None] * (K) + p_out_i1[None, :] * (1)
+        if POOL_V_FIRST:
+            p_out = (dest_ptr) + p_out_i0[:, None] * (1) + p_out_i1[None, :] * (V)
+        else:
+            p_out = (dest_ptr) + p_out_i0[:, None] * (K) + p_out_i1[None, :] * (1)
 
         tl.store(
             p_out,
@@ -163,6 +189,7 @@ def store_ssm_state_to_block_map_kernel(
     SEQ_SIZE_PER_BLOCK: tl.constexpr,
     CHUNK_SIZE: tl.constexpr,
     CONV_STRIDE_TOKEN: tl.constexpr,
+    POOL_V_FIRST: tl.constexpr,
 ):
     i_c, i_h, i_v = tl.program_id(0), tl.program_id(1), tl.program_id(2)
 
@@ -201,6 +228,7 @@ def store_ssm_state_to_block_map_kernel(
             K,
             BLOCK_V,
             CONV_STRIDE_TOKEN,
+            POOL_V_FIRST,
         )
     elif (chunk + 1) * CHUNK_SIZE % SEQ_SIZE_PER_BLOCK == 0:
         source_ptr = (
@@ -225,6 +253,7 @@ def store_ssm_state_to_block_map_kernel(
             K,
             BLOCK_V,
             CONV_STRIDE_TOKEN,
+            POOL_V_FIRST,
         )
 
 
@@ -266,4 +295,5 @@ def store_ssm_state_to_block_map(
         SEQ_SIZE_PER_BLOCK=seq_size_per_block,
         CONV_STRIDE_TOKEN=token_stride_ssm_state,
         CHUNK_SIZE=chunk_size,
+        POOL_V_FIRST=kda_pool_v_first(),
     )
