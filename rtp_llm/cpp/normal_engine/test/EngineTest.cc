@@ -1,5 +1,6 @@
 #include "c10/util/intrusive_ptr.h"
 #include "autil/TimeUtility.h"
+#include "autil/EnvUtil.h"
 #include "torch/all.h"
 #include <algorithm>
 #include <cstdlib>
@@ -29,6 +30,7 @@
 #include <limits>
 #include <memory>
 #include <pybind11/embed.h>
+#include <set>
 
 namespace py = pybind11;
 
@@ -717,6 +719,272 @@ TEST_F(NormalEngineTest, testRejectGenerationPrefillWithSpeculativeBeforeRunnerC
     }
 }
 
+TEST_F(NormalEngineTest, testRejectUnsupportedPrefillAsyncBeforeWarmup) {
+    ModelConfig   model_config;
+    RuntimeConfig runtime_config;
+    KVCacheConfig kv_cache_config;
+    auto          base = createEngineInitParams(CustomConfig{}, model_config, runtime_config, kv_cache_config);
+    base.runtime_config.fifo_scheduler_config.prefill_async_scheduling = true;
+    base.parallelism_config.role_type                                  = RoleType::PREFILL;
+    base.pd_sep_config.role_type                                       = RoleType::PREFILL;
+    base.runtime_config.warm_up                                        = true;
+
+    // A rejected constructor must never reach even the warmup model factory.
+    int factory_calls                  = 0;
+    NormalExecutor::test_model_factory = [&](const GptModelInitParams&) {
+        ++factory_calls;
+        return std::make_unique<MockModel>(model_config.vocab_size);
+    };
+    struct FactoryResetGuard {
+        ~FactoryResetGuard() {
+            NormalExecutor::test_model_factory = nullptr;
+        }
+    } factory_reset_guard;
+
+    const auto check = [&](const EngineInitParams&                       params,
+                           const char*                                   expected,
+                           std::unique_ptr<ProposeModelEngineInitParams> proposer = nullptr) {
+        try {
+            NormalEngine engine(params, std::move(proposer), false);
+            FAIL() << "unsupported Prefill async combination must fail initialization";
+        } catch (const std::exception& error) {
+            EXPECT_NE(std::string(error.what()).find(expected), std::string::npos) << error.what();
+        }
+        EXPECT_EQ(factory_calls, 0);
+    };
+    for (int variant = 0; variant < 5; ++variant) {
+        auto params = base;
+        switch (variant) {
+            case 0:
+                params.pd_sep_config.role_type = RoleType::DECODE;
+                break;
+            case 1:
+                params.parallelism_config.dp_size = 2;
+                break;
+            case 2:
+                params.parallelism_config.pp_size = 2;
+                break;
+            case 3:
+                params.ffn_disaggregate_config.enable_ffn_disaggregate = true;
+                break;
+            case 4:
+                params.runtime_config.use_batch_decode_scheduler = true;
+                break;
+        }
+        SCOPED_TRACE(variant);
+        check(params, "Prefill async scheduling requires");
+    }
+    auto wrong_proposer           = base;
+    wrong_proposer.sp_config.type = SP_TYPE_DSPARK;
+    check(wrong_proposer,
+          "Prefill async scheduling requires",
+          std::make_unique<ProposeModelEngineInitParams>(SP_TYPE_MTP, 1));
+    auto graph                                      = base;
+    graph.hw_kernel_config.enable_cuda_graph        = true;
+    graph.hw_kernel_config.prefill_capture_seq_lens = {8};
+    check(graph, "does not support Prefill CUDA graph");
+    graph.hw_kernel_config.prefill_capture_seq_lens.clear();
+    graph.hw_kernel_config.generation_prefill_capture_token_buckets = {8};
+    graph.runtime_config.warm_up                                    = false;
+    { NormalEngine engine(graph, nullptr, false); }
+    EXPECT_GT(factory_calls, 0);
+    factory_calls = 0;
+    for (const char* name :
+         {"RTP_LLM_MTP_ASYNC_PREPARE", "RTP_LLM_MTP_ASYNC_DEVICE_STATE", "RTP_LLM_DROP_BROAD_SYNC"}) {
+        autil::EnvGuard flag(name, "1");
+        check(base, name);
+    }
+}
+
+TEST_F(NormalEngineTest, testPrefillAsyncIsolationLeavesOffConstructorUnchanged) {
+    ModelConfig   model_config;
+    RuntimeConfig runtime_config;
+    KVCacheConfig kv_cache_config;
+    auto          params = createEngineInitParams(CustomConfig{}, model_config, runtime_config, kv_cache_config);
+    ASSERT_FALSE(params.runtime_config.fifo_scheduler_config.prefill_async_scheduling);
+    params.runtime_config.warm_up                                    = false;
+    params.hw_kernel_config.enable_cuda_graph                        = true;
+    params.hw_kernel_config.prefill_capture_seq_lens                 = {8};
+    params.hw_kernel_config.generation_prefill_capture_token_buckets = {8};
+    autil::EnvGuard async_prepare("RTP_LLM_MTP_ASYNC_PREPARE", "1");
+    autil::EnvGuard device_state("RTP_LLM_MTP_ASYNC_DEVICE_STATE", "1");
+    autil::EnvGuard drop_sync("RTP_LLM_DROP_BROAD_SYNC", "1");
+    NormalExecutor::test_model_factory = [vocab = model_config.vocab_size](const GptModelInitParams&) {
+        return std::make_unique<MockModel>(vocab);
+    };
+    struct FactoryResetGuard {
+        ~FactoryResetGuard() {
+            NormalExecutor::test_model_factory = nullptr;
+        }
+    } factory_reset_guard;
+    NormalEngine engine(params, nullptr, false);
+    EXPECT_FALSE(engine.prefill_prepare_pool_);
+    EXPECT_TRUE(engine.stop().ok());
+}
+
+TEST_F(NormalEngineTest, testPrefillAsyncStopDrainsPreparedCancelledRequest) {
+    CustomConfig config;
+    config.role_type = RoleType::PREFILL;
+    ModelConfig   model_config;
+    RuntimeConfig runtime_config;
+    KVCacheConfig kv_cache_config;
+    auto          params          = createEngineInitParams(config, model_config, runtime_config, kv_cache_config);
+    params.runtime_config.warm_up = false;
+    params.runtime_config.fifo_scheduler_config.prefill_async_scheduling = true;
+    params.runtime_config.max_generate_batch_size                        = 1;
+
+    std::promise<void> entered_forward;
+    std::promise<void> release_forward;
+    auto               released = release_forward.get_future().share();
+    std::atomic<int>   forwards{0};
+    NormalExecutor::test_model_factory = [&](const GptModelInitParams&) {
+        return std::make_unique<MockModel>(model_config.vocab_size, [&](const GptModelInputs&) {
+            if (forwards.fetch_add(1) == 0) {
+                entered_forward.set_value();
+                // Bound failure cleanup too: an assertion cannot strand the engine loop.
+                EXPECT_EQ(released.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+            }
+        });
+    };
+    struct FactoryResetGuard {
+        ~FactoryResetGuard() {
+            NormalExecutor::test_model_factory = nullptr;
+        }
+    } factory_reset_guard;
+    NormalEngine engine(params, nullptr);
+    const auto   request = [] {
+        auto input                             = std::make_shared<GenerateInput>();
+        input->input_ids                       = torch::tensor({1, 2, 3, 4}, torch::kInt32);
+        input->generate_config                 = std::make_shared<GenerateConfig>();
+        input->generate_config->max_new_tokens = 1;
+        return input;
+    };
+    auto a = engine.enqueue(request());
+    ASSERT_EQ(entered_forward.get_future().wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    auto       b        = engine.enqueue(request());
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!b->hasPendingAsyncBookkeeping() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_TRUE(b->hasPendingAsyncBookkeeping());
+    b->reportError(ErrorCode::CANCELLED, "cancel prepared request");
+    auto stopping = std::async(std::launch::async, [&] { return engine.stop(); });
+    EXPECT_EQ(stopping.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+    EXPECT_TRUE(a->hasPendingAsyncBookkeeping());
+    EXPECT_TRUE(b->hasPendingAsyncBookkeeping());
+    release_forward.set_value();
+    ASSERT_EQ(stopping.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    EXPECT_TRUE(stopping.get().ok());
+    EXPECT_FALSE(a->hasPendingAsyncBookkeeping());
+    EXPECT_FALSE(b->hasPendingAsyncBookkeeping());
+    EXPECT_TRUE(b->hasError());
+    EXPECT_EQ(a->curBlocksNum(), 0);
+    EXPECT_EQ(b->curBlocksNum(), 0);
+    EXPECT_TRUE(engine.getScheduler().empty());
+}
+
+TEST_F(NormalEngineTest, testPrefillAsyncRechecksPreparedCancellationAndTimeout) {
+    // Block A after lookahead starts, then wait for B's complete host preparation.
+    // The engine keeps running after cancellation, so shutdown cannot hide a forward.
+    for (int variant = 0; variant < 3; ++variant) {
+        SCOPED_TRACE(variant);
+        CustomConfig config;
+        config.role_type = RoleType::PREFILL;
+        ModelConfig   model_config;
+        RuntimeConfig runtime_config;
+        KVCacheConfig kv_cache_config;
+        auto          params          = createEngineInitParams(config, model_config, runtime_config, kv_cache_config);
+        params.runtime_config.warm_up = false;
+        params.runtime_config.fifo_scheduler_config.prefill_async_scheduling = true;
+        params.runtime_config.max_generate_batch_size                        = 2;
+
+        std::promise<void>                entered_a;
+        std::promise<void>                release_a;
+        std::promise<void>                entered_b;
+        std::promise<void>                release_b;
+        std::promise<void>                entered_c;
+        auto                              released   = release_a.get_future().share();
+        auto                              released_b = release_b.get_future().share();
+        std::vector<std::vector<int32_t>> forwarded;
+        NormalExecutor::test_model_factory = [&](const GptModelInitParams&) {
+            return std::make_unique<MockModel>(model_config.vocab_size, [&](const GptModelInputs& inputs) {
+                auto tokens = inputs.combo_tokens.cpu().contiguous();
+                forwarded.emplace_back(tokens.data_ptr<int32_t>(), tokens.data_ptr<int32_t>() + tokens.numel());
+                if (forwarded.size() == 1) {
+                    entered_a.set_value();
+                    EXPECT_EQ(released.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+                } else if (variant == 1 && forwarded.back().front() == 31) {
+                    entered_b.set_value();
+                    EXPECT_EQ(released_b.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+                } else if (forwarded.back().front() == 41) {
+                    entered_c.set_value();
+                }
+            });
+        };
+        struct FactoryResetGuard {
+            ~FactoryResetGuard() {
+                NormalExecutor::test_model_factory = nullptr;
+            }
+        } factory_reset_guard;
+        NormalEngine engine(params, nullptr);
+        const auto   request = [](std::vector<int32_t> tokens) {
+            auto input                             = std::make_shared<GenerateInput>();
+            input->input_ids                       = torch::tensor(tokens, torch::kInt32);
+            input->generate_config                 = std::make_shared<GenerateConfig>();
+            input->generate_config->max_new_tokens = 1;
+            return input;
+        };
+        auto a = engine.enqueue(request({1, 2, 3, 4}));
+        ASSERT_EQ(entered_a.get_future().wait_for(std::chrono::seconds(5)), std::future_status::ready);
+        auto [accepted, b] = engine.enqueueMultiple({request({21, 22, 23}), request({31, 32, 33, 34, 35})});
+        ASSERT_EQ(accepted, (std::vector<bool>{true, true}));
+        ASSERT_TRUE(engine.prepared_prefill_batch_);
+        ASSERT_EQ(engine.prepared_prefill_batch_->wait_for(std::chrono::seconds(5)), std::future_status::ready);
+        if (variant == 2) {
+            // Set an already expired deadline only after preparation, with no sleep race.
+            for (const auto& stream : b) {
+                stream->generateInput()->generate_config->timeout_ms = 1;
+                stream->begin_time_us_ = autil::TimeUtility::currentTimeInMicroSeconds() - 1000000;
+            }
+        } else {
+            b[0]->reportError(ErrorCode::CANCELLED, "cancel prepared row");
+            if (variant == 0) {
+                b[1]->reportError(ErrorCode::CANCELLED, "cancel entire prepared batch");
+            }
+        }
+        auto c = engine.enqueue(request({41, 42}));
+        release_a.set_value();
+        if (variant == 1) {
+            const auto entered_b_status = entered_b.get_future().wait_for(std::chrono::seconds(5));
+            EXPECT_EQ(entered_b_status, std::future_status::ready);
+            if (entered_b_status == std::future_status::ready) {
+                EXPECT_TRUE(engine.prepared_prefill_batch_);
+                if (engine.prepared_prefill_batch_) {
+                    EXPECT_EQ(engine.prepared_prefill_batch_->wait_for(std::chrono::seconds(5)),
+                              std::future_status::ready);
+                }
+            }
+            release_b.set_value();
+        }
+        EXPECT_EQ(entered_c.get_future().wait_for(std::chrono::seconds(5)), std::future_status::ready);
+        EXPECT_TRUE(engine.stop().ok());
+        std::vector<std::vector<int32_t>> expected{{1, 2, 3, 4}};
+        if (variant == 1) {
+            expected.push_back({31, 32, 33, 34, 35});
+        }
+        expected.push_back({41, 42});
+        EXPECT_EQ(forwarded, expected);
+        EXPECT_TRUE(b[0]->hasError());
+        EXPECT_EQ(b[1]->hasError(), variant != 1);
+        for (const auto& stream : b) {
+            EXPECT_FALSE(stream->hasPendingAsyncBookkeeping());
+            EXPECT_EQ(stream->curBlocksNum(), 0);
+        }
+        EXPECT_FALSE(c->hasPendingAsyncBookkeeping());
+        EXPECT_TRUE(engine.getScheduler().empty());
+    }
+}
+
 TEST_F(NormalEngineTest, testRejectMismatchedSpeculativeProposalBeforeWarmup) {
     ModelConfig   model_config;
     RuntimeConfig runtime_config;
@@ -1283,7 +1551,8 @@ TEST_F(NormalEngineTest, testEnqueueMultipleRejectsMixedModesBeforeRoleFiltering
 
 TEST_F(NormalEngineTest, testEnqueueMultipleIgnoresInvalidStreamForModeCheck) {
     CustomConfig config;
-    auto         engine = createMockEngine(config);
+    // Inspect enqueue state before any background step can finish the valid request.
+    auto engine = createMockEngine(config, false);
 
     auto make_query = [](int max_new_tokens, int min_new_tokens) {
         auto query                             = make_shared<GenerateInput>();

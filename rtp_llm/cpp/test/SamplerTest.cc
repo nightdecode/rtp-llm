@@ -81,30 +81,23 @@ TEST_F(SamplerTest, testMixedDynamicBeamTransitionsUseIndependentOutput) {
     auto cum_log_probs    = torch::tensor({0.0f, 0.0f, -100.0f, 0.0f}, torch::kFloat32).to(torch::kCUDA);
 
     std::vector<at::Generator> generators(batch_size);
-    SamplerInputs              inputs{logits,
-                         token_ids,
-                         input_lengths,
-                         sequence_lengths,
-                         std::make_shared<LogitsProcessorStates>(),
-                         vocab_size,
-                         step,
-                         batch_size,
-                         batch_size_out,
-                         num_beams_in,
-                         num_beams_out,
-                         top_k,
-                         top_p,
-                         temperature,
-                         torch::Tensor(),
-                         torch::Tensor(),
-                         torch::Tensor(),
-                         torch::Tensor(),
-                         torch::Tensor(),
-                         torch::Tensor(),
-                         false,
-                         cum_log_probs,
-                         torch::Tensor(),
-                         generators};
+    SamplerInputs inputs{};
+    inputs.logits                      = logits;
+    inputs.token_ids                   = token_ids;
+    inputs.input_lengths               = input_lengths;
+    inputs.sequence_lengths            = sequence_lengths;
+    inputs.logits_processor_states_ptr = std::make_shared<LogitsProcessorStates>();
+    inputs.vocab_size                  = vocab_size;
+    inputs.step                        = step;
+    inputs.batch_size                  = batch_size;
+    inputs.batch_size_out              = batch_size_out;
+    inputs.num_beams_in                = num_beams_in;
+    inputs.num_beams_out               = num_beams_out;
+    inputs.top_k                       = top_k;
+    inputs.top_p                       = top_p;
+    inputs.temperature                 = temperature;
+    inputs.cum_log_probs               = cum_log_probs;
+    inputs.generator                   = generators;
 
     auto output = sampler_->forward(inputs).token_ids.cpu().contiguous();
 
@@ -164,32 +157,26 @@ TEST_F(SamplerTest, testGeneralSampling) {
     std::vector<at::Generator> generator;
     generator.resize(batch_size);
 
-    SamplerInputs inputs{
-        logits.clone(),
-        output_token_ids.clone(),
-        input_lengths,
-        sequence_lengths,
-        state_ptr,
-        size_t(vocab_size),
-        size_t(step),
-        batch_size,
-        batch_size,
-        num_beams_in,
-        num_beams_out,
-        top_k,
-        top_p,
-        temperature,
-        repetition_penalty,
-        presence_penalty,
-        frequency_penalty,
-        torch::Tensor(),  // no_repeat_ngram_size
-        torch::Tensor(),  // do_sample
-        torch::Tensor(),  // finished_mask
-        false,            // return_original_all_probs
-        cum_log_probs.clone(),
-        torch::Tensor(),  // all_probs
-        generator,
-    };
+    SamplerInputs inputs{};
+    inputs.logits                      = logits.clone();
+    inputs.token_ids                   = output_token_ids.clone();
+    inputs.input_lengths               = input_lengths;
+    inputs.sequence_lengths            = sequence_lengths;
+    inputs.logits_processor_states_ptr = state_ptr;
+    inputs.vocab_size                  = size_t(vocab_size);
+    inputs.step                        = size_t(step);
+    inputs.batch_size                  = batch_size;
+    inputs.batch_size_out              = batch_size;
+    inputs.num_beams_in                = num_beams_in;
+    inputs.num_beams_out               = num_beams_out;
+    inputs.top_k                       = top_k;
+    inputs.top_p                       = top_p;
+    inputs.temperature                 = temperature;
+    inputs.repetition_penalty          = repetition_penalty;
+    inputs.presence_penalty            = presence_penalty;
+    inputs.frequency_penalty           = frequency_penalty;
+    inputs.cum_log_probs               = cum_log_probs.clone();
+    inputs.generator                   = generator;
 
     auto outputs = sampler_->forward(inputs);
     std::cout << "output_token_ids: " << outputs.token_ids.cpu() << std::endl;

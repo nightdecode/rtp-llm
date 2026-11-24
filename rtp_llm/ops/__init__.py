@@ -5,6 +5,7 @@ import pathlib
 import sys
 import threading
 import traceback
+from types import ModuleType
 from typing import List, Optional
 
 import torch
@@ -390,6 +391,13 @@ def ensure_rdma_ops_loaded() -> None:
     _load_rdma_ops(required=True)
 
 
+def load_engram_ops() -> ModuleType:
+    """Load optional Engram bindings from the shared RTP-LLM library path."""
+    import libfabric_memory
+
+    return libfabric_memory
+
+
 def __getattr__(name: str):
     if name in _COMPUTE_SYMBOLS:
         _load_compute_ops()
@@ -413,3 +421,4 @@ def get_multimodal_feature_hash(embedding: torch.Tensor) -> torch.Tensor:
     return importlib.import_module("libth_transformer").get_multimodal_feature_hash(
         embedding
     )
+

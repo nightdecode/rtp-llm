@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <exception>
 #include <functional>
+#include <exception>
 #include <future>
 #include <limits>
 #include <list>
@@ -29,8 +30,11 @@
 #include "rtp_llm/cpp/normal_engine/NormalGenerateStream.h"
 #include "rtp_llm/cpp/engine_base/schedulers/SchedulerUtils.h"
 #include "rtp_llm/cpp/normal_engine/NormalExecutor.h"
+#include "rtp_llm/cpp/normal_engine/AsyncRunner.h"
 #include "rtp_llm/cpp/models/ModelTypes.h"
 #include "rtp_llm/cpp/models/SampleInfos.h"
+#include "rtp_llm/cpp/models/Sampler.h"
+#include "rtp_llm/cpp/metrics/RtpLLMMetrics.h"
 #include "rtp_llm/cpp/models/logits_processor/MultiSeqLogitsProcessor.h"
 #include "rtp_llm/models_py/bindings/core/Types.h"
 #include "rtp_llm/cpp/testing/TestBase.h"
@@ -43,6 +47,10 @@
 #include "rtp_llm/cpp/cache/OpaqueKVCacheSpec.h"
 #include "rtp_llm/cpp/cuda_graph/cuda_graph_base.h"
 #include "rtp_llm/cpp/cuda_graph/cuda_graph_runner.h"
+
+#if USING_CUDA
+#include <cuda_runtime_api.h>
+#endif
 
 using namespace std;
 
@@ -186,6 +194,111 @@ protected:
 class OutputDispatchTest: public NormalBatchStreamProcessorTest, public ::testing::WithParamInterface<int> {};
 
 INSTANTIATE_TEST_SUITE_P(SerialAndParallel, OutputDispatchTest, ::testing::Values(0, 2));
+
+#if USING_CUDA
+TEST_P(OutputDispatchTest, CpuOutputsWaitForWriterOnlyWhenRequested) {
+    class RecordingStream final: public NormalGenerateStream {
+    public:
+        using NormalGenerateStream::NormalGenerateStream;
+        std::shared_ptr<torch::Event> writer;
+        std::vector<bool> writer_ready;
+        void updateOutput(const StreamUpdateInfo& update) override {
+            writer_ready.push_back(writer->query());
+            NormalGenerateStream::updateOutput(update);
+        }
+    };
+    struct Gate {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool released{false};
+        std::atomic<bool> timed_out{false};
+        void release() {
+            { std::lock_guard<std::mutex> lock(mutex); released = true; }
+            cv.notify_all();
+        }
+    };
+    for (bool asynchronous : {false, true}) for (bool wait_for_writer : {false, true}) {
+        SCOPED_TRACE(testing::Message() << "async=" << asynchronous << " writer_wait=" << wait_for_writer);
+        auto model = makeLogprobsModelConfig();
+        auto query = std::make_shared<GenerateInput>();
+        query->input_ids = hostIntBuffer({0});
+        query->generate_config = std::make_shared<GenerateConfig>();
+        query->generate_config->max_new_tokens = 8;
+        query->generate_config->ignore_eos = true;
+        auto stream = std::make_shared<RecordingStream>(query, model, RuntimeConfig{}, ResourceContext{}, nullptr);
+        stream->generate_status_->status = StreamState::RUNNING;
+        StreamGroups streams({stream});
+        CacheConfig cache;
+        initFullCacheConfig(cache, 1);
+        NormalBatchStreamProcessor processor(model, {}, {}, cache, false, GetParam());
+        MergedOutput outputs;
+        outputs.sampler_output.token_ids = torch::tensor({1}, torch::kInt32).reshape({1, 1});
+        outputs.sampler_output.success = torch::tensor({true}, torch::kBool);
+        // False is the original P/off default; true represents protected D.
+        if (wait_for_writer) outputs.wait_for_kv_writer = true;
+        EXPECT_EQ(outputs.wait_for_kv_writer, wait_for_writer);
+        auto producer = cuda_graph::graphGetStreamFromPool(false);
+        auto consumer = cuda_graph::graphGetStreamFromPool(false);
+        while (consumer == producer) consumer = cuda_graph::graphGetStreamFromPool(false);
+        stream->writer = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
+        AsyncRunner runner(consumer);
+        runner.launch([] {});
+        runner.sync(consumer);
+        consumer.synchronize(); // Warm the actual worker before blocking the writer.
+        auto gate = std::make_shared<Gate>();
+        auto* owner = new std::shared_ptr<Gate>(gate);
+        const auto launch_status = cudaLaunchHostFunc(producer.stream(), [](void* opaque) {
+            std::unique_ptr<std::shared_ptr<Gate>> owner(static_cast<std::shared_ptr<Gate>*>(opaque));
+            auto state = *owner;
+            std::unique_lock<std::mutex> lock(state->mutex);
+            if (!state->cv.wait_for(lock, std::chrono::seconds(5), [&] { return state->released; }))
+                state->timed_out.store(true);
+        }, owner);
+        if (launch_status != cudaSuccess) delete owner;
+        ASSERT_EQ(launch_status, cudaSuccess);
+        std::thread releaser;
+        std::mutex done_mutex;
+        std::condition_variable done_cv;
+        bool done = false;
+        std::exception_ptr failure;
+        absl::Status status;
+        try {
+            stream->writer->record(producer);
+            if (wait_for_writer) {
+                releaser = std::thread([&] {
+                    std::unique_lock<std::mutex> lock(done_mutex);
+                    // Only releases the intentional dependency; no time assertion.
+                    done_cv.wait_for(lock, std::chrono::milliseconds(200), [&] { return done; });
+                    lock.unlock();
+                    gate->release();
+                });
+            }
+            if (asynchronous) {
+                runner.launch([&] {
+                    stream->writer->block(cuda_graph::graphGetCurrentStream());
+                    status = processor.dispatch(streams, outputs);
+                });
+                runner.sync(consumer);
+            } else {
+                cuda_graph::GraphStreamGuard guard(producer);
+                status = processor.dispatch(streams, outputs);
+            }
+        } catch (...) { failure = std::current_exception(); }
+        { std::lock_guard<std::mutex> lock(done_mutex); done = true; }
+        done_cv.notify_all();
+        gate->release();
+        if (releaser.joinable()) releaser.join();
+        producer.synchronize();
+        consumer.synchronize(); // Actual GPU quiescence before stream/tensor teardown.
+        if (failure) std::rethrow_exception(failure);
+        EXPECT_TRUE(status.ok());
+        EXPECT_FALSE(gate->timed_out.load());
+        ASSERT_EQ(stream->writer_ready.size(), 1u);
+        EXPECT_EQ(stream->writer_ready.front(), wait_for_writer);
+        EXPECT_EQ(stream->outputTokenLen(), 1);
+    }
+}
+#endif
 
 TEST_P(OutputDispatchTest, testDispatchPreservesCpuProfilingAndAsyncDisableGuard) {
     namespace tap = torch::autograd::profiler;
@@ -442,6 +555,95 @@ TEST_F(NormalBatchStreamProcessorTest, testWarmUpWithoutCacheManager) {
     EXPECT_FALSE(model_input->capture_hidden_states);
     EXPECT_FALSE(model_input->kv_cache_block_id.defined());
     EXPECT_FALSE(model_input->kv_cache_kernel_block_id.defined());
+}
+
+TEST_F(NormalBatchStreamProcessorTest, PrefillRetainsHostMetadataWithDeviceInputEnabled) {
+    const char* previous = std::getenv("RTP_LLM_DEVICE_INPUT");
+    struct RestoreDeviceInputEnv {
+        std::optional<std::string> previous;
+        ~RestoreDeviceInputEnv() {
+            if (previous.has_value()) {
+                setenv("RTP_LLM_DEVICE_INPUT", previous->c_str(), 1);
+            } else {
+                unsetenv("RTP_LLM_DEVICE_INPUT");
+            }
+        }
+    } restore{previous ? std::optional<std::string>(previous) : std::nullopt};
+    setenv("RTP_LLM_DEVICE_INPUT", "1", 1);
+
+    ModelConfig model_config;
+    model_config.max_seq_len      = 128;
+    model_config.vocab_size       = 128;
+    model_config.input_vocab_size = 128;
+    model_config.num_layers       = 1;
+    CacheConfig cache_config;
+    initFullCacheConfig(cache_config, 1);
+    rtp_llm::test::setGroupBlockLayout(cache_config, {"default"}, {64}, {4096}, {256});
+
+    enum class BatchKind {
+        PREFILL,
+        DECODE,
+        MIXED
+    };
+    for (const auto kind : {BatchKind::PREFILL, BatchKind::DECODE, BatchKind::MIXED}) {
+        const bool prefill_only = kind == BatchKind::PREFILL;
+        auto       make_stream  = [&](std::vector<int32_t> tokens, int reuse, std::vector<int> blocks, bool context) {
+            auto query             = std::make_shared<GenerateInput>();
+            query->input_ids       = hostIntBuffer(std::move(tokens));
+            query->generate_config = std::make_shared<GenerateConfig>();
+            auto stream            = std::make_shared<NormalGenerateStream>(
+                query, model_config, RuntimeConfig{}, ResourceContext{}, nullptr);
+            BatchKVCacheResource cache;
+            cache.resetBatchSize(1);
+            cache.initGroups(cache_config.topologyPtr());
+            cache.setBatchBlocks(0, "default", blocks);
+            stream->setKVCache(cache);
+            stream->setReuseLength(reuse);
+            stream->setIsContextStream(context);
+            stream->generate_status_->status = StreamState::RUNNING;
+            return stream;
+        };
+        auto short_stream = make_stream({1, 2, 3}, 0, {1, 2}, prefill_only);
+        auto long_stream =
+            make_stream({4, 5, 6, 7, 8, 9}, kind == BatchKind::DECODE ? 0 : 2, {3, 4}, kind != BatchKind::DECODE);
+        // Supply mixed streams in context/decode order. The packed model input
+        // must still put decode first and keep token/cache rows aligned.
+        StreamGroups groups(kind == BatchKind::MIXED ? std::list<GenerateStreamPtr>{long_stream, short_stream} :
+                                                       std::list<GenerateStreamPtr>{short_stream, long_stream});
+        NormalBatchStreamProcessor processor(
+            model_config, PDSepConfig{}, ProfilingDebugLoggingConfig{}, cache_config, false);
+        TensorHolder holder;
+        auto         inputs = processor.gatherModelInput(groups, holder);
+        ASSERT_TRUE(inputs.ok());
+        for (const auto* tensor : {&inputs->combo_tokens,
+                                   &inputs->input_lengths,
+                                   &inputs->prefix_lengths,
+                                   &inputs->sequence_lengths,
+                                   &inputs->kv_cache_block_id,
+                                   &inputs->kv_cache_kernel_block_id,
+                                   &inputs->lm_output_indexes}) {
+            ASSERT_TRUE(tensor->defined());
+            EXPECT_EQ(tensor->is_cuda(), !prefill_only);
+            if (prefill_only && tensor->numel() > 0) {
+                EXPECT_TRUE(tensor->is_pinned());
+            }
+        }
+        if (prefill_only) {
+            EXPECT_EQ(toVec<int32_t>(inputs->combo_tokens), (std::vector<int32_t>{1, 2, 3, 6, 7, 8, 9}));
+            EXPECT_EQ(toVec<int32_t>(inputs->input_lengths), (std::vector<int32_t>{3, 4}));
+            EXPECT_EQ(toVec<int32_t>(inputs->prefix_lengths), (std::vector<int32_t>{0, 2}));
+            EXPECT_EQ(toVec<int32_t>(inputs->lm_output_indexes), (std::vector<int32_t>{2, 6}));
+            EXPECT_EQ(toVec<int32_t>(inputs->kv_cache_block_id), (std::vector<int32_t>{1, 2, 3, 4}));
+        } else if (kind == BatchKind::MIXED) {
+            EXPECT_EQ(toVec<int32_t>(inputs->combo_tokens.cpu()), (std::vector<int32_t>{3, 6, 7, 8, 9}));
+            EXPECT_EQ(toVec<int32_t>(inputs->input_lengths.cpu()), (std::vector<int32_t>{3, 4}));
+            EXPECT_EQ(toVec<int32_t>(inputs->sequence_lengths.cpu()), (std::vector<int32_t>{2}));
+            EXPECT_EQ(toVec<int32_t>(inputs->prefix_lengths.cpu()), (std::vector<int32_t>{2}));
+            EXPECT_EQ(toVec<int32_t>(inputs->lm_output_indexes.cpu()), (std::vector<int32_t>{0, 4}));
+            EXPECT_EQ(toVec<int32_t>(inputs->kv_cache_block_id.cpu()), (std::vector<int32_t>{1, 2, 3, 4}));
+            EXPECT_EQ(toVec<int32_t>(inputs->kv_cache_kernel_block_id.cpu()), (std::vector<int32_t>{1, 2, 3, 4}));
+        }
+    }
 }
 
 TEST_F(NormalBatchStreamProcessorTest, testSpeculativeReserveStepFormula) {
@@ -2747,8 +2949,10 @@ TEST_F(NormalBatchStreamProcessorTest, testDisabledOutputVocabMasksPaddedLogits)
     auto sampler_inputs = processor.gatherSamplerInput(stream_groups, GptModelInputs(), model_output);
     ASSERT_TRUE(sampler_inputs.ok());
     EXPECT_EQ(sampler_inputs->top_k.data_ptr<int32_t>()[0], 8);
-    EXPECT_EQ(sampler_inputs->all_probs.size(1), 16);
+    EXPECT_EQ(sampler_inputs->probability_output, SamplerProbabilityOutput::DENSE);
     EXPECT_TRUE(torch::isneginf(sampler_inputs->logits.narrow(1, 10, 6)).all().item<bool>());
+    Sampler sampler({});
+    EXPECT_EQ(sampler.forward(*sampler_inputs).all_probs.size(1), 16);
 }
 
 TEST_F(NormalBatchStreamProcessorTest, testPaddedSizeLargerThanKKeepsDispatchAndSamplingOnK) {

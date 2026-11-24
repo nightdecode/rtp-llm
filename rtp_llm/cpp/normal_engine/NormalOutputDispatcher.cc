@@ -12,6 +12,8 @@
 #include <string>
 #include <utility>
 #include "rtp_llm/cpp/utils/TensorDebugUtils.h"
+#include <cstring>
+#include <vector>
 #if USING_CUDA
 #include "rtp_llm/models_py/bindings/cuda/ops/StandaloneOps.h"
 #include "ATen/cuda/CUDAContext.h"
@@ -45,6 +47,26 @@ void syncPinnedCpuCopies(bool need_sync) {
     // The copy launch returns quickly; only this worker thread blocks on its
     // stream while the main engine thread can continue issuing CUDA work.
     cuda_graph::graphGetCurrentStream().synchronize();
+}
+
+torch::Tensor makeHostInt64IndexTensor(const std::vector<int64_t>& values, bool pinned) {
+    auto options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+    if (pinned) {
+        options = options.pinned_memory(true);
+    }
+    auto tensor = torch::empty({static_cast<int64_t>(values.size())}, options);
+    if (!values.empty()) {
+        std::memcpy(tensor.data_ptr<int64_t>(), values.data(), values.size() * sizeof(int64_t));
+    }
+    return tensor;
+}
+
+torch::Tensor copyHostIndexToDeviceAsync(const torch::Tensor& host_tensor, const torch::Device& device) {
+    if (!device.is_cuda()) {
+        return host_tensor;
+    }
+    RTP_LLM_CHECK(host_tensor.is_pinned());
+    return host_tensor.to(device, torch::kInt64, /*non_blocking=*/true, /*copy=*/true);
 }
 
 }  // namespace
@@ -197,11 +219,19 @@ absl::Status NormalOutputDispatcher::dispatch(const StreamGroups& stream_groups,
     const auto&  sampler_output       = merge_outputs.sampler_output;
     const size_t total_batch_size_out = stream_groups.totalSamplerBatchSizeOut();
     RTP_LLM_CHECK(total_batch_size_out == (size_t)sampler_output.token_ids.size(0));
-    // token_ids and success may be CUDA tensors. Keep the non-beam token copy
-    // narrow, then stage D2H through pinned CPU buffers and synchronize once.
+
+    auto all_streams              = stream_groups.allStreams();
+    bool need_return_logprobs     = false;
+    int  max_content_top_logprobs = 0;
+    for (const auto& stream : all_streams) {
+        if (stream->shouldComputeLogprobs()) {
+            need_return_logprobs     = true;
+            max_content_top_logprobs = std::max(max_content_top_logprobs, stream->generateConfig()->top_logprobs);
+        }
+    }
     bool any_beam_search = false;
     if (sampler_output.token_ids.defined() && sampler_output.token_ids.size(1) > 1) {
-        for (auto& stream : stream_groups.allStreams()) {
+        for (const auto& stream : all_streams) {
             if (stream->currentNumBeams() > 1 || stream->nextNumBeams() > 1) {
                 any_beam_search = true;
                 break;
@@ -218,18 +248,91 @@ absl::Status NormalOutputDispatcher::dispatch(const StreamGroups& stream_groups,
             token_ids_for_copy     = sampler_output.token_ids.narrow(1, last_col, 1).contiguous();
         }
     }
+
+    // Probabilities use sampler-input coordinates, including context tiling.
+    std::vector<int64_t> requested_output_row_indices;
+    std::vector<int64_t> requested_input_row_indices;
+    int64_t              input_batch_idx = 0, output_batch_idx = 0;
+    if (need_return_logprobs) {
+        for (const auto& stream : all_streams) {
+            const int64_t input_rows =
+                stream->needTilingForSampling() ? stream->nextBatchSize() : stream->currentBatchSize();
+            const int64_t output_rows = stream->nextBatchSize();
+            if (stream->shouldComputeLogprobs()) {
+                const bool has_beams = stream->currentNumBeams() > 1 || stream->nextNumBeams() > 1;
+                for (int64_t i = 0; i < output_rows; ++i) {
+                    const int64_t src =
+                        has_beams ? sampler_output.beam_index.data_ptr<int32_t>()[output_batch_idx + i] : i;
+                    RTP_LLM_CHECK(src >= 0 && src < input_rows);
+                    requested_output_row_indices.push_back(output_batch_idx + i);
+                    requested_input_row_indices.push_back(input_batch_idx + src);
+                }
+            }
+            input_batch_idx += input_rows;
+            output_batch_idx += output_rows;
+        }
+    }
+
+    torch::Tensor compact_token_logprobs;
+    torch::Tensor compact_top_logprob_token_ids;
+    torch::Tensor compact_top_logprobs;
+    // Keep every pinned H2D source alive through the batch's existing D2H
+    // synchronization. All index copies and consumers run on the same stream.
+    std::vector<torch::Tensor> index_host_buffers;
+    auto make_device_index = [&index_host_buffers](const std::vector<int64_t>& values, const torch::Device& device) {
+        auto host_tensor   = makeHostInt64IndexTensor(values, device.is_cuda());
+        auto device_tensor = copyHostIndexToDeviceAsync(host_tensor, device);
+        index_host_buffers.emplace_back(std::move(host_tensor));
+        return device_tensor;
+    };
+    if (need_return_logprobs) {
+        const auto& probs = sampler_output.sampling_probs;
+        RTP_LLM_CHECK_WITH_INFO(probs.defined(), "generation logprobs require the sampler's processed probabilities");
+        auto input_rows  = make_device_index(requested_input_row_indices, probs.device());
+        auto output_rows = make_device_index(requested_output_row_indices, sampler_output.token_ids.device());
+        auto tokens =
+            sampler_output.token_ids.select(1, sampler_output.token_ids.size(1) - 1).index_select(0, output_rows);
+        if (probs.is_cuda() && !tokens.is_cuda()) {
+            tokens = tokens.pin_memory();
+            index_host_buffers.push_back(tokens);
+        }
+        tokens = tokens.to(probs.device(), torch::kLong, /*non_blocking=*/true);
+#if USING_CUDA
+        if (probs.is_cuda()) {
+            probs.record_stream(cuda_graph::graphGetCurrentStream());
+        }
+#endif
+        const auto configured_vocab = all_streams.front()->outputVocabSize() > 0 ?
+                                          all_streams.front()->outputVocabSize() :
+                                          all_streams.front()->vocabSize();
+        const auto vocab            = std::min<int64_t>(probs.size(1), configured_vocab);
+        auto       scores           = computeSamplingLogprobs(
+            probs.narrow(1, 0, vocab).index_select(0, input_rows), {}, {}, tokens, max_content_top_logprobs);
+        compact_token_logprobs        = scores.token_logprobs.unsqueeze(1);
+        compact_top_logprob_token_ids = scores.top_logprob_token_ids.unsqueeze(1);
+        compact_top_logprobs          = scores.top_logprobs.unsqueeze(1);
+    }
+
+    // token IDs, success, and all compact logprob results share one D2H wait.
+    // Each CUDA tensor is staged into pinned memory before the synchronization;
+    // per-stream dispatch below only slices CPU tensors.
     bool                need_d2h_sync = false;
     const torch::Tensor token_ids_cpu = copyToPinnedCpuAsync(token_ids_for_copy, need_d2h_sync);
     const torch::Tensor success_cpu   = copyToPinnedCpuAsync(sampler_output.success, need_d2h_sync);
     const torch::Tensor custom_output_cpu =
         copyToPinnedCpuAsync(merge_outputs.model_output.custom_output, need_d2h_sync);
+    compact_token_logprobs        = copyToPinnedCpuAsync(compact_token_logprobs, need_d2h_sync);
+    compact_top_logprob_token_ids = copyToPinnedCpuAsync(compact_top_logprob_token_ids, need_d2h_sync);
+    compact_top_logprobs          = copyToPinnedCpuAsync(compact_top_logprobs, need_d2h_sync);
     syncPinnedCpuCopies(need_d2h_sync);
     RTP_LLM_LOG_DEBUG("new_all_token_ids = [%s]", tensorDebugStringWithData<int32_t>(token_ids_cpu).c_str());
-    int  batch_idx_in     = 0;
-    int  batch_idx_out    = 0;
-    int  token_offset     = 0;
-    bool return_all_probs = stream_groups.needReturnAllProbs() != ReturnAllProbsMode::NONE;
-    auto new_tokens_all   = torch::empty({(int64_t)total_batch_size_out, 1}, torch::kInt32);
+
+    int  batch_idx_in       = 0;
+    int  batch_idx_out      = 0;
+    int  token_offset       = 0;
+    int  logprobs_batch_idx = 0;
+    bool return_all_probs   = stream_groups.needReturnAllProbs() != ReturnAllProbsMode::NONE;
+    auto new_tokens_all     = torch::empty({(int64_t)total_batch_size_out, 1}, torch::kInt32);
 
     std::vector<autil::ThreadPoolBase::Future<void>> futures;
     if (thread_pool_) {
@@ -254,12 +357,15 @@ absl::Status NormalOutputDispatcher::dispatch(const StreamGroups& stream_groups,
         const bool has_custom_output =
             stream->isContextStream()
             && stream->generateInput()->custom_output_token_position >= stream->prefixLength();
+        const bool return_content_logprobs = stream->shouldComputeLogprobs();
 
         auto task = [&,
                      stream,
                      batch_idx_in,
                      batch_idx_out,
                      token_offset,
+                     logprobs_batch_idx,
+                     return_content_logprobs,
                      dispatch_stream,
                      custom_output_batch_idx = has_custom_output ? custom_output_offset : -1]() {
             std::optional<at::ThreadLocalStateGuard> profiling_guard;
@@ -280,7 +386,12 @@ absl::Status NormalOutputDispatcher::dispatch(const StreamGroups& stream_groups,
                                  token_ids_cpu,
                                  success_cpu,
                                  custom_output_cpu,
-                                 custom_output_batch_idx);
+                                 custom_output_batch_idx,
+                                 return_content_logprobs,
+                                 logprobs_batch_idx,
+                                 compact_token_logprobs,
+                                 compact_top_logprob_token_ids,
+                                 compact_top_logprobs);
         };
 
         if (thread_pool_) {
@@ -295,6 +406,9 @@ absl::Status NormalOutputDispatcher::dispatch(const StreamGroups& stream_groups,
         batch_idx_in += cur_batch_size;
         batch_idx_out += next_batch_size;
         token_offset += token_size;
+        if (return_content_logprobs) {
+            logprobs_batch_idx += next_batch_size;
+        }
     }
 
     // Tasks reference local tensors and merge_outputs. Drain every task before
@@ -320,7 +434,12 @@ void NormalOutputDispatcher::dispatchSingleStream(GenerateStreamPtr    stream,
                                                   const torch::Tensor& token_ids_cpu,
                                                   const torch::Tensor& success_cpu,
                                                   const torch::Tensor& custom_output_cpu,
-                                                  int                  custom_output_batch_idx) const {
+                                                  int                  custom_output_batch_idx,
+                                                  bool                 return_content_logprobs,
+                                                  int                  logprobs_batch_idx,
+                                                  const torch::Tensor& token_logprobs_cpu,
+                                                  const torch::Tensor& top_logprob_token_ids_cpu,
+                                                  const torch::Tensor& top_logprobs_cpu) const {
 
     const auto&  model_output      = merge_outputs.model_output;
     const auto&  sampler_output    = merge_outputs.sampler_output;
@@ -480,6 +599,27 @@ void NormalOutputDispatcher::dispatchSingleStream(GenerateStreamPtr    stream,
         }
     }
 
+    torch::Tensor token_logprobs;
+    torch::Tensor top_logprob_token_ids;
+    torch::Tensor top_logprobs;
+    if (return_content_logprobs) {
+        RTP_LLM_CHECK(token_logprobs_cpu.defined());
+        RTP_LLM_CHECK(top_logprob_token_ids_cpu.defined());
+        RTP_LLM_CHECK(top_logprobs_cpu.defined());
+        RTP_LLM_CHECK(!token_logprobs_cpu.is_cuda());
+        RTP_LLM_CHECK(!top_logprob_token_ids_cpu.is_cuda());
+        RTP_LLM_CHECK(!top_logprobs_cpu.is_cuda());
+        const int64_t requested_top_logprobs =
+            std::min<int64_t>(std::max<int64_t>(stream->generateConfig()->top_logprobs, 0), top_logprobs_cpu.size(2));
+        token_logprobs        = token_logprobs_cpu.narrow(0, logprobs_batch_idx, next_batch_size).contiguous();
+        top_logprob_token_ids = top_logprob_token_ids_cpu.narrow(0, logprobs_batch_idx, next_batch_size)
+                                    .narrow(2, 0, requested_top_logprobs)
+                                    .contiguous();
+        top_logprobs = top_logprobs_cpu.narrow(0, logprobs_batch_idx, next_batch_size)
+                           .narrow(2, 0, requested_top_logprobs)
+                           .contiguous();
+    }
+
     torch::Tensor current_softmax_result;
     if (stream->calculateSoftmaxProbs()) {
 #if USING_CUDA
@@ -529,6 +669,8 @@ void NormalOutputDispatcher::dispatchSingleStream(GenerateStreamPtr    stream,
     RecordedTokenTiming* recorded_timings =
         merge_outputs.recorded_batch ? merge_outputs.recorded_batch->sliceTimings(batch_idx_in, cur_batch_size) :
                                        nullptr;
+    const int32_t logprobs_offset =
+        stream->generateConfig()->return_logprobs ? stream->logprobsContentOffset(new_tokens, 1) : 0;
     StreamUpdateInfo update_info{has_beam_search ? batch_new_all_token_ids : new_tokens,
                                  1,
                                  batch_hidden_states,
@@ -545,7 +687,12 @@ void NormalOutputDispatcher::dispatchSingleStream(GenerateStreamPtr    stream,
                                  std::move(error_info),
                                  stream->isContextStream() ? model_output.generation_prefill_cuda_graph_status :
                                                              GenerationPrefillCudaGraphStatus::NOT_REQUESTED,
-                                 batch_custom_output};
+                                 batch_custom_output,
+                                 token_logprobs,
+                                 top_logprob_token_ids,
+                                 top_logprobs,
+                                 -1,
+                                 logprobs_offset};
     stream->update(update_info, true, recorded_timings, cur_batch_size);
 }
 

@@ -1,12 +1,59 @@
 #pragma once
 
+#include "rtp_llm/cpp/normal_engine/speculative/MtpTargetVerifyLayout.h"
+
+#include <memory>
+#include <optional>
+
 #include "rtp_llm/cpp/normal_engine/NormalBatchStreamProcessor.h"
 #include "rtp_llm/cpp/engine_base/stream/GenerateStream.h"
 #include "rtp_llm/cpp/models/logits_processor/SpecLogitsVerifyRunner.h"
 #include "rtp_llm/cpp/normal_engine/speculative/MtpCompute.h"
 #include "rtp_llm/cpp/normal_engine/speculative/SpeculativeSampler.h"
+#include <vector>
 
 namespace rtp_llm {
+
+// Holds the target's processed sampling distribution until acceptance selects
+// emitted content rows. No raw LM-head storage or full logprob matrix is retained.
+struct MtpTargetLogprobs {
+    torch::Tensor probs;                         // [dense_target_positions, width]
+    torch::Tensor candidate_ids;                 // optional vocabulary IDs, same shape as probs
+    torch::Tensor point_mass_token_ids;          // optional [dense_target_positions], replaces probs
+    torch::Tensor source_row_indices_cpu_owner;  // pinned indices retained through dispatch
+    torch::Tensor token_logprobs;
+    torch::Tensor top_logprob_token_ids;
+    torch::Tensor top_logprobs;
+    int64_t       dense_row_count        = 0;
+    int64_t       requested_top_logprobs = 0;
+
+    bool defined() const {
+        return probs.defined() || point_mass_token_ids.defined() || token_logprobs.defined();
+    }
+
+    bool finalized() const {
+        return token_logprobs.defined();
+    }
+
+    int64_t maxTopLogprobs() const {
+        return top_logprobs.defined() ? top_logprobs.size(1) : requested_top_logprobs;
+    }
+};
+
+int64_t maxMtpActiveContentTopLogprobs(const StreamGroups& stream_groups);
+
+MtpTargetLogprobs captureMtpTargetProbs(const SamplerOutput& output, int64_t max_top_logprobs);
+
+// emitted_token_ids keeps the dense target-row layout; select only accepted
+// content rows. Scores always come from target p, including replacement tokens.
+void finalizeSelectedMtpTargetLogprobs(MtpTargetLogprobs&          target_logprobs,
+                                       const torch::Tensor&        emitted_token_ids,
+                                       const std::vector<int64_t>& selected_dense_row_indices);
+
+torch::Tensor reshapeMtpTargetAllProbs(const torch::Tensor& all_probs,
+                                       int64_t              batch_size,
+                                       int64_t              positions_per_batch,
+                                       int64_t              logits_width);
 
 class MtpBatchStreamProcessor: public NormalBatchStreamProcessor {
 public:
@@ -21,6 +68,7 @@ public:
         NormalBatchStreamProcessor(model_config, pd_sep_config, profiling_debug_logging_config, cache_config, warm_up),
         propose_step_(sp_config.gen_num_per_cycle),
         vocab_size_(model_config.vocab_size),
+        is_dspark_(sp_config.type == SP_TYPE_DSPARK),
         is_block_draft_(isBlockDraftType(sp_config.type)),
         dspark_mask_token_id_(static_cast<int32_t>(sp_config.sp_dspark_mask_token_id)),
         dspark_sample_from_anchor_(sp_config.sp_dspark_sample_from_anchor) {}
@@ -39,9 +87,26 @@ public:
                                  const MergedOutput&  propose_output,
                                  const torch::Tensor& draft_last_hidden_states) const;
 
+    absl::Status dispatchPrefill(const StreamGroups&      stream_groups,
+                                 const MergedOutput&      prefill_output,
+                                 const MergedOutput&      propose_output,
+                                 const torch::Tensor&     draft_last_hidden_states,
+                                 const MtpTargetLogprobs& target_logprobs) const;
+
     absl::Status dispatchDecode(const StreamGroups&                          stream_groups,
                                 const speculative::SpeculativeSamplerOutput& spec_decode_output,
                                 const MergedOutput&                          draft_prefill_output) const;
+
+    absl::Status dispatchDecode(const StreamGroups&                          stream_groups,
+                                const speculative::SpeculativeSamplerOutput& spec_decode_output,
+                                const MergedOutput&                          draft_prefill_output,
+                                MtpTargetLogprobs                            target_logprobs) const;
+
+    // Wait for accepted lengths/tokens and reduce only accepted target rows.
+    // An already-finalized payload is left unchanged.
+    void finalizeDecodeTargetLogprobs(const StreamGroups&                          stream_groups,
+                                      const speculative::SpeculativeSamplerOutput& spec_decode_output,
+                                      MtpTargetLogprobs&                           target_logprobs) const;
 
     absl::StatusOr<GptModelInputs> gatherDecodeModelInput(const StreamGroups& stream_groups,
                                                           TensorHolder&       host_holder) const;
@@ -56,10 +121,12 @@ public:
                                                       const std::vector<CacheGroupType>& group_types,
                                                       int64_t                            seq_size_per_block);
 
-    absl::StatusOr<SamplerInputs> gatherSpecSamplerInput(const StreamGroups&                         stream_groups,
-                                                         const GptModelOutputs&                      model_output,
-                                                         const SpecLogitsVerifyRunner::LaunchResult& spec_logits_result,
-                                                         const torch::Tensor& draft_token_ids) const;
+    // Build full logical-row history on the current stream when penalties need it.
+    // The executor applies precomputed masks before passing these inputs to Sampler.
+    absl::StatusOr<SamplerInputs> gatherSpecSamplerInput(const StreamGroups&    stream_groups,
+                                                         const GptModelOutputs& model_output,
+                                                         const torch::Tensor&   draft_token_ids,
+                                                         bool has_draft_to_target_mapping = false) const;
 
     void prepareDecodeDraftModelInput(const StreamGroups& stream_groups,
                                       GptModelInputs&     model_input,
@@ -94,15 +161,19 @@ public:
     /** COMMIT populates draft KV from normalized target features while retaining the target's prefill geometry. */
     void validatePrefillDSparkCommitInput(const GptModelInputs& model_input) const;
 
-    mtp::DSparkRoundState buildDSparkRoundState(const StreamGroups&   stream_groups,
-                                                const GptModelInputs& model_input,
-                                                TensorHolder&         host_holder) const;
+    // Immutable state shared by the proposal and target-verification phases of
+    // one DSpARK round. Position bases contain one MRoPE/default tuple per
+    // request; each phase expands them to its own token width, so batching
+    // cannot shift one request onto another request's positions.
+    DSparkRoundState buildDSparkRoundState(const StreamGroups&   stream_groups,
+                                           const GptModelInputs& model_input,
+                                           TensorHolder&         host_holder) const;
 
-    void prepareDSparkProposeModelInput(const mtp::DSparkRoundState& round_state,
-                                        GptModelInputs&              model_input,
-                                        TensorHolder&                host_holder);
+    void prepareDSparkProposeModelInput(const DSparkRoundState& round_state,
+                                        GptModelInputs&         model_input,
+                                        TensorHolder&           host_holder);
 
-    void prepareDSparkTargetVerifyModelInput(const mtp::DSparkRoundState& round_state,
+    void prepareDSparkTargetVerifyModelInput(const DSparkRoundState& round_state,
                                              GptModelInputs&              model_input,
                                              const torch::Tensor&         proposals,
                                              TensorHolder&                host_holder);
@@ -150,12 +221,14 @@ protected:
                                       const MergedOutput&                prefill_output,
                                       const MergedOutput&                propose_output,
                                       const torch::Tensor&               draft_last_hidden_states,
+                                      const MtpTargetLogprobs&           target_logprobs,
                                       const torch::Tensor&               new_tokens_all,
                                       std::vector<StreamSpecUpdateInfo>& spec_update_infos) const;
 
     void prepareDecodeSpecUpdateInfo(const StreamGroups&                          stream_groups,
                                      const speculative::SpeculativeSamplerOutput& spec_decode_output,
                                      const MergedOutput&                          draft_prefill_output,
+                                     MtpTargetLogprobs&                           target_logprobs,
                                      std::vector<StreamSpecUpdateInfo>&           spec_update_infos) const;
 
     void gatherHiddenStates(const StreamGroups& stream_groups, GptModelInputs& model_input) const;
@@ -167,11 +240,15 @@ protected:
 
     int     propose_step_;
     size_t  vocab_size_                   = 0;
+    bool    is_dspark_ = false;
     bool    is_block_draft_                = false;
     int32_t dspark_mask_token_id_         = -1;
     bool    dspark_sample_from_anchor_     = true;
 
-    // DSpARK proposal constants are grow-only device buffers. Keeping them on
+    // gatherSpecSamplerInput runs serially on the executor thread. Keep its
+    // history uploads on one stream so allocator reuse stays stream-ordered.
+
+    // Decode-round constants are grow-only device buffers.  Keeping them on
     // device is required by RTP_LLM_STREAM_ASYNC: no accept-length D2H is
     // introduced on the scheduling thread.
     mtp::DSparkProposeInputBuffers dspark_propose_input_buffers_;

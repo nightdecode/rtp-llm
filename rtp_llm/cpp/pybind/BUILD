@@ -21,6 +21,21 @@ py_test(
     ],
 )
 
+py_test(
+    name = "rtp_llm_startup_test",
+    srcs = ["rtp_llm_startup_test.py"],
+    data = [
+        "//:rtp_compute_ops",
+        "//:th_transformer",
+        "//:th_transformer_config",
+    ],
+    deps = [
+        "//rtp_llm:device",
+        "//rtp_llm:ops",
+    ],
+    env = {"CUDA_VISIBLE_DEVICES": "", "GPU_COUNT": "0"},
+)
+
 cc_library(
     name = "py_utils",
     hdrs = [
@@ -137,6 +152,7 @@ cc_library(
         "//rtp_llm/cpp/engine_base/schedulers:schedulers",
         "//rtp_llm/cpp/engine_base:weights_converter",
         "//rtp_llm/cpp/cache:cache",
+        "//rtp_llm/cpp/utils:profiling_scope",
         "//rtp_llm/cpp/telemetry",
         "//rtp_llm/cpp/multimodal_processor:multimodal_processor",
         ":config_extract",

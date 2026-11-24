@@ -5,9 +5,18 @@
 #include <cstddef>
 #include <cstring>
 #include <memory>
+#include <map>
+#include <limits>
+#include <typeinfo>
 #include <ATen/Generator.h>
 #if defined(USING_CUDA) || defined(USING_ROCM)
 #include <ATen/cuda/CUDAGeneratorImpl.h>
+#endif
+#if USING_CUDA
+#include <ATen/cuda/CUDAEvent.h>
+#include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 #endif
 #include "autil/EnvUtil.h"
 #include "rtp_llm/cpp/cache/connector/p2p/P2PConnectorMetrics.h"
@@ -19,6 +28,8 @@
 #include "rtp_llm/models_py/bindings/core/Types.h"
 #include "rtp_llm/cpp/config/ModelConfig.h"
 #include "rtp_llm/cpp/models/logits_processor/LogitsProcessorFactory.h"
+#include "rtp_llm/cpp/models/logits_processor/GrammarLogitsProcessor.h"
+#include "rtp_llm/cpp/models/logits_processor/MultiSeqLogitsProcessor.h"
 #include "rtp_llm/cpp/utils/LinearBlocksUtil.h"
 
 using namespace std;
@@ -28,6 +39,8 @@ namespace rtp_llm {
 namespace {
 
 constexpr size_t kSmallBeamSearchV1MaxBeamWidth = 8;  // Keep in sync with trt_beam_search kMaxBeamWidthForV1.
+
+constexpr int64_t kInitialLogprobsHistoryCapacity = 64;
 
 std::optional<std::string> validateOutputVocabRequest(GenerateConfig& config, size_t output_vocab_size) {
     if (config.repetition_penalty != 1.0f || config.presence_penalty != 0.0f || config.frequency_penalty != 0.0f) {
@@ -39,8 +52,9 @@ std::optional<std::string> validateOutputVocabRequest(GenerateConfig& config, si
     if (config.in_think_mode) {
         return "output vocabulary pruning does not support think mode";
     }
-    if (config.return_logits || config.return_prompt_logits || config.return_all_probs != ReturnAllProbsMode::NONE
-        || config.calculate_loss != 0 || !config.select_tokens_id.empty() || !config.select_tokens_str.empty()) {
+    if (config.return_logits || config.return_logprobs || config.return_prompt_logits
+        || config.return_all_probs != ReturnAllProbsMode::NONE || config.calculate_loss != 0
+        || !config.select_tokens_id.empty() || !config.select_tokens_str.empty()) {
         return "output vocabulary pruning does not support full-vocabulary logits, probabilities, labels, or loss";
     }
     if (config.hasNumBeams()) {
@@ -94,6 +108,11 @@ GenerateStream::GenerateStream(const shared_ptr<GenerateInput>& input,
 
     // batch size depends on perf_test_, initialize it first
     perf_test_ = perf_test || autil::EnvUtil::getEnv("PERF_TEST", false);
+    RTP_LLM_CHECK_WITH_INFO(!generate_input_->generate_config->return_logprobs
+                                || (!generate_input_->generate_config->hasNumBeams()
+                                    && generate_input_->generate_config->num_return_sequences <= 1),
+                            "return_logprobs does not support beam search or num_return_sequences > 1");
+    logprobs_content_started_->store(!generate_input_->generate_config->in_think_mode, std::memory_order_relaxed);
     if (perf_test_ && hasNumBeams()) {
         // TODO(zhangjianning.zjn): support perf test for beam search
         RTP_LLM_LOG_WARNING("beam search does not support PERF_TEST for now");
@@ -183,7 +202,7 @@ GenerateStream::GenerateStream(const shared_ptr<GenerateInput>& input,
                                                                             processor_eos_token_id,
                                                                             nullptr,
                                                                             !resource_context.defer_grammar_to_pp_tail,
-                                                                            output_vocab_size_ > 0);
+                                                                            output_vocab_size_ > 0, streamLogTag());
     if (processors_result.ok()) {
         auto processors                   = std::move(processors_result.value());
         sampling_state_.logits_processors = std::move(processors);
@@ -754,6 +773,69 @@ std::vector<int> GenerateStream::completeTokenIdsVec(int batch_idx) {
     return complete_token_ids_->completeTokenIdsVec(batch_idx);
 }
 
+bool GenerateStream::hasLogprobsContentStarted() const {
+    return logprobs_content_started_->load(std::memory_order_acquire);
+}
+
+void GenerateStream::updateLogprobsContentStarted(int old_seq_length) {
+    if (hasLogprobsContentStarted()) {
+        return;
+    }
+    const auto& config = *generate_input_->generate_config;
+    if (!config.return_logprobs || !config.in_think_mode || config.end_think_token_ids.empty()) {
+        return;
+    }
+
+    RTP_LLM_CHECK_WITH_INFO(currentBatchSize() == 1,
+                            "content logprob phase tracking only supports single-sequence generation");
+    const int32_t  close_token_id = config.end_think_token_ids.front();
+    const int32_t* token_ids      = complete_token_ids_->data(0);
+    for (int32_t pos = std::max(old_seq_length, inputLength()); pos < seqLength(); ++pos) {
+        if (token_ids[pos] == close_token_id) {
+            logprobs_content_started_->store(true, std::memory_order_release);
+            return;
+        }
+    }
+}
+
+int32_t GenerateStream::logprobsContentOffset(const torch::Tensor& candidate_tokens, int32_t num_new_tokens) const {
+    RTP_LLM_CHECK(num_new_tokens >= 0);
+    if (num_new_tokens == 0 || hasLogprobsContentStarted()) {
+        return 0;
+    }
+
+    const auto& config = *generate_input_->generate_config;
+    if (!config.in_think_mode || config.end_think_token_ids.empty()) {
+        return num_new_tokens;
+    }
+    RTP_LLM_CHECK(candidate_tokens.defined());
+    RTP_LLM_CHECK_WITH_INFO(currentBatchSize() == 1 && nextBatchSize() == 1,
+                            "content logprob offset only supports single-sequence generation");
+
+    auto tokens_cpu          = candidate_tokens.is_cuda() ? candidate_tokens.cpu() : candidate_tokens;
+    tokens_cpu               = tokens_cpu.to(torch::kInt32).contiguous();
+    const int32_t* token_ptr = nullptr;
+    if (tokens_cpu.dim() == 1) {
+        RTP_LLM_CHECK(num_new_tokens <= tokens_cpu.size(0));
+        token_ptr = tokens_cpu.data_ptr<int32_t>();
+    } else {
+        RTP_LLM_CHECK(tokens_cpu.dim() == 2);
+        RTP_LLM_CHECK(tokens_cpu.size(0) == 1);
+        RTP_LLM_CHECK(num_new_tokens <= tokens_cpu.size(1));
+        token_ptr = tokens_cpu.data_ptr<int32_t>();
+    }
+
+    const int32_t close_token_id = config.end_think_token_ids.front();
+    for (int32_t offset = 0; offset < num_new_tokens; ++offset) {
+        if (token_ptr[offset] == close_token_id) {
+            // The close token itself is reasoning. The next token, including a
+            // textual delimiter tail, is the first content-logprob position.
+            return offset + 1;
+        }
+    }
+    return num_new_tokens;
+}
+
 int GenerateStream::currentExecuteTokenSize() {
     return currentExecuteTokens(0).size() * currentBatchSize();
 }
@@ -1176,6 +1258,7 @@ StreamState GenerateStream::moveToNext() {
     // taking mutex_ would deadlock with specUpdate().
     // The error transition skips reservation and defers KV release to the last worker.
     if (needsAsyncBookkeepingJoinForKvReservation() && !hasEvent(StreamEvents::Error)) {
+        RTP_LLM_PROFILE_SCOPE("stream.move_to_next(wait_async_bookkeeping_for_kv)");
         waitPendingAsyncBookkeeping();
     }
 
@@ -1291,6 +1374,9 @@ bool GenerateStream::needsAsyncBookkeepingJoinForKvReservation() const {
     if (!hasMtpCacheSnapshot(state) || state.next_seq_len_upper_bound <= 0 || stream_cache_resource_ == nullptr) {
         return true;
     }
+    if (canReserveMtpCacheWithoutBookkeepingJoin(state)) {
+        return false;
+    }
 
     // Reading group vector sizes is safe while specUpdate only swaps existing
     // elements.  No allocator mutation can run concurrently: scheduler calls
@@ -1314,6 +1400,200 @@ void GenerateStream::clearPPInflight() {
 
 bool GenerateStream::isPPInflight() const {
     return pp_inflight_.load(std::memory_order_acquire) != 0;
+}
+
+bool GenerateStream::canReserveMtpCacheWithoutBookkeepingJoin(const MtpAsyncDeviceState& state) const {
+    if (!state.allow_async_cache_reservation || state.max_mtp_advance <= 0 || state.next_seq_len_upper_bound <= 0
+        || !hasMtpCacheSnapshot(state) || !stream_cache_resource_ || maxBatchSize() != 1 || hasNumBeams()) {
+        return false;
+    }
+    const auto& manager = stream_cache_resource_->resourceContext().cache_manager;
+    if (!manager || (manager->cpSlotMapper() && manager->cpSlotMapper()->isSharded())) {
+        return false;
+    }
+    for (const auto& group : manager->cacheConfig().topology().groups()) {
+        if (group.policy.group_type == CacheGroupType::LINEAR) {
+            return false;
+        }
+        if (group.policy.group_type != CacheGroupType::SWA) {
+            continue;
+        }
+        const int64_t block_tokens   = group.seqSizePerBlock();
+        const int64_t retained_pages = std::max(1u, group.policy.active_tail_blocks) + reserve_step_;
+        // pre-sampler joins the preceding host commit before another dispatch.
+        // Thus the oldest unfinished KV consumer is at most two MTP advances
+        // behind this bound. Account for window, forward reservation, and page
+        // alignment; pruning beyond this retained tail cannot touch its pages.
+        // A state-cache group without a declared window conservatively needs a
+        // whole logical page. Keep the allocator's existing retention policy.
+        const int64_t history_tokens =
+            group.policy.sliding_window_size > 0 ? group.policy.sliding_window_size : block_tokens;
+        if (block_tokens <= 0 || retained_pages < 2
+            || (retained_pages - 1) * block_tokens < history_tokens + 2LL * state.max_mtp_advance + reserve_step_ + 2) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool GenerateStream::replaceMtpCacheSnapshot(uint64_t                   expected_epoch,
+                                             torch::Tensor              physical,
+                                             torch::Tensor              kernel,
+                                             std::vector<torch::Tensor> host_buffers,
+                                             bool                       upload_pending) {
+    std::lock_guard<std::mutex> lock(*mtp_async_state_mutex_);
+    if (mtp_async_state_.epoch != expected_epoch) {
+        return false;
+    }
+    mtp_async_state_.next_kv_cache_block_id_gpu        = std::move(physical);
+    mtp_async_state_.next_kv_cache_kernel_block_id_gpu = std::move(kernel);
+    mtp_async_state_.cache_snapshot_host_buffers       = std::move(host_buffers);
+    mtp_async_state_.cache_snapshot_upload_pending     = upload_pending;
+    return true;
+}
+
+absl::Status GenerateStream::reserveMtpCacheFromUpperBound(const MtpAsyncDeviceState& state) {
+    RTP_LLM_PROFILE_SCOPE("stream.reserve_mtp_cache_from_upper_bound");
+    auto status = stream_cache_resource_->incrKVBlock(state.next_seq_len_upper_bound);
+    if (!status.ok()) {
+        return status;
+    }
+    const auto& resource       = stream_cache_resource_->kvCache();
+    const auto& tags           = stream_cache_resource_->resourceContext().cache_manager->cacheConfig().groupTags();
+    int64_t     physical_width = 0;
+    int64_t     kernel_width   = 0;
+    for (const auto& tag : tags) {
+        physical_width = std::max(physical_width, static_cast<int64_t>(resource.blocks(0, tag).size()));
+        kernel_width   = std::max(kernel_width, static_cast<int64_t>(resource.kernelBlocks(0, tag).size()));
+    }
+    const auto pinned_i32     = torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true);
+    const auto group_count    = static_cast<int64_t>(tags.size());
+    const auto physical_count = group_count * physical_width;
+    // One immutable allocation and upload; the two views retain independent
+    // widths and values (physical and kernel IDs need not be identical).
+    auto host          = torch::zeros({physical_count + group_count * kernel_width}, pinned_i32);
+    auto physical_host = host.narrow(0, 0, physical_count).view({group_count, 1, physical_width});
+    auto kernel_host = host.narrow(0, physical_count, group_count * kernel_width).view({group_count, 1, kernel_width});
+    for (size_t row = 0; row < tags.size(); ++row) {
+        const auto& physical = resource.blocks(0, tags[row]);
+        const auto& kernel   = resource.kernelBlocks(0, tags[row]);
+        std::copy(physical.begin(), physical.end(), physical_host.data_ptr<int32_t>() + row * physical_width);
+        std::copy(kernel.begin(), kernel.end(), kernel_host.data_ptr<int32_t>() + row * kernel_width);
+    }
+    // Both views own the shared storage through the published snapshot.
+    torch::Tensor physical;
+    torch::Tensor kernel;
+    const bool    same_device =
+        state.next_kv_cache_block_id_gpu.device() == state.next_kv_cache_kernel_block_id_gpu.device();
+    if (state.batch_cache_snapshot_upload && same_device) {
+        RTP_LLM_CHECK_WITH_INFO(replaceMtpCacheSnapshot(state.epoch,
+                                                        state.next_kv_cache_block_id_gpu,
+                                                        state.next_kv_cache_kernel_block_id_gpu,
+                                                        {std::move(physical_host), std::move(kernel_host)},
+                                                        /*upload_pending=*/true),
+                                "MTP cache reservation raced another state publication");
+        return absl::OkStatus();
+    }
+    if (same_device) {
+        auto device = host.to(state.next_kv_cache_block_id_gpu.options(), /*non_blocking=*/true);
+        physical    = device.narrow(0, 0, physical_count).view_as(physical_host);
+        kernel      = device.narrow(0, physical_count, group_count * kernel_width).view_as(kernel_host);
+    } else {
+        physical = physical_host.to(state.next_kv_cache_block_id_gpu.options(), /*non_blocking=*/true);
+        kernel   = kernel_host.to(state.next_kv_cache_kernel_block_id_gpu.options(), /*non_blocking=*/true);
+    }
+    RTP_LLM_CHECK_WITH_INFO(
+        replaceMtpCacheSnapshot(
+            state.epoch, std::move(physical), std::move(kernel), {std::move(physical_host), std::move(kernel_host)}),
+        "MTP cache reservation raced another state publication");
+    return absl::OkStatus();
+}
+
+void GenerateStream::flushMtpCacheSnapshotUploads(const std::list<std::shared_ptr<GenerateStream>>& streams,
+                                                  std::optional<torch::Stream>                      upload_stream) {
+    RTP_LLM_PROFILE_SCOPE("mtp.flush_cache_snapshot_uploads");
+    (void)upload_stream;  // Non-CUDA builds keep the caller-stream copy.
+    struct Upload {
+        std::shared_ptr<GenerateStream> stream;
+        MtpAsyncDeviceState             state;
+    };
+    std::map<int, std::vector<Upload>> batches;
+    for (const auto& stream : streams) {
+        auto state = stream->getMtpAsyncDeviceState();
+        if (state.cache_snapshot_upload_pending) {
+            RTP_LLM_CHECK_WITH_INFO(hasMtpCacheSnapshot(state) && state.cache_snapshot_host_buffers.size() == 2,
+                                    "pending MTP snapshot requires a valid device pair and two host views");
+            batches[state.next_kv_cache_block_id_gpu.get_device()].push_back({stream, std::move(state)});
+        }
+    }
+    for (const auto& [device, batch] : batches) {
+        (void)device;
+        int64_t total = 0;
+        for (const auto& upload : batch) {
+            for (const auto& tensor : upload.state.cache_snapshot_host_buffers) {
+                RTP_LLM_CHECK_WITH_INFO(tensor.device().is_cpu() && tensor.scalar_type() == torch::kInt32
+                                            && tensor.dim() == 3 && tensor.is_contiguous(),
+                                        "pending MTP snapshot must be contiguous host int32 [group,1,blocks]");
+                total += tensor.numel();
+            }
+        }
+        auto    host   = torch::empty({total}, torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true));
+        int64_t offset = 0;
+        for (const auto& upload : batch) {
+            for (const auto& tensor : upload.state.cache_snapshot_host_buffers) {
+                if (tensor.numel()) {
+                    std::memcpy(host.data_ptr<int32_t>() + offset,
+                                tensor.data_ptr<int32_t>(),
+                                tensor.numel() * sizeof(int32_t));
+                }
+                offset += tensor.numel();
+            }
+        }
+        const auto    options = batch.front().state.next_kv_cache_block_id_gpu.options();
+        torch::Tensor gpu;
+#if USING_CUDA
+        if (options.device().is_cuda() && upload_stream && upload_stream->device_type() == c10::DeviceType::CUDA
+            && upload_stream->device_index() == device) {
+            const c10::cuda::CUDAGuard device_guard(options.device());
+            const auto                 current = c10::cuda::getCurrentCUDAStream(device);
+            cudaStreamCaptureStatus    capture_status;
+            C10_CUDA_CHECK(cudaStreamIsCapturing(current.stream(), &capture_status));
+            const auto copy = c10::cuda::CUDAStream(*upload_stream);
+            if (capture_status == cudaStreamCaptureStatusNone && copy != current) {
+                at::cuda::CUDAEvent uploaded;
+                {
+                    const c10::cuda::CUDAStreamGuard stream_guard(copy);
+                    gpu = host.to(options, /*non_blocking=*/true);
+                    uploaded.record(copy);
+                }
+                // The immutable host snapshot has no dependency on the preceding
+                // model round. Preserve caller-stream readiness before publishing.
+                uploaded.block(current);
+                c10::cuda::CUDACachingAllocator::recordStream(gpu.storage().data_ptr(), current);
+            } else {
+                gpu = host.to(options, /*non_blocking=*/true);
+            }
+        } else
+#endif
+        {
+            gpu = host.to(options, /*non_blocking=*/true);
+        }
+        offset = 0;
+        for (const auto& upload : batch) {
+            const auto& physical = upload.state.cache_snapshot_host_buffers[0];
+            const auto& kernel   = upload.state.cache_snapshot_host_buffers[1];
+            const auto  count    = physical.numel() + kernel.numel();
+            RTP_LLM_CHECK_WITH_INFO(
+                upload.stream->replaceMtpCacheSnapshot(
+                    upload.state.epoch,
+                    gpu.narrow(0, offset, physical.numel()).view(physical.sizes()),
+                    gpu.narrow(0, offset + physical.numel(), kernel.numel()).view(kernel.sizes()),
+                    {host.narrow(0, offset, physical.numel()).view(physical.sizes()),
+                     host.narrow(0, offset + physical.numel(), kernel.numel()).view(kernel.sizes())}),
+                "batched MTP upload raced another state publication");
+            offset += count;
+        }
+    }
 }
 
 bool GenerateStream::hasError() const {
@@ -1506,8 +1786,9 @@ void GenerateStream::specUpdate(const StreamSpecUpdateInfo& update_info,
         const_cast<torch::Tensor&>(new_tokens).zero_();
     }
 
-    auto num_new_tokens = update_info.num_new_tokens;
-    int  cur_cached_len = seqLength() - 1;
+    const int old_seq_length = seqLength();
+    auto      num_new_tokens = update_info.num_new_tokens;
+    int       cur_cached_len = seqLength() - 1;
 
     int error_token_id = 0;
     if (!complete_token_ids_->update(new_tokens,
@@ -1524,6 +1805,7 @@ void GenerateStream::specUpdate(const StreamSpecUpdateInfo& update_info,
                                    + " out of vocab size: " + std::to_string(vocab_size_));
         return;
     }
+    num_new_tokens = std::max(0, seqLength() - old_seq_length);
 
     int nxt_cached_len   = seqLength() - 1;
     int accept_token_num = nxt_cached_len - cur_cached_len;
@@ -1552,6 +1834,17 @@ void GenerateStream::specUpdate(const StreamSpecUpdateInfo& update_info,
     if (update_info.speculative_propose_step > 0) {
         sp_iter_count_++;
         speculative_proposed_draft_tokens_ += update_info.speculative_propose_step;
+        // Match the A/R publication point exactly: stale/error updates above
+        // contribute neither numerator nor denominator. Unknown is sticky.
+        if (speculative_verified_draft_tokens_ >= 0) {
+            const auto verified = update_info.verified_draft_tokens;
+            if (verified < 0 || verified > update_info.speculative_propose_step
+                || speculative_verified_draft_tokens_ > std::numeric_limits<int64_t>::max() - verified) {
+                speculative_verified_draft_tokens_ = -1;
+            } else {
+                speculative_verified_draft_tokens_ += verified;
+            }
+        }
         speculative_accepted_tokens_per_pos_.resize(update_info.speculative_propose_step, 0);
         const int accepted_draft_tokens =
             std::clamp(update_info.accepted_draft_tokens, 0, update_info.speculative_propose_step);
@@ -1560,6 +1853,7 @@ void GenerateStream::specUpdate(const StreamSpecUpdateInfo& update_info,
         }
     }
 
+    if (num_new_tokens > 0) {
     // update speculative output buffer
     const auto draft_count = update_info.draft_tokens.defined() ? update_info.draft_tokens.numel() : 0;
     RTP_LLM_CHECK_WITH_INFO(sp_output_buffer_ && sp_output_buffer_->tokens.defined()
@@ -1615,24 +1909,39 @@ void GenerateStream::specUpdate(const StreamSpecUpdateInfo& update_info,
                           cur_cached_len + 1,
                           nxt_cached_len + 1);
     }
+    }
+
+    // CompleteTokenIds may truncate the speculative window at max-token or
+    // stop-word boundaries.  The logprob tensors contain only the content
+    // suffix, so truncate them by the committed portion after that suffix's
+    // packet-local offset rather than by the full token count.
+    const int32_t logprobs_offset         = std::min<int32_t>(update_info.logprobs_offset, num_new_tokens);
+    const int32_t committed_logprob_count = std::max<int32_t>(num_new_tokens - logprobs_offset, 0);
+    auto          narrow_logprobs         = [committed_logprob_count](const torch::Tensor& tensor) {
+        if (!tensor.defined()) {
+            return torch::Tensor();
+        }
+        RTP_LLM_CHECK(tensor.dim() >= 2);
+        RTP_LLM_CHECK(committed_logprob_count <= tensor.size(1));
+        return tensor.narrow(/*dim=*/1, /*start=*/0, committed_logprob_count);
+    };
+    auto token_logprobs        = narrow_logprobs(update_info.token_logprobs);
+    auto top_logprob_token_ids = narrow_logprobs(update_info.top_logprob_token_ids);
+    auto top_logprobs          = narrow_logprobs(update_info.top_logprobs);
 
     // update normal output buffer
-    updateOutput({new_tokens,
-                  num_new_tokens,
-                  torch::Tensor(),
-                  torch::Tensor(),
-                  torch::Tensor(),
-                  torch::Tensor(),
-                  torch::Tensor(),
-                  torch::Tensor(),
-                  torch::Tensor(),
-                  torch::Tensor(),
-                  update_info.update_remote_generate,
-                  update_info.force_update_info});
-    // Accepted tokens and both speculative cache swaps are now committed.
-    // The scheduler will reclaim history before its next allocation.
+    updateOutput({.new_tokens             = new_tokens,
+                  .num_new_tokens         = num_new_tokens,
+                  .update_remote_generate = update_info.update_remote_generate,
+                  .force_update_info      = update_info.force_update_info,
+                  .token_logprobs         = token_logprobs,
+                  .top_logprob_token_ids  = top_logprob_token_ids,
+                  .top_logprobs           = top_logprobs,
+                  .output_start_pos       = old_seq_length,
+                  .logprobs_offset        = logprobs_offset});
+    updateLogprobsContentStarted(old_seq_length);
+    // Accepted tokens and cache swaps are committed before history reclamation.
     stream_cache_resource_->reclaimLinearHistory(nxt_cached_len);
-
     // Freeze TTFT after output update while holding the stream lock; mirrors
     // update(). Later speculative steps re-freeze the same first-token value.
     if (timings && timing_count && seqLength() > inputLength()) {
@@ -1660,6 +1969,7 @@ void GenerateStream::updateWithoutLock(const StreamUpdateInfo& update_info,
         return;
     }
 
+    const int   old_seq_length      = seqLength();
     const auto& new_tokens          = update_info.new_tokens;
     auto        num_new_tokens      = update_info.num_new_tokens;
     const bool  prefill_only_update = num_new_tokens == 0 && generate_input_->generate_config->isPrefillOnly();
@@ -1701,7 +2011,34 @@ void GenerateStream::updateWithoutLock(const StreamUpdateInfo& update_info,
     }
 
     // TODO(xinfei.sxf) fix this (update_queue)
-    updateOutput(update_info);
+    // Preserve the pre-update sequence position. CompleteTokenIds::update may
+    // clamp requested tokens to maxTokenNum, and needFinish() may later trim a
+    // multi-token window at EOS/stop words.
+    updateOutput({update_info.new_tokens,
+                  update_info.num_new_tokens,
+                  update_info.hidden_states,
+                  update_info.logits,
+                  update_info.softmax_probs,
+                  update_info.cum_log_probs,
+                  update_info.all_probs,
+                  update_info.loss,
+                  update_info.src_batch_indices,
+                  update_info.all_hidden_states,
+                  update_info.update_remote_generate,
+                  update_info.force_update_info,
+                  update_info.prompt_logits,
+                  update_info.error_info,
+                  update_info.generation_prefill_cuda_graph_status,
+                  update_info.custom_output,
+                  update_info.token_logprobs,
+                  update_info.top_logprob_token_ids,
+                  update_info.top_logprobs,
+                  old_seq_length,
+                  update_info.logprobs_offset});
+
+    // needFinish(), called by updateOutput(), can trim this packet at EOS/stop
+    // words. Advance the cached phase only from tokens that were committed.
+    updateLogprobsContentStarted(old_seq_length);
 
     // Freeze TTFT after output trimming while holding the stream lock.
     if (timings && seqLength() > inputLength()) {
@@ -1768,6 +2105,16 @@ std::optional<ErrorInfo> GenerateStream::updateLogitProcessorStatus(const torch:
         }
     }
     return validateLogitsProcessorState();
+}
+
+bool GenerateStream::xgrammarUpdateTimedOut() const {
+    for (const auto& processor : sampling_state_.logits_processors) {
+        const auto* grammar = dynamic_cast<GrammarLogitsProcessor*>(processor.get());
+        if (grammar && grammar->updateTimedOut()) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void GenerateStream::updateLogitProcessorMultiSeqStatus(const torch::Tensor& src_batch_indices) {
@@ -1844,6 +2191,91 @@ void GenerateStream::setSoftmaxProbs(const torch::Tensor& softmax_probs,
     softmax_probs_.narrow(0, 0, currentBatchSize()).narrow(1, start_pos, num_probs).copy_(probs_cpu);
 }
 
+void GenerateStream::setLogProbs(const torch::Tensor& token_logprobs,
+                                 const torch::Tensor& top_logprob_token_ids,
+                                 const torch::Tensor& top_logprobs,
+                                 const torch::Tensor& src_batch_indices,
+                                 int                  start_pos) {
+    RTP_LLM_PROFILE_FUNCTION();
+    // D2H belongs at the batch executor/dispatcher boundary. Doing it here
+    // would serialize three blocking copies for every stream and every step.
+    RTP_LLM_CHECK(!token_logprobs.is_cuda());
+    RTP_LLM_CHECK(!top_logprob_token_ids.is_cuda());
+    RTP_LLM_CHECK(!top_logprobs.is_cuda());
+    RTP_LLM_CHECK(!src_batch_indices.defined() || !src_batch_indices.is_cuda());
+
+    auto token_logprobs_cpu = token_logprobs.contiguous();
+    auto top_token_ids_cpu  = top_logprob_token_ids.contiguous();
+    auto top_logprobs_cpu   = top_logprobs.contiguous();
+
+    RTP_LLM_CHECK(token_logprobs_cpu.dim() == 2);
+    RTP_LLM_CHECK(top_token_ids_cpu.dim() == 3);
+    RTP_LLM_CHECK(top_logprobs_cpu.dim() == 3);
+    RTP_LLM_CHECK(token_logprobs_cpu.scalar_type() == torch::kFloat32);
+    RTP_LLM_CHECK(top_token_ids_cpu.scalar_type() == torch::kInt32);
+    RTP_LLM_CHECK(top_logprobs_cpu.scalar_type() == torch::kFloat32);
+    RTP_LLM_CHECK(token_logprobs_cpu.size(0) == currentBatchSize());
+    RTP_LLM_CHECK(top_token_ids_cpu.size(0) == token_logprobs_cpu.size(0));
+    RTP_LLM_CHECK(top_logprobs_cpu.size(0) == token_logprobs_cpu.size(0));
+    RTP_LLM_CHECK(top_token_ids_cpu.size(1) == token_logprobs_cpu.size(1));
+    RTP_LLM_CHECK(top_logprobs_cpu.size(1) == token_logprobs_cpu.size(1));
+    const int64_t configured_top_logprobs =
+        std::min<int64_t>(std::max<int64_t>(generate_input_->generate_config->top_logprobs, 0), vocab_size_);
+    RTP_LLM_CHECK(top_token_ids_cpu.size(2) == configured_top_logprobs);
+    RTP_LLM_CHECK(top_logprobs_cpu.size(2) == configured_top_logprobs);
+    RTP_LLM_CHECK(start_pos >= inputLength());
+    RTP_LLM_CHECK_WITH_INFO(!hasNumBeams() && numReturnSequences() <= 1,
+                            "content logprob history only supports single-sequence generation");
+    RTP_LLM_CHECK(!src_batch_indices.defined());
+
+    const int64_t num_new_tokens           = token_logprobs_cpu.size(1);
+    const int64_t history_start_pos        = logprobs_history_size_;
+    const int64_t required_capacity        = history_start_pos + num_new_tokens;
+    const int64_t physical_output_capacity = std::max<int64_t>(max_seq_len_ - inputLength(), 0);
+    RTP_LLM_CHECK(required_capacity <= physical_output_capacity);
+
+    if (!token_logprobs_.defined()) {
+        const int64_t requested_output_capacity = std::min<int64_t>(
+            std::max<int64_t>(generate_input_->generate_config->max_new_tokens, 0), physical_output_capacity);
+        const int64_t initial_capacity = std::min<int64_t>(
+            physical_output_capacity,
+            std::max<int64_t>(required_capacity,
+                              std::min<int64_t>(requested_output_capacity, kInitialLogprobsHistoryCapacity)));
+        token_logprobs_        = torch::zeros({1, initial_capacity}, torch::kFloat32);
+        top_logprob_token_ids_ = torch::zeros({1, initial_capacity, configured_top_logprobs}, torch::kInt32);
+        top_logprobs_          = torch::zeros({1, initial_capacity, configured_top_logprobs}, torch::kFloat32);
+    }
+
+    RTP_LLM_CHECK(top_logprob_token_ids_.defined());
+    RTP_LLM_CHECK(top_logprobs_.defined());
+    // Once content starts, history grows geometrically in content-relative
+    // coordinates; reasoning tokens consume no slots.
+    if (required_capacity > token_logprobs_.size(1)) {
+        const int64_t old_capacity = token_logprobs_.size(1);
+        const int64_t new_capacity = std::min<int64_t>(
+            physical_output_capacity, std::max<int64_t>(required_capacity, std::max<int64_t>(old_capacity * 2, 1)));
+        auto new_token_logprobs = torch::zeros({token_logprobs_.size(0), new_capacity}, token_logprobs_.options());
+        auto new_top_logprob_token_ids =
+            torch::zeros({top_logprob_token_ids_.size(0), new_capacity, top_logprob_token_ids_.size(2)},
+                         top_logprob_token_ids_.options());
+        auto new_top_logprobs =
+            torch::zeros({top_logprobs_.size(0), new_capacity, top_logprobs_.size(2)}, top_logprobs_.options());
+        if (old_capacity > 0) {
+            new_token_logprobs.narrow(1, 0, old_capacity).copy_(token_logprobs_);
+            new_top_logprob_token_ids.narrow(1, 0, old_capacity).copy_(top_logprob_token_ids_);
+            new_top_logprobs.narrow(1, 0, old_capacity).copy_(top_logprobs_);
+        }
+        token_logprobs_        = std::move(new_token_logprobs);
+        top_logprob_token_ids_ = std::move(new_top_logprob_token_ids);
+        top_logprobs_          = std::move(new_top_logprobs);
+    }
+
+    token_logprobs_.narrow(1, history_start_pos, num_new_tokens).copy_(token_logprobs_cpu);
+    top_logprob_token_ids_.narrow(1, history_start_pos, num_new_tokens).copy_(top_token_ids_cpu);
+    top_logprobs_.narrow(1, history_start_pos, num_new_tokens).copy_(top_logprobs_cpu);
+    logprobs_history_size_ += num_new_tokens;
+}
+
 torch::Tensor GenerateStream::getLoss() {
     return loss_;
 }
@@ -1854,6 +2286,18 @@ torch::Tensor GenerateStream::getLastHiddenStates() const {
 
 torch::Tensor GenerateStream::getSoftmaxProbs() {
     return sampling_state_.softmax_probs;
+}
+
+torch::Tensor GenerateStream::getTokenLogProbs() const {
+    return token_logprobs_;
+}
+
+torch::Tensor GenerateStream::getTopLogprobTokenIds() const {
+    return top_logprob_token_ids_;
+}
+
+torch::Tensor GenerateStream::getTopLogProbs() const {
+    return top_logprobs_;
 }
 
 void GenerateStream::setMetricsReporter(kmonitor::MetricsReporterPtr metrics_reporter) {
@@ -1992,6 +2436,12 @@ void GenerateStream::CopyOnWrite(const GenerateStream& other_stream, bool copy_l
     grpc_normal_device_state_pending_ =
         std::make_shared<std::atomic<bool>>(other_stream.hasGrpcNormalDeviceStatePending());
     sampling_state_.cum_log_probs = other_stream.sampling_state_.cum_log_probs.clone();
+    token_logprobs_ = other_stream.token_logprobs_.defined() ? other_stream.token_logprobs_.clone() : torch::Tensor();
+    top_logprob_token_ids_ =
+        other_stream.top_logprob_token_ids_.defined() ? other_stream.top_logprob_token_ids_.clone() : torch::Tensor();
+    top_logprobs_ = other_stream.top_logprobs_.defined() ? other_stream.top_logprobs_.clone() : torch::Tensor();
+    logprobs_history_size_    = other_stream.logprobs_history_size_;
+    logprobs_content_started_ = std::make_shared<std::atomic<bool>>(other_stream.hasLogprobsContentStarted());
     if (other_stream.calculateLoss() && copy_loss) {
         loss_ = other_stream.loss_.clone();
     } else {

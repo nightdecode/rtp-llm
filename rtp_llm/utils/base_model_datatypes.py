@@ -144,6 +144,7 @@ class AuxInfo:
     first_token_cost_time: float = 0
     wait_time: float = 0
     pd_sep: bool = False
+    xgrammar_update_timeout: bool = False
     cum_log_probs: List[float] = field(default_factory=list)
     beam_responses: List[str] = field(default_factory=list)
     softmax_probs: List[float] = field(default_factory=list)
@@ -168,6 +169,7 @@ class AuxInfo:
 
     multimodal_lengths: Dict[int, int] = field(default_factory=dict)
     speculative_draft_rounds: int = 0
+    speculative_verified_draft_tokens: int = -1
     speculative_accepted_tokens_per_pos: List[int] = field(default_factory=list)
     generation_prefill_cuda_graph_status: str = (
         GENERATION_PREFILL_CUDA_GRAPH_STATUS_NOT_REQUESTED
@@ -191,6 +193,11 @@ class GenerateOutput:
     prompt_logits: Optional[Dict[str, Any]] = None
     # output of the deployment-registered post-layers CustomHandler
     custom_output: Optional[torch.Tensor] = None
+    token_logprobs: Optional[torch.Tensor] = None
+    top_logprob_token_ids: Optional[torch.Tensor] = None
+    top_logprobs: Optional[torch.Tensor] = None
+    logprobs_offset: Optional[int] = None
+    logprobs_count: Optional[int] = None
 
     class Config:
         arbitrary_types_allowed = True
