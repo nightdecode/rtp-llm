@@ -910,6 +910,34 @@ def reduce_scatter(input_tensor: torch.Tensor, group: Group) -> torch.Tensor:
     return output_tensor
 
 
+def all_to_all(input_tensor: torch.Tensor, group: Group) -> torch.Tensor:
+    """Exchange equal chunks of dim 0 with every rank in the group.
+
+    Chunk i of the input goes to rank i; chunk i of the output comes from
+    rank i. Used to trade one ownership axis for another -- the KDA
+    context-parallel prefill swaps token ownership for head ownership with
+    it (see KimiLinearKDAPrefill.forward_cp).
+
+    Args:
+        input_tensor: Tensor whose dim 0 is divisible by the group size
+        group: Process group to use
+
+    Returns:
+        A new tensor of the same shape, rank-major along dim 0
+    """
+    process_group = _get_group(group)
+    world_size = torch.distributed.get_world_size(process_group)
+    assert input_tensor.shape[0] % world_size == 0, (
+        f"all_to_all: input dim 0 ({input_tensor.shape[0]}) "
+        f"must be divisible by world_size ({world_size})"
+    )
+    output_tensor = torch.empty_like(input_tensor)
+    torch.distributed.all_to_all_single(
+        output_tensor, input_tensor.contiguous(), group=process_group
+    )
+    return output_tensor
+
+
 def barrier(group: Group) -> None:
     """Barrier all ranks in the group.
 
