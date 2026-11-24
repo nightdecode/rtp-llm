@@ -1,0 +1,87 @@
+id: fixed_window_batching
+name: FIXED_WINDOW 凑批约束
+describe:
+  S1-4：maxRequests 8 / maxCollectionWaitMs 300 下批大小不超上限、predict gap 有界。qps 54 压出深队列使凑批填满（上限 8），采集批大小分布与 predict gap 留证；批大小超 8 即异常。基线记录：batch_size
+  分布、predict gap p50/p99。
+environment:
+  master:
+    deployment:
+      replicas: 1
+    config: configs/master.yaml
+  prefill:
+    engine: rtp
+    deployment:
+      replicas: 1
+    config: configs/prefill.yaml
+  decode:
+    engine: rtp
+    deployment:
+      replicas: 1
+    config: configs/decode.yaml
+  frontend:
+    config:
+      seq_size_per_block: 128
+      prefill_cp_size: 4
+      image_token_id: 129264
+      cache_key_hash_seed: "4923373599811257905"
+phases:
+  - id: startup
+    describe: 确认唯一主 Master 并等待 Engine 发现传播。
+    timeout: 120s
+    steps:
+      - id: check_master_leader
+        describe: 只有一个主 Master。
+        interface: master/list/addresses
+        args:
+          is_leader: true
+        expect:
+          count: 1
+        wait_after: 10s
+  - id: traffic
+    describe: 高压打流填满批窗口。
+    timeout: 240s
+    steps:
+      - id: start_frontend
+        describe: qps 24 超过 22/s 排出能力，深队列下批批应填满到 8。
+        interface: frontend/start/playback
+        args:
+          requests_file: data/traffic/uniform-2k.mckidx
+          qps: 24
+          total_concurrency: 512
+          queue_capacity: 1024
+          request_timeout: 120s
+          drain_timeout: 90s
+        wait_after: 30s
+      - id: observe_batch_size
+        describe: 批大小 Gauge（按 reason 标签），峰值应不超过 8。
+        interface: prometheus/query
+        args:
+          promql: max_over_time(flexlb_app_engine_balancing_master_batch_size[30s])
+      - id: observe_predict_gap
+        describe: 批执行预测偏差留证。
+        interface: prometheus/query
+        args:
+          promql: flexlb_app_flexlb_batch_predict_gap_ms_seconds_count
+      - id: check_ttft_p95
+        describe: 深队列下 TTFT P95 仍有界。
+        interface: frontend/query/ttft
+        args:
+          range:
+            - -10s
+            - 0s
+          statistic: p95
+        expect:
+          lte: 20
+      - id: stop_frontend
+        describe: 停止播放并收齐已发请求终态。
+        interface: frontend/stop/playback
+        within: 120s
+      - id: check_total_success_rate
+        describe: 全程成功率不低于 95%。
+        interface: frontend/query/success_rate
+        args:
+          range:
+            - -150s
+            - 0s
+        expect:
+          gte: 0.95

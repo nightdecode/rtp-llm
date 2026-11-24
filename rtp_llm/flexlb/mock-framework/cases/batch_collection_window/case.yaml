@@ -1,0 +1,67 @@
+id: batch_collection_window
+name: 凑批窗口与 occupancy
+describe: 复现 Case 08 的机制。engine 单批执行时间配成恒定 360ms（模拟 L20B"批大批量小耗时相同"的特性），Master 用 500ms 凑批窗口、maxRequests 8；固定节奏流量下验证请求全部成功、吞吐达标，并记录 prefill 吞吐供窗口扫参对照。不同 maxCollectionWaitMs（150/300/500ms）的对照通过修改 master 配置重跑完成，比较各轮的 prefill tps 与 ttft。
+environment:
+  master:
+    config: configs/master.yaml
+  prefill:
+    engine: rtp
+    deployment:
+      replicas: 2
+    config: configs/prefill.yaml
+  decode:
+    engine: rtp
+    config: configs/decode.yaml
+  frontend:
+    config: {}
+phases:
+  - id: startup
+    describe: 确认唯一主 Master 并等待 Engine 发现传播。
+    timeout: 10s
+    steps:
+      - id: check_master_leader
+        describe: 只有一个主 Master。
+        interface: master/list/addresses
+        args: { is_leader: true }
+        expect: { count: 1 }
+        wait_after: 2s
+  - id: traffic
+    describe: 固定 8 qps 节奏打流，验证满批下的成功率与吞吐。
+    timeout: 90s
+    steps:
+      - id: start_frontend
+        describe: 固定节奏播放，并发预算覆盖凑批等待。
+        interface: frontend/start/playback
+        args:
+          requests_file: data/traffic/basic.mckidx
+          qps: 8
+          total_concurrency: 16
+          queue_capacity: 64
+          request_timeout: 30s
+          drain_timeout: 20s
+        wait_after: 15s
+      - id: check_frontend_qps
+        describe: 实际发出速率稳定在目标区间。
+        interface: frontend/query/qps
+        args: { range: [-10s, 0s] }
+        expect: { gte: 6.5, lte: 9.5 }
+      - id: observe_prefill_tps
+        describe: 记录 prefill 吞吐，供不同凑批窗口的对照轮比较（窗口越大批越满、tps 越高）。
+        interface: engine/query/prefill_tps
+        args: { range: [-10s, 0s] }
+      - id: check_ttft
+        describe: 满批时 TTFT P95 有上界。
+        interface: frontend/query/ttft
+        args:
+          range: [-10s, 0s]
+          statistic: p95
+        expect: { lte: 5s }
+      - id: stop_frontend
+        describe: 停止播放并收齐终态。
+        interface: frontend/stop/playback
+        within: 30s
+      - id: check_total_success_rate
+        describe: 打流窗口内成功率不低于 99%。
+        interface: frontend/query/success_rate
+        args: { range: [-60s, 0s] }
+        expect: { gte: 0.99 }

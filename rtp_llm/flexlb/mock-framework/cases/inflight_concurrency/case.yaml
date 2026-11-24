@@ -1,0 +1,93 @@
+id: inflight_concurrency
+name: 慢 ACK 并发不退化
+describe: F1.4：maxInflightPerPrefillWorker=3 + 全体批 ACK 扣 1s，高压下单 worker 在途批数顶到 3 且不越界，证明 RPC 并发真重叠而非串行退化。真机吞吐上界 Q≈B×K/L。
+environment:
+  master:
+    deployment:
+      replicas: 1
+    config: configs/master.yaml
+  prefill:
+    engine: rtp
+    deployment:
+      replicas: 1
+    config: configs/prefill.yaml
+  decode:
+    engine: rtp
+    deployment:
+      replicas: 1
+    config: configs/decode.yaml
+  frontend:
+    config:
+      seq_size_per_block: 128
+      prefill_cp_size: 4
+      image_token_id: 129264
+      cache_key_hash_seed: "4923373599811257905"
+phases:
+  - id: startup
+    describe: 确认唯一主 Master 并等待 Engine 发现传播。
+    timeout: 120s
+    steps:
+      - id: check_master_leader
+        describe: 只有一个主 Master。
+        interface: master/list/addresses
+        args:
+          is_leader: true
+        expect:
+          count: 1
+        wait_after: 10s
+  - id: concurrency
+    describe: 慢 ACK 并发批验证。
+    timeout: 300s
+    steps:
+      - id: start_frontend
+        describe: qps 20 压满：批 ACK 扣 1s、单 worker 在途上限 3，验证并发批真重叠。
+        interface: frontend/start/playback
+        args:
+          requests_file: data/traffic/uniform-2k.mckidx
+          qps: 20
+          total_concurrency: 64
+          queue_capacity: 256
+          request_timeout: 60s
+          drain_timeout: 60s
+        wait_after: 30s
+      - id: check_inflight_reaches_k
+        describe: 慢 ACK 下单 worker 在途批数必须达到上限 3（并发不退化）。
+        interface: prometheus/query_scalar
+        args:
+          promql: max(max_over_time(flexlb_app_flexlb_inflight_batch_count[30s]))
+        expect:
+          gte: 3
+      - id: check_inflight_not_exceed_k
+        describe: 在途批数不突破上限 3（上限生效）。
+        interface: prometheus/query_scalar
+        args:
+          promql: max(max_over_time(flexlb_app_flexlb_inflight_batch_count[30s]))
+        expect:
+          lte: 3
+      - id: evidence_batch_size
+        describe: 批大小分布留证。
+        interface: prometheus/query
+        args:
+          promql: flexlb_app_engine_balancing_master_batch_size
+      - id: check_success_saturated
+        describe: 饱和打流窗口成功率 ≥80%（排队有界）。
+        interface: frontend/query/success_rate
+        args:
+          range:
+            - -30s
+            - 0s
+        expect:
+          gte: 0.8
+      - id: stop_frontend
+        describe: 停止播放并收齐已发请求终态。
+        interface: frontend/stop/playback
+        within: 240s
+      - id: check_total_success_rate
+        describe: 全程成功率 ≥80%。
+        interface: frontend/query/success_rate
+        args:
+          range:
+            - -120s
+            - 0s
+        expect:
+          gte: 0.8

@@ -1,0 +1,81 @@
+id: inflight_limit_k4
+name: inflight 上限 K=4
+describe:
+  S2-2：验证吞吐上限 ≈ 批大小 × K ÷ 单批耗时（K=maxInflightPerPrefillWorker=4）。prefill 1 台恒定 360ms/批，qps 30 拉满使批批填满 8；校验 prefill_tps 触及派发流水上限，采集 inflight_batch_count
+  峰值（应 ≤ K）留证。K=1/2/4 三轮各为一个独立 case（master 配置不同无法同 case 内切换），基线记录：K × 吞吐曲线应接近线性直至 engine 单批串行上限 2.78 批/s。
+environment:
+  master:
+    deployment:
+      replicas: 1
+    config: configs/master.yaml
+  prefill:
+    engine: rtp
+    deployment:
+      replicas: 1
+    config: configs/prefill.yaml
+  decode:
+    engine: rtp
+    deployment:
+      replicas: 1
+    config: configs/decode.yaml
+  frontend:
+    config:
+      seq_size_per_block: 128
+      prefill_cp_size: 4
+      image_token_id: 129264
+      cache_key_hash_seed: "4923373599811257905"
+phases:
+  - id: startup
+    describe: 确认唯一主 Master 并等待 Engine 发现传播。
+    timeout: 120s
+    steps:
+      - id: check_master_leader
+        describe: 只有一个主 Master。
+        interface: master/list/addresses
+        args:
+          is_leader: true
+        expect:
+          count: 1
+        wait_after: 10s
+  - id: traffic
+    describe: 拉满打流并观测吞吐上限。
+    timeout: 240s
+    steps:
+      - id: start_frontend
+        describe: qps 16 超过 11/s 排出能力，使批大小稳定为 4。
+        interface: frontend/start/playback
+        args:
+          requests_file: data/traffic/uniform-2k.mckidx
+          qps: 16
+          total_concurrency: 256
+          queue_capacity: 512
+          request_timeout: 120s
+          drain_timeout: 60s
+        wait_after: 30s
+      - id: check_prefill_tps
+        describe: prefill 吞吐触及理论下限（约 2.78 批/s × 4 请求 × 2048 token ≈ 22.7k/s）。
+        interface: engine/query/prefill_tps
+        args:
+          range:
+            - -10s
+            - 0s
+        expect:
+          gte: 15000
+      - id: observe_inflight_batch
+        describe: 在途批数峰值不应超过 K=4（留证）。
+        interface: prometheus/query
+        args:
+          promql: max_over_time(flexlb_app_flexlb_inflight_batch_count[30s])
+      - id: stop_frontend
+        describe: 停止播放并收齐已发请求终态。
+        interface: frontend/stop/playback
+        within: 90s
+      - id: check_total_success_rate
+        describe: 全程成功率不低于 95%。
+        interface: frontend/query/success_rate
+        args:
+          range:
+            - -120s
+            - 0s
+        expect:
+          gte: 0.95

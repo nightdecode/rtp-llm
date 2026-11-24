@@ -1,0 +1,130 @@
+id: batch_rt_cap
+name: 凑批 RT 上限
+describe: F3.2 降级版：engine 执行耗时 = 10ms×batchSize（批越大越慢），master 凑批窗口 300ms 封顶；qps 6/12/18 三档下 TTFT p99 均有上界。逐批 RT 核对待 GAP-M1。
+environment:
+  master:
+    deployment:
+      replicas: 1
+    config: configs/master.yaml
+  prefill:
+    engine: rtp
+    deployment:
+      replicas: 1
+    config: configs/prefill.yaml
+  decode:
+    engine: rtp
+    deployment:
+      replicas: 1
+    config: configs/decode.yaml
+  frontend:
+    config:
+      seq_size_per_block: 128
+      prefill_cp_size: 4
+      image_token_id: 129264
+      cache_key_hash_seed: "4923373599811257905"
+phases:
+  - id: startup
+    describe: 确认唯一主 Master 并等待 Engine 发现传播。
+    timeout: 120s
+    steps:
+      - id: check_master_leader
+        describe: 只有一个主 Master。
+        interface: master/list/addresses
+        args:
+          is_leader: true
+        expect:
+          count: 1
+        wait_after: 10s
+  - id: ladder
+    describe: 三档加压测 TTFT 上界。
+    timeout: 600s
+    steps:
+      - id: start_low
+        describe: qps 6 档位打 20s。
+        interface: frontend/start/playback
+        args:
+          requests_file: data/traffic/uniform-2k.mckidx
+          qps: 6
+          total_concurrency: 64
+          queue_capacity: 128
+          request_timeout: 60s
+          drain_timeout: 60s
+        wait_after: 20s
+      - id: check_ttft_low
+        describe: qps 6 下 TTFT p99 ≤1500ms（凑批 RT 上限约束首 token）。
+        interface: frontend/query/ttft
+        args:
+          range:
+            - -15s
+            - 0s
+          statistic: p99
+        expect:
+          lte: 1500
+      - id: stop_low
+        describe: 停止当前档位。
+        interface: frontend/stop/playback
+        within: 240s
+      - id: start_mid
+        describe: qps 12 档位打 20s。
+        interface: frontend/start/playback
+        args:
+          requests_file: data/traffic/uniform-2k.mckidx
+          qps: 12
+          total_concurrency: 64
+          queue_capacity: 128
+          request_timeout: 60s
+          drain_timeout: 60s
+        wait_after: 20s
+      - id: check_ttft_mid
+        describe: qps 12 下 TTFT p99 ≤1500ms（凑批 RT 上限约束首 token）。
+        interface: frontend/query/ttft
+        args:
+          range:
+            - -15s
+            - 0s
+          statistic: p99
+        expect:
+          lte: 1500
+      - id: stop_mid
+        describe: 停止当前档位。
+        interface: frontend/stop/playback
+        within: 240s
+      - id: start_high
+        describe: qps 18 档位打 20s。
+        interface: frontend/start/playback
+        args:
+          requests_file: data/traffic/uniform-2k.mckidx
+          qps: 18
+          total_concurrency: 64
+          queue_capacity: 128
+          request_timeout: 60s
+          drain_timeout: 60s
+        wait_after: 20s
+      - id: check_ttft_high
+        describe: qps 18 下 TTFT p99 ≤2000ms（凑批 RT 上限约束首 token）。
+        interface: frontend/query/ttft
+        args:
+          range:
+            - -15s
+            - 0s
+          statistic: p99
+        expect:
+          lte: 2000
+      - id: stop_high
+        describe: 停止当前档位。
+        interface: frontend/stop/playback
+        within: 240s
+      - id: evidence_batch_size
+        describe: 各档批大小分布留证。
+        interface: prometheus/query
+        args:
+          promql: flexlb_app_engine_balancing_master_batch_size
+      - id: check_total_success_rate
+        describe: 全程成功率 ≥99%。
+        interface: frontend/query/success_rate
+        args:
+          range:
+            - -300s
+            - 0s
+        expect:
+          gte: 0.99

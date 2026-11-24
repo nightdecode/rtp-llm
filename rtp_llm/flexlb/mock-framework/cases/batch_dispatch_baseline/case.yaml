@@ -1,0 +1,86 @@
+id: batch_dispatch_baseline
+name: BATCH 派发基线
+describe:
+  S2-1：BATCH 派发稳态基线。prefill 2 台恒定 360ms/批、inflight 2，理论上限每 worker 约 2.78 批/s。校验 prefill 吞吐达理论下限，采集 dispatch_ack 耗时与 inflight 批数水位留证。基线记录：dispatch_ack
+  p50/p99、inflight_batch 均值/峰值、prefill tps。
+environment:
+  master:
+    deployment:
+      replicas: 1
+    config: configs/master.yaml
+  prefill:
+    engine: rtp
+    deployment:
+      replicas: 2
+    config: configs/prefill.yaml
+  decode:
+    engine: rtp
+    deployment:
+      replicas: 1
+    config: configs/decode.yaml
+  frontend:
+    config:
+      seq_size_per_block: 128
+      prefill_cp_size: 4
+      image_token_id: 129264
+      cache_key_hash_seed: "4923373599811257905"
+phases:
+  - id: startup
+    describe: 确认唯一主 Master 并等待 Engine 发现传播。
+    timeout: 120s
+    steps:
+      - id: check_master_leader
+        describe: 只有一个主 Master。
+        interface: master/list/addresses
+        args:
+          is_leader: true
+        expect:
+          count: 1
+        wait_after: 10s
+  - id: traffic
+    describe: 稳态打流并采集派发指标。
+    timeout: 180s
+    steps:
+      - id: start_frontend
+        describe: qps 8 稳态打流 30s。
+        interface: frontend/start/playback
+        args:
+          requests_file: data/traffic/uniform-2k.mckidx
+          qps: 8
+          total_concurrency: 32
+          queue_capacity: 64
+          request_timeout: 30s
+          drain_timeout: 30s
+        wait_after: 30s
+      - id: check_prefill_tps
+        describe: prefill 吞吐达到稳态下限（uniform-2k：2 台 × 2.78 批/s × 批均请求 × 2048 token）。
+        interface: engine/query/prefill_tps
+        args:
+          range:
+            - -10s
+            - 0s
+        expect:
+          gte: 15000
+      - id: observe_dispatch_ack
+        describe: 派发 ACK 耗时计时器留证。
+        interface: prometheus/query
+        args:
+          promql: flexlb_app_flexlb_dispatch_ack_time_ms_seconds_count
+      - id: observe_inflight_batch
+        describe: 每 worker 在途批数（应不超过 2）。
+        interface: prometheus/query
+        args:
+          promql: flexlb_app_flexlb_inflight_batch_count
+      - id: stop_frontend
+        describe: 停止播放并收齐已发请求终态。
+        interface: frontend/stop/playback
+        within: 190s
+      - id: check_total_success_rate
+        describe: 全程成功率不低于 99%。
+        interface: frontend/query/success_rate
+        args:
+          range:
+            - -90s
+            - 0s
+        expect:
+          gte: 0.99

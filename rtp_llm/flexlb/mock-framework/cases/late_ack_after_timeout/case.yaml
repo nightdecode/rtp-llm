@@ -1,0 +1,100 @@
+id: late_ack_after_timeout
+name: 迟到 ACK 不翻案
+describe: F1.3 降级版：mock.rpc.enqueue.ack.delay.ms=2000 > fetchAttachTimeoutMs=300，请求全部以附着超时终结；迟到 ACK 到达后成功率不翻案、每请求终态唯一、无悬挂。ACK_SUPPRESSED 事件待 GAP-F1。
+environment:
+  master:
+    deployment:
+      replicas: 1
+    config: configs/master.yaml
+  prefill:
+    engine: rtp
+    deployment:
+      replicas: 1
+    config: configs/prefill.yaml
+  decode:
+    engine: rtp
+    deployment:
+      replicas: 1
+    config: configs/decode.yaml
+  frontend:
+    config:
+      seq_size_per_block: 128
+      prefill_cp_size: 4
+      image_token_id: 129264
+      cache_key_hash_seed: "4923373599811257905"
+phases:
+  - id: startup
+    describe: 确认唯一主 Master 并等待 Engine 发现传播。
+    timeout: 120s
+    steps:
+      - id: check_master_leader
+        describe: 只有一个主 Master。
+        interface: master/list/addresses
+        args:
+          is_leader: true
+        expect:
+          count: 1
+        wait_after: 10s
+  - id: timeout
+    describe: 扣到超时并验证不翻案。
+    timeout: 240s
+    steps:
+      - id: start_frontend
+        describe: qps 4 打 25s；批 ACK 被扣 2s，超过 300ms 附着窗口。
+        interface: frontend/start/playback
+        args:
+          requests_file: data/traffic/uniform-2k-small.mckidx
+          qps: 4
+          total_concurrency: 16
+          queue_capacity: 32
+          request_timeout: 30s
+          drain_timeout: 60s
+        wait_after: 25s
+      - id: stop_frontend
+        describe: 停止播放并收齐已发请求终态。
+        interface: frontend/stop/playback
+        within: 190s
+      - id: check_timeout_outcome
+        describe: 附着超时：成功率接近 0。
+        interface: frontend/query/success_rate
+        args:
+          range:
+            - -90s
+            - 0s
+        expect:
+          lte: 0.05
+      - id: count_issued
+        describe: 发出的请求总数。
+        interface: frontend/query/playback_requests
+        args:
+          kind: ISSUED
+      - id: check_terminal_unique
+        describe: 每请求恰好一个终态（唯一终态，无双重结算）。
+        interface: frontend/query/playback_requests
+        args:
+          kind: TERMINAL
+        expect:
+          eq:
+            ref: steps.count_issued
+      - id: evidence_success_outcome
+        describe: 成功终态数（应为 0 量级，留证）。
+        interface: frontend/query/playback_requests
+        args:
+          kind: TERMINAL
+          field: outcome
+          equals: success
+      - id: check_no_flip_after_late_ack
+        describe: 等待 3s 让全部迟到 ACK 到达后再测：成功率仍接近 0（迟到 ACK 不改判）。
+        interface: frontend/query/success_rate
+        args:
+          range:
+            - -90s
+            - 0s
+        expect:
+          lte: 0.05
+        wait_after: 3s
+      - id: evidence_inflight
+        describe: 在途请求应清零（无悬挂）。
+        interface: prometheus/query
+        args:
+          promql: flexlb_app_flexlb_inflight_request_count

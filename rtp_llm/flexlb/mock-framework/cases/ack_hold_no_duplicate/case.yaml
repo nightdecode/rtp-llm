@@ -1,0 +1,101 @@
+id: ack_hold_no_duplicate
+name: 接受后扣 ACK
+describe:
+  F1.2 降级版：mock.rpc.enqueue.ack.delay.ms=1000 静态扣留全体批 ACK 1s（自动释放），验证 Master 不重复派发（engine 执行数 ≤ 发出数）、在途批数不越上限、请求最终全成功。按集合扣留/择机释放待 GAP-F1
+  运行期注入。
+environment:
+  master:
+    deployment:
+      replicas: 1
+    config: configs/master.yaml
+  prefill:
+    engine: rtp
+    deployment:
+      replicas: 1
+    config: configs/prefill.yaml
+  decode:
+    engine: rtp
+    deployment:
+      replicas: 1
+    config: configs/decode.yaml
+  frontend:
+    config:
+      seq_size_per_block: 128
+      prefill_cp_size: 4
+      image_token_id: 129264
+      cache_key_hash_seed: "4923373599811257905"
+phases:
+  - id: startup
+    describe: 确认唯一主 Master 并等待 Engine 发现传播。
+    timeout: 120s
+    steps:
+      - id: check_master_leader
+        describe: 只有一个主 Master。
+        interface: master/list/addresses
+        args:
+          is_leader: true
+        expect:
+          count: 1
+        wait_after: 10s
+  - id: hold
+    describe: 扣 ACK 打流并核对。
+    timeout: 240s
+    steps:
+      - id: start_frontend
+        describe: qps 4 打 35s；所有批 ACK 被静态扣留 1s。
+        interface: frontend/start/playback
+        args:
+          requests_file: data/traffic/uniform-2k-small.mckidx
+          qps: 4
+          total_concurrency: 16
+          queue_capacity: 32
+          request_timeout: 30s
+          drain_timeout: 60s
+        wait_after: 35s
+      - id: check_inflight_bounded
+        describe: 慢 ACK 期间单 worker 在途批数不超过上限 2（不无限积压）。
+        interface: prometheus/query_scalar
+        args:
+          promql: max(max_over_time(flexlb_app_flexlb_inflight_batch_count[30s]))
+        expect:
+          lte: 2
+      - id: evidence_queue
+        describe: 扣 ACK 期间排队深度留证。
+        interface: prometheus/query
+        args:
+          promql: sum(flexlb_app_flexlb_batcher_queue_size)
+      - id: stop_frontend
+        describe: 停止播放并收齐已发请求终态。
+        interface: frontend/stop/playback
+        within: 190s
+      - id: check_success_rate
+        describe: 迟到 ACK 释放后请求全部成功。
+        interface: frontend/query/success_rate
+        args:
+          range:
+            - -90s
+            - 0s
+        expect:
+          gte: 0.99
+      - id: count_issued
+        describe: 发出的请求总数。
+        interface: frontend/query/playback_requests
+        args:
+          kind: ISSUED
+      - id: check_no_duplicate_dispatch
+        describe: engine 实际执行数 ÷1.05（抹平 increase 插值误差）不得超过前端发出数（不重复派发）。
+        interface: prometheus/query_scalar
+        args:
+          promql: sum(increase(rtp_llm_framework_requests_total{role="prefill"}[90s])) / 1.05
+        expect:
+          lte:
+            ref: steps.count_issued
+          gte: 1
+      - id: check_terminal_unique
+        describe: 每请求恰好一个终态。
+        interface: frontend/query/playback_requests
+        args:
+          kind: TERMINAL
+        expect:
+          eq:
+            ref: steps.count_issued

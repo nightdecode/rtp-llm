@@ -1,0 +1,91 @@
+id: admission_backpressure
+name: 准入前慢背压
+describe: F1.7 降级版：mock.rpc.enqueue.admission.delay.ms=800 把延迟放在准入之前（附着窗口尚未开启），验证 Master 背压形态与最终全部成功；派发 ACK 耗时证据确认注入生效。取消后延迟任务不执行待 GAP-F2。
+environment:
+  master:
+    deployment:
+      replicas: 1
+    config: configs/master.yaml
+  prefill:
+    engine: rtp
+    deployment:
+      replicas: 1
+    config: configs/prefill.yaml
+  decode:
+    engine: rtp
+    deployment:
+      replicas: 1
+    config: configs/decode.yaml
+  frontend:
+    config:
+      seq_size_per_block: 128
+      prefill_cp_size: 4
+      image_token_id: 129264
+      cache_key_hash_seed: "4923373599811257905"
+phases:
+  - id: startup
+    describe: 确认唯一主 Master 并等待 Engine 发现传播。
+    timeout: 120s
+    steps:
+      - id: check_master_leader
+        describe: 只有一个主 Master。
+        interface: master/list/addresses
+        args:
+          is_leader: true
+        expect:
+          count: 1
+        wait_after: 10s
+  - id: admission
+    describe: 准入延迟背压验证。
+    timeout: 240s
+    steps:
+      - id: start_frontend
+        describe: qps 6 打 30s；所有批的准入本身被延迟 800ms（ACK 更晚）。
+        interface: frontend/start/playback
+        args:
+          requests_file: data/traffic/uniform-2k-small.mckidx
+          qps: 6
+          total_concurrency: 32
+          queue_capacity: 64
+          request_timeout: 30s
+          drain_timeout: 60s
+        wait_after: 30s
+      - id: check_admission_delay_effective
+        describe: 派发 ACK 耗时 p95 ≥0.5s：准入延迟确实生效（被注入方证据）。
+        interface: prometheus/query_scalar
+        args:
+          promql: histogram_quantile(0.95, sum by(le)(rate(flexlb_app_flexlb_dispatch_ack_time_ms_seconds_bucket[60s])))
+        expect:
+          gte: 0.5
+      - id: evidence_queue
+        describe: 准入背压下排队深度留证。
+        interface: prometheus/query
+        args:
+          promql: sum(flexlb_app_flexlb_batcher_queue_size)
+      - id: stop_frontend
+        describe: 停止播放并收齐已发请求终态。
+        interface: frontend/stop/playback
+        within: 190s
+      - id: check_success_rate
+        describe: 延迟准入后请求最终全成功。
+        interface: frontend/query/success_rate
+        args:
+          range:
+            - -90s
+            - 0s
+        expect:
+          gte: 0.99
+      - id: count_issued
+        describe: 发出的请求总数。
+        interface: frontend/query/playback_requests
+        args:
+          kind: ISSUED
+      - id: check_no_duplicate_dispatch
+        describe: engine 执行数 ÷1.05（抹平 increase 插值误差）不超过发出数（无重复派发）。
+        interface: prometheus/query_scalar
+        args:
+          promql: sum(increase(rtp_llm_framework_requests_total{role="prefill"}[90s])) / 1.05
+        expect:
+          lte:
+            ref: steps.count_issued
+          gte: 1

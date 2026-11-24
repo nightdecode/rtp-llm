@@ -1,0 +1,72 @@
+id: fetch_attach_timeout
+name: Fetch 附着超时收敛
+describe:
+  S2-4：BATCH 下 fetchAttachTimeoutMs=300ms，engine 的 EnqueueBatch ACK 延迟 600ms（mock.rpc.enqueue.ack.delay.ms）——附着窗口先于 ACK 过期，请求必须以超时错误终结而非悬挂。校验：全部请求有终态（stop
+  校验 issued==finished）、成功率接近 0、在途清零。基线记录：附着超时失败的错误码分布。
+environment:
+  master:
+    deployment:
+      replicas: 1
+    config: configs/master.yaml
+  prefill:
+    engine: rtp
+    deployment:
+      replicas: 1
+    config: configs/prefill.yaml
+  decode:
+    engine: rtp
+    deployment:
+      replicas: 1
+    config: configs/decode.yaml
+  frontend:
+    config:
+      seq_size_per_block: 128
+      prefill_cp_size: 4
+      image_token_id: 129264
+      cache_key_hash_seed: "4923373599811257905"
+phases:
+  - id: startup
+    describe: 确认唯一主 Master 并等待 Engine 发现传播。
+    timeout: 120s
+    steps:
+      - id: check_master_leader
+        describe: 只有一个主 Master。
+        interface: master/list/addresses
+        args:
+          is_leader: true
+        expect:
+          count: 1
+        wait_after: 10s
+  - id: traffic
+    describe: 打流触发附着超时。
+    timeout: 240s
+    steps:
+      - id: start_frontend
+        describe: qps 4 打 15s；每个批的附着都因 ACK 延迟超过 300ms 附着窗口而失败。
+        interface: frontend/start/playback
+        args:
+          requests_file: data/traffic/uniform-2k.mckidx
+          qps: 4
+          total_concurrency: 32
+          queue_capacity: 64
+          request_timeout: 30s
+          drain_timeout: 30s
+        wait_after: 20s
+      - id: stop_frontend
+        describe: 停止打流并收齐终态（全部终结即证明无悬挂）。
+        interface: frontend/stop/playback
+        within: 90s
+      - id: check_success_rate
+        describe: 附着超时后请求全部以失败终结。
+        interface: frontend/query/success_rate
+        args:
+          range:
+            - -60s
+            - 0s
+        expect:
+          lte: 0.05
+      - id: observe_inflight_drained
+        describe: 在途请求数应回落为 0（无悬挂，留证）。
+        interface: prometheus/query
+        args:
+          promql: flexlb_app_flexlb_inflight_request_count

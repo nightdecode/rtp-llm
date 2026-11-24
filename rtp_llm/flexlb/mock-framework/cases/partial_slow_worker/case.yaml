@@ -1,0 +1,86 @@
+id: partial_slow_worker
+name: 局部慢不拖累
+describe: F1.5 降级版：instance_configs 只给 prefill-1 配 3s ACK 扣留，prefill-0 正常；验证双活、健康 worker 吞吐有下限、全程成功率 ≥99%。注入前基线对照靠健康 worker 自身。
+environment:
+  master:
+    deployment:
+      replicas: 1
+    config: configs/master.yaml
+  prefill:
+    engine: rtp
+    deployment:
+      replicas: 2
+    config: configs/prefill.yaml
+    instance_configs:
+      prefill-1: configs/prefill-slow.yaml
+  decode:
+    engine: rtp
+    deployment:
+      replicas: 1
+    config: configs/decode.yaml
+  frontend:
+    config:
+      seq_size_per_block: 128
+      prefill_cp_size: 4
+      image_token_id: 129264
+      cache_key_hash_seed: "4923373599811257905"
+phases:
+  - id: startup
+    describe: 确认唯一主 Master 并等待 Engine 发现传播。
+    timeout: 120s
+    steps:
+      - id: check_master_leader
+        describe: 只有一个主 Master。
+        interface: master/list/addresses
+        args:
+          is_leader: true
+        expect:
+          count: 1
+        wait_after: 10s
+  - id: partial_slow
+    describe: 局部慢 worker 打流。
+    timeout: 240s
+    steps:
+      - id: start_frontend
+        describe: qps 8 打 35s；prefill-1 的批 ACK 被静态扣 3s，prefill-0 正常。
+        interface: frontend/start/playback
+        args:
+          requests_file: data/traffic/uniform-2k.mckidx
+          qps: 8
+          total_concurrency: 32
+          queue_capacity: 64
+          request_timeout: 30s
+          drain_timeout: 60s
+        wait_after: 35s
+      - id: check_both_workers_serving
+        describe: 两台 prefill 都在接活（防假阳性）。
+        interface: prometheus/query_scalar
+        args:
+          promql: count(sum by(instance)(increase(rtp_llm_framework_requests_total{role="prefill"}[60s])) > 0)
+        expect:
+          eq: 2
+      - id: check_healthy_worker_tps
+        describe: 健康 worker 吞吐有下限（不被慢 worker 拖死）。
+        interface: prometheus/query_scalar
+        args:
+          promql: max(avg_over_time(rtp_llm_context_tps{role="prefill"}[30s]))
+        expect:
+          gte: 2000
+      - id: evidence_per_worker_share
+        describe: 分 worker 执行数分布（倾斜留证）。
+        interface: prometheus/query
+        args:
+          promql: sum by(instance)(increase(rtp_llm_framework_requests_total{role="prefill"}[60s]))
+      - id: stop_frontend
+        describe: 停止播放并收齐已发请求终态。
+        interface: frontend/stop/playback
+        within: 190s
+      - id: check_success_rate
+        describe: 局部慢下全程成功率 ≥99%。
+        interface: frontend/query/success_rate
+        args:
+          range:
+            - -90s
+            - 0s
+        expect:
+          gte: 0.99

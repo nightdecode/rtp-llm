@@ -1,0 +1,86 @@
+id: config_end_to_end
+name: 启动配置生效值
+describe: C3.1 降级版：给 master 配非默认的 inflight=3/maxRequests=6，用指标行为证明配置端到端生效（在途批数 ≤3、批大小 ≤6 且确实顶到 6），而非读配置自证（Case 01 教训：设了≠生效）。effective-config 文件本身已由框架落盘可人工核对。
+environment:
+  master:
+    deployment:
+      replicas: 1
+    config: configs/master.yaml
+  prefill:
+    engine: rtp
+    deployment:
+      replicas: 1
+    config: configs/prefill.yaml
+  decode:
+    engine: rtp
+    deployment:
+      replicas: 1
+    config: configs/decode.yaml
+  frontend:
+    config:
+      seq_size_per_block: 128
+      prefill_cp_size: 4
+      image_token_id: 129264
+      cache_key_hash_seed: "4923373599811257905"
+phases:
+  - id: startup
+    describe: 确认唯一主 Master 并等待 Engine 发现传播。
+    timeout: 120s
+    steps:
+      - id: check_master_leader
+        describe: 只有一个主 Master。
+        interface: master/list/addresses
+        args:
+          is_leader: true
+        expect:
+          count: 1
+        wait_after: 10s
+  - id: behavior
+    describe: 行为级生效校验。
+    timeout: 300s
+    steps:
+      - id: start_frontend
+        describe: qps 30 打 30s 压满（压力足以顶破未生效的默认值）。
+        interface: frontend/start/playback
+        args:
+          requests_file: data/traffic/uniform-2k.mckidx
+          qps: 30
+          total_concurrency: 64
+          queue_capacity: 512
+          request_timeout: 60s
+          drain_timeout: 60s
+        wait_after: 30s
+      - id: check_inflight_cap
+        describe: 行为证明 maxInflightPerPrefillWorker=3 生效：在途批数 ≤3。
+        interface: prometheus/query_scalar
+        args:
+          promql: max(max_over_time(flexlb_app_flexlb_inflight_batch_count[30s]))
+        expect:
+          lte: 3
+      - id: check_batch_size_cap
+        describe: 行为证明 maxRequests=6 生效：批大小 ≤6。
+        interface: prometheus/query_scalar
+        args:
+          promql: max(max_over_time(flexlb_app_engine_balancing_master_batch_size[30s]))
+        expect:
+          lte: 6
+      - id: check_batch_size_reached
+        describe: 批大小确实顶到上限 6（配置边界被真实触及，防空转假阳性）。
+        interface: prometheus/query_scalar
+        args:
+          promql: max(max_over_time(flexlb_app_engine_balancing_master_batch_size[30s]))
+        expect:
+          gte: 6
+      - id: stop_frontend
+        describe: 停止播放并收齐已发请求终态。
+        interface: frontend/stop/playback
+        within: 240s
+      - id: check_total_success_rate
+        describe: 全程成功率 ≥80%（饱和有界）。
+        interface: frontend/query/success_rate
+        args:
+          range:
+            - -120s
+            - 0s
+        expect:
+          gte: 0.8
