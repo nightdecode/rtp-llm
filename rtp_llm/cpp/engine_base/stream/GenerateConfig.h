@@ -75,9 +75,10 @@ public:
 
     std::vector<int>              select_tokens_id;
     std::vector<std::string>      select_tokens_str;
-    int                           calculate_loss            = 0;
-    int                           hidden_states_cut_dim     = 0;
-    bool                          return_logits             = false;
+    int                           calculate_loss        = 0;
+    int                           hidden_states_cut_dim = 0;
+    bool                          return_logits         = false;
+    std::optional<int>            logits_index;
     bool                          return_prompt_logits      = false;
     int                           prompt_logits_top_k       = 64;
     int                           prompt_logits_start       = -1;
@@ -360,7 +361,7 @@ public:
         // first (new wire format); on parse failure, fall back to bool: true→DEFAULT,
         // false→NONE. Without this fallback an old bool payload raises
         // autil::legacy::ExceptionBase and the surrounding catch nulls the entire
-        // generate_config (see ApiDataType.cc).
+        // generate_config.
         int return_all_probs_int = static_cast<int>(return_all_probs);
         try {
             json.Jsonize("return_all_probs", return_all_probs_int, return_all_probs_int);

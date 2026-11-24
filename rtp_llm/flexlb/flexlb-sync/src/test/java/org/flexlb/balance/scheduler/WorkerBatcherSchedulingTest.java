@@ -26,6 +26,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.OptionalLong;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -373,8 +374,8 @@ class WorkerBatcherSchedulingTest {
                                                 org.flexlb.balance.endpoint.PrefillState
                                                         .RouteReservation.class)));
         DeliveryStrategy delivery = mock(DeliveryStrategy.class);
-        List<org.flexlb.dao.pv.DecisionGroup> published = new CopyOnWriteArrayList<>();
-        WorkerBatcher runtime = runningRuntime(config, endpoint, delivery);
+        Map<ScheduledRequest, org.flexlb.dao.pv.DecisionGroup> published =
+                new ConcurrentHashMap<>();
         when(delivery.prepare(
                         org.mockito.ArgumentMatchers.anyList(),
                         org.mockito.ArgumentMatchers.any(),
@@ -384,28 +385,15 @@ class WorkerBatcherSchedulingTest {
                             List<ScheduledRequest> members = List.copyOf(invocation.getArgument(0));
                             var transaction = mock(DeliveryStrategy.Transaction.class);
                             when(transaction.items()).thenReturn(members);
-                            when(transaction.commitUnderLock())
-                                    .thenAnswer(
-                                            ignored -> {
-                                                var precedingWork =
-                                                        runtime.ownedState().committedSnapshot();
-                                                for (ScheduledRequest member : members) {
-                                                    assertTrue(
-                                                            runtime.ownedState()
-                                                                    .terminalizeActiveUnderLock(
-                                                                            member));
-                                                    var reservation =
-                                                            member.takePublishedRouteReservation();
-                                                    if (reservation != null) {
-                                                        reservation.close();
-                                                    }
-                                                }
-                                                return precedingWork;
-                                            });
                             org.mockito.Mockito.doAnswer(
                                             ignored -> {
                                                 for (ScheduledRequest member : members) {
-                                                    published.add(member.ctx().getDecisionGroup());
+                                                    // The mock transaction leaves the request
+                                                    // queued.
+                                                    // Capture the first handoff for each request.
+                                                    published.putIfAbsent(
+                                                            member,
+                                                            member.ctx().getDecisionGroup());
                                                     member.future().complete(new Response());
                                                 }
                                                 return null;
@@ -417,6 +405,7 @@ class WorkerBatcherSchedulingTest {
                                             org.mockito.ArgumentMatchers.any());
                             return transaction;
                         });
+        WorkerBatcher runtime = runningRuntime(config, endpoint, delivery);
         List<ScheduledRequest> requests = new ArrayList<>();
         for (int i = 0; i < count; i++) {
             ScheduledRequest request =
@@ -428,9 +417,9 @@ class WorkerBatcherSchedulingTest {
             request.future().get(5, TimeUnit.SECONDS);
         }
         assertEquals(count, published.size());
-        String id = published.getFirst().id();
+        String id = published.get(requests.getFirst()).id();
         assertNotNull(id);
-        for (var group : published) {
+        for (var group : published.values()) {
             assertEquals(id, group.id());
             assertEquals(count, group.committedSize());
             assertEquals(expectedReason, group.reason());

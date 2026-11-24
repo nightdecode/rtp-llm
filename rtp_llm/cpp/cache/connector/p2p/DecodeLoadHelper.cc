@@ -1,6 +1,7 @@
 #include "rtp_llm/cpp/cache/connector/p2p/DecodeLoadHelper.h"
 
 #include "rtp_llm/cpp/utils/AssertUtils.h"
+#include "rtp_llm/cpp/utils/GrpcAddressUtil.h"
 #include "rtp_llm/cpp/utils/Logger.h"
 #include "rtp_llm/cpp/utils/RpcCompletionQueue.h"
 #include "rtp_llm/cpp/utils/TimeUtil.h"
@@ -18,22 +19,6 @@ namespace rtp_llm {
 
 namespace {
 
-std::string formatGrpcHostPort(const std::string& host, uint32_t port) {
-    if (host.empty() || port == 0 || port > 65535) {
-        return "";
-    }
-    if (host.front() == '[' || host.back() == ']') {
-        if (host.front() == '[' && host.back() == ']') {
-            return host + ":" + std::to_string(port);
-        }
-        return "";
-    }
-    if (host.find(':') != std::string::npos) {
-        return "[" + host + "]:" + std::to_string(port);
-    }
-    return host + ":" + std::to_string(port);
-}
-
 struct WorkerAddrParts {
     std::string host;
     int32_t     cache_store_port = 0;
@@ -43,9 +28,9 @@ bool parseWorkerAddrPort(const std::string& port_text, int32_t* port) {
     if (!port || port_text.empty()) {
         return false;
     }
-    char* end   = nullptr;
-    errno       = 0;
-    auto value  = std::strtoll(port_text.c_str(), &end, 10);
+    char* end             = nullptr;
+    errno                 = 0;
+    auto       value      = std::strtoll(port_text.c_str(), &end, 10);
     const bool parsed_all = end == port_text.c_str() + port_text.size();
     if (errno != 0 || !parsed_all || value < 1 || value > 65535) {
         return false;
@@ -78,9 +63,8 @@ bool parseWorkerAddr(const std::string& worker_addr, WorkerAddrParts* parts) {
         grpc_port_text        = worker_addr.substr(cache_port_end + 1);
     } else {
         const auto grpc_col = worker_addr.rfind(':');
-        const auto cache_col = (grpc_col == std::string::npos || grpc_col == 0)
-                                   ? std::string::npos
-                                   : worker_addr.rfind(':', grpc_col - 1);
+        const auto cache_col =
+            (grpc_col == std::string::npos || grpc_col == 0) ? std::string::npos : worker_addr.rfind(':', grpc_col - 1);
         if (cache_col == std::string::npos || cache_col == 0 || cache_col + 1 >= grpc_col
             || grpc_col + 1 >= worker_addr.size()) {
             return false;
@@ -131,16 +115,17 @@ DecodeLoadHelper::DecodeLoadHelper(const std::vector<std::string>& worker_addrs,
     }
 }
 
-std::shared_ptr<DecodeLoadHelper::Result> DecodeLoadHelper::load(int64_t            request_id,
-                                                                   const std::string& prefill_ip,
-                                                                   uint32_t           prefill_port,
-                                                                   const std::string& unique_key,
-                                                                   int64_t            request_deadline_ms,
-                                                                   int64_t            transfer_deadline_ms,
-                                 int64_t            load_timeout_ms,
-                                                                   bool               no_transfer,
-                                                                   uint64_t           plan_digest,
-                                                                   const std::vector<int>& active_route_ids) {
+std::shared_ptr<DecodeLoadHelper::Result> DecodeLoadHelper::load(int64_t                 request_id,
+                                                                 const std::string&      prefill_ip,
+                                                                 uint32_t                prefill_port,
+                                                                 const std::string&      unique_key,
+                                                                 int64_t                 request_deadline_ms,
+                                                                 int64_t                 transfer_deadline_ms,
+                                                                 int64_t                 load_timeout_ms,
+                                                                 bool                    no_transfer,
+                                                                 uint64_t                plan_digest,
+                                                                 const std::vector<int>& active_route_ids,
+                                                                 const std::string&      decode_pipeline_layout) {
     auto result        = std::make_shared<Result>();
     result->request_id = request_id;
     result->unique_key = unique_key;
@@ -204,7 +189,8 @@ std::shared_ptr<DecodeLoadHelper::Result> DecodeLoadHelper::load(int64_t        
                                request_id,
                                no_transfer,
                                plan_digest,
-                               active_route_ids)) {
+                               active_route_ids,
+                               decode_pipeline_layout)) {
         if (result->status.ok())
             result->status = grpcStatusFromErrorInfo(
                 ErrorInfo(ErrorCode::RPC_FINISH_FAILED,
@@ -232,17 +218,19 @@ std::shared_ptr<DecodeLoadHelper::Result> DecodeLoadHelper::load(int64_t        
 }
 
 bool DecodeLoadHelper::buildAndStartAsyncRpc(const std::shared_ptr<Result>& result,
-                                              const std::string&             unique_key,
-                                              int64_t                        request_deadline_ms,
-                                              int64_t                        transfer_deadline_ms,
-                               int64_t                        load_timeout_ms,
-                                              int64_t                        request_id,
-                                              bool                           no_transfer,
-                                              uint64_t                       plan_digest,
-                                              const std::vector<int>&        active_route_ids) {
+                                             const std::string&             unique_key,
+                                             int64_t                        request_deadline_ms,
+                                             int64_t                        transfer_deadline_ms,
+                                             int64_t                        load_timeout_ms,
+                                             int64_t                        request_id,
+                                             bool                           no_transfer,
+                                             uint64_t                       plan_digest,
+                                             const std::vector<int>&        active_route_ids,
+                                             const std::string&             decode_pipeline_layout) {
     result->request.set_unique_key(unique_key);
     result->request.set_no_transfer(no_transfer);
     result->request.set_plan_digest(plan_digest);
+    result->request.set_decode_pipeline_layout(decode_pipeline_layout);
     for (int route_id : active_route_ids) {
         result->request.add_active_route_ids(route_id);
     }
@@ -253,9 +241,9 @@ bool DecodeLoadHelper::buildAndStartAsyncRpc(const std::shared_ptr<Result>& resu
         tp_worker_info->set_cache_store_port(tp_worker.cache_store_port());
     }
 
-    result->client_context   = std::make_shared<grpc::ClientContext>();
+    result->client_context = std::make_shared<grpc::ClientContext>();
 
-    const int64_t now_ms       = currentTimeMs();
+    const int64_t now_ms = currentTimeMs();
     if (request_deadline_ms <= 0 || request_deadline_ms == std::numeric_limits<int64_t>::max()
         || transfer_deadline_ms <= now_ms || transfer_deadline_ms > request_deadline_ms) {
         result->status = grpcStatusFromErrorInfo(ErrorInfo(
@@ -264,8 +252,8 @@ bool DecodeLoadHelper::buildAndStartAsyncRpc(const std::shared_ptr<Result>& resu
                 + " transfer_deadline=" + std::to_string(transfer_deadline_ms)));
         return false;
     }
-    result->timeout_ms = static_cast<int>(std::min<int64_t>(
-        transfer_deadline_ms - now_ms, std::numeric_limits<int>::max()));
+    result->timeout_ms =
+        static_cast<int>(std::min<int64_t>(transfer_deadline_ms - now_ms, std::numeric_limits<int>::max()));
     result->request.set_timeout_ms(load_timeout_ms);
     result->request.set_handoff_timeout_ms(transfer_deadline_ms - now_ms);
     result->request.set_decode_tp_size(decode_tp_size_);
@@ -329,20 +317,25 @@ void DecodeLoadHelper::Result::parseSideChannelPayload(P2PSideChannelPayload& si
     if (response.has_payload()) {
         auto& payload                      = *response.mutable_payload();
         side_channel_payload.has_rng_state = payload.has_rng_state();
-        side_channel_payload.rng_offset = payload.rng_offset();
+        side_channel_payload.rng_offset    = payload.rng_offset();
         side_channel_payload.has_first_token =
             payload.has_first_generate_token() || payload.first_generate_token_id() != 0;
-        side_channel_payload.first_token_id   = payload.first_generate_token_id();
+        side_channel_payload.first_token_id                        = payload.first_generate_token_id();
+        side_channel_payload.frontend_context_token_num            = payload.frontend_context_token_num();
+        side_channel_payload.frontend_context_token_num_with_cache = payload.frontend_context_token_num_with_cache();
+        side_channel_payload.frontend_context_execute_time_us      = payload.frontend_context_execute_time_us();
+        side_channel_payload.frontend_context_execute_time_with_cache_us =
+            payload.frontend_context_execute_time_with_cache_us();
         side_channel_payload.generation_prefill_cuda_graph_status = payload.generation_prefill_cuda_graph_status();
         side_channel_payload.prefill_use_independent_block_pools  = payload.prefill_use_independent_block_pools();
-        side_channel_payload.total_reuse_len  = payload.total_reuse_len();
-        side_channel_payload.local_reuse_len  = payload.local_reuse_len();
-        side_channel_payload.remote_reuse_len = payload.remote_reuse_len();
-        side_channel_payload.memory_reuse_len = payload.memory_reuse_len();
-        side_channel_payload.disk_reuse_len   = payload.disk_reuse_len();
+        side_channel_payload.total_reuse_len                      = payload.total_reuse_len();
+        side_channel_payload.local_reuse_len                      = payload.local_reuse_len();
+        side_channel_payload.remote_reuse_len                     = payload.remote_reuse_len();
+        side_channel_payload.memory_reuse_len                     = payload.memory_reuse_len();
+        side_channel_payload.disk_reuse_len                       = payload.disk_reuse_len();
         side_channel_payload.multimodal_lengths =
             std::map<int, int>(payload.multimodal_lengths().begin(), payload.multimodal_lengths().end());
-        side_channel_payload.has_data         = true;
+        side_channel_payload.has_data = true;
         if (payload.has_prompt_logits()) {
             side_channel_payload.prompt_logits.emplace().Swap(payload.mutable_prompt_logits());
         }
@@ -382,6 +375,11 @@ void DecodeLoadHelper::Result::parseSideChannelPayload(P2PSideChannelPayload& si
             side_channel_payload.propose_hidden.Swap(it_hidden->second.mutable_tensor());
         }
 
+        auto it_seed = tensors.find("mtp_indexer_topk");
+        if (it_seed != tensors.end() && it_seed->second.has_tensor()) {
+            side_channel_payload.mtp_indexer_topk.emplace().Swap(it_seed->second.mutable_tensor());
+        }
+
         auto it_pos = payload.tensors().find("position_ids");
         if (it_pos != payload.tensors().end() && it_pos->second.has_tensor()) {
             const auto& tensor_pb = it_pos->second.tensor();
@@ -399,6 +397,7 @@ void DecodeLoadHelper::Result::parseSideChannelPayload(P2PSideChannelPayload& si
 }
 
 void DecodeLoadHelper::Result::complete(bool ok) {
+    const auto receive_time = currentTimeUs();
     if (done()) {
         return;
     }
@@ -423,7 +422,7 @@ void DecodeLoadHelper::Result::complete(bool ok) {
         if (done_) {
             return;  // A late Finish must not overwrite logical cancellation.
         }
-        success_ = false;
+        success_   = false;
         error_code = ErrorCode::P2P_CONNECTOR_LOAD_FROM_PREFILL_FAILED;
         if (!ok || !status.ok()) {
             const auto error = errorInfoFromGrpcStatus(
@@ -434,7 +433,7 @@ void DecodeLoadHelper::Result::complete(bool ok) {
             error_message = error.ToString();
         } else if (response.error_code() != ErrorCodePB::NONE_ERROR) {
             const std::string wire_error_message = response.error_message();
-            error_code    = transRPCErrorCode(response.error_code());
+            error_code                           = transRPCErrorCode(response.error_code());
             error_message =
                 (wire_error_message.empty() ? std::string() : wire_error_message + " ")
                 + "[received_at location=DecodeLoadHelper::complete observer_role=DECODE operation=StartLoad peer="
@@ -450,6 +449,11 @@ void DecodeLoadHelper::Result::complete(bool ok) {
                     "observer_role=DECODE peer="
                     + server_addr + " request_id=" + std::to_string(request_id) + " key=" + unique_key + "]";
             } else {
+                first_token_timing_.received_us = receive_time;
+                const auto produced_us          = response.payload().first_token_time_us();
+                if (produced_us > 0) {
+                    first_token_timing_.produced_us = produced_us;
+                }
                 side_channel_payload = std::move(parsed_payload);
                 success_             = true;
                 error_code           = ErrorCode::NONE_ERROR;
@@ -459,9 +463,12 @@ void DecodeLoadHelper::Result::complete(bool ok) {
         if (!success_) {
             RTP_LLM_LOG_WARNING("P2P Decode StartLoad failed, unique_key=%s peer=%s grpc_code=%d "
                                 "wire_code=%d error_code=%d error_name=%s error=%s",
-                                unique_key.c_str(), server_addr.c_str(),
-                                static_cast<int>(status.error_code()), static_cast<int>(response.error_code()),
-                                static_cast<int>(error_code), ErrorCodeToString(error_code).c_str(),
+                                unique_key.c_str(),
+                                server_addr.c_str(),
+                                static_cast<int>(status.error_code()),
+                                static_cast<int>(response.error_code()),
+                                static_cast<int>(error_code),
+                                ErrorCodeToString(error_code).c_str(),
                                 error_message.c_str());
         }
         done_              = true;

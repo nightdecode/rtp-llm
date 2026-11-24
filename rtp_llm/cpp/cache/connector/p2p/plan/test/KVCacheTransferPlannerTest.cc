@@ -1,5 +1,6 @@
 #include "rtp_llm/cpp/cache/connector/p2p/plan/KVCacheTransferPlanner.h"
 #include "rtp_llm/cpp/cache/connector/p2p/plan/ShardLayoutFactory.h"
+#include "rtp_llm/cpp/cache/connector/p2p/plan/PipelineLayoutCodec.h"
 
 #include "rtp_llm/cpp/cache/CPSlotMapper.h"
 #include "rtp_llm/cpp/cache/OpaqueKVCacheSpec.h"
@@ -51,9 +52,9 @@ constexpr const char* kFixedTag = "fixed";
 
 ParallelismConfig makePc(int tp_size, CPRotateMethod method, bool kv_cache_sharded) {
     ParallelismConfig pc;
-    pc.tp_size                              = tp_size;
-    pc.prefill_cp_config.method             = method;
-    pc.prefill_cp_config.kv_cache_sharded   = kv_cache_sharded;
+    pc.tp_size                            = tp_size;
+    pc.prefill_cp_config.method           = method;
+    pc.prefill_cp_config.kv_cache_sharded = kv_cache_sharded;
     if (kv_cache_sharded) {
         pc.prefill_cp_config.prefill_cp_size = tp_size;
     }
@@ -89,8 +90,8 @@ ShardLayout::GroupLayout makeSwaGroup() {
 void finalize(ShardLayout& layout) {
     layout.deriveHeadShardCounts();
     for (auto& [tag, g] : layout.groups) {
-        const size_t global = g.spec_type == KVCacheSpecType::MultiHeadLatentAttention ? kMlaBlockBytes :
-                                                                                        kGlobalMhaBlockBytes;
+        const size_t global =
+            g.spec_type == KVCacheSpecType::MultiHeadLatentAttention ? kMlaBlockBytes : kGlobalMhaBlockBytes;
         size_t divisor = static_cast<size_t>(std::max(1, layout.headShardCount(tag)));
         if (g.pre_sliced) {
             divisor *= static_cast<size_t>(std::max(1, layout.cpSize()));
@@ -99,12 +100,12 @@ void finalize(ShardLayout& layout) {
     }
 }
 
-ShardLayout makeLayout(int                                                              tp_size,
-                       CPRotateMethod                                                   method,
-                       bool                                                             kv_cache_sharded,
+ShardLayout makeLayout(int                                                                  tp_size,
+                       CPRotateMethod                                                       method,
+                       bool                                                                 kv_cache_sharded,
                        const std::vector<std::pair<std::string, ShardLayout::GroupLayout>>& groups) {
     ShardLayout layout;
-    layout.pc = makePc(tp_size, method, kv_cache_sharded);
+    layout.pc                         = makePc(tp_size, method, kv_cache_sharded);
     layout.cache_key_tokens_per_block = kSeqSizePerBlock;
     for (const auto& [tag, g] : groups) {
         layout.groups[tag] = g;
@@ -160,7 +161,191 @@ void expectNoHeadPartitioning(const TransferPlan& plan) {
     }
 }
 
+PipelineTransferLayout pipeline(const std::vector<int>& cuts, const ShardLayout& shards) {
+    PipelineTransferLayout result;
+    int                    layer_begin = 0;
+    for (int count : cuts) {
+        auto& stage            = result.stages.emplace_back();
+        stage.main_layer_begin = layer_begin;
+        stage.main_layer_count = count;
+        stage.main_shards      = shards;
+        stage.layer_tags.resize(count, {kFullTag});
+        for (int lane = 0; lane < shards.rankCount(); ++lane) {
+            stage.worker_indices.push_back(static_cast<int>(result.worker_count++));
+        }
+        layer_begin += count;
+    }
+    return result;
+}
+
 }  // namespace
+
+TEST(PlannerPipeline, CoversDifferentStageCutsInBothDirections) {
+    const std::vector<std::pair<std::vector<int>, std::vector<int>>> cuts = {
+        {{8}, {3, 5}}, {{3, 5}, {8}}, {{3, 5}, {2, 6}}, {{3, 5}, {2, 4, 2}}};
+    for (const auto& [src_cuts, dst_cuts] : cuts) {
+        auto       src    = pipeline(src_cuts, mhaLayout(1));
+        auto       dst    = pipeline(dst_cuts, mhaLayout(2));
+        const auto result = KVCacheTransferPlanner::planStages(src, dst, "request");
+        ASSERT_TRUE(result.ok()) << result.error.ToString();
+        expectUniqueRouteIds(result.plan);
+        expectAllRouteBytesMatch(result.plan);
+        std::set<std::pair<int, int>> seen;
+        for (const auto& route : result.plan.routes) {
+            const auto& source_stage = src.stages.at(route.src_rank);
+            const auto& target_stage = dst.stages.at(route.dst_rank / 2);
+            EXPECT_EQ(route.src_partition.count, 2);
+            ASSERT_FALSE(route.layers.empty());
+            for (const auto& layer : route.layers) {
+                EXPECT_EQ(layer.global_id, source_stage.main_layer_begin + layer.src_local_id);
+                EXPECT_EQ(layer.global_id, target_stage.main_layer_begin + layer.dst_local_id);
+                EXPECT_LT(layer.src_local_id, source_stage.main_layer_count);
+                EXPECT_LT(layer.dst_local_id, target_stage.main_layer_count);
+                EXPECT_TRUE(seen.emplace(layer.global_id, route.dst_rank % 2).second);
+            }
+        }
+        EXPECT_EQ(seen.size(), 16u);
+        EXPECT_EQ(result.plan.digest(), KVCacheTransferPlanner::planStages(src, dst, "request").plan.digest());
+    }
+}
+
+TEST(PlannerPipeline, PreservesCpKeyRulesAndUsesPublishedDraftGeometry) {
+    auto src                       = pipeline({3, 5}, mlaLayout(2, CPRotateMethod::ALL_GATHER, true));
+    auto dst                       = pipeline({2, 4, 2}, mlaLayout(1));
+    src.stages.back().draft_shards = src.stages.back().main_shards;
+    dst.stages.back().draft_shards = dst.stages.back().main_shards;
+    for (auto* side : {&src, &dst}) {
+        auto& stage = side->stages.back();
+        stage.draft_shards.groups.at(kFullTag).kv_block_stride_bytes *= 2;
+        stage.layer_tags.push_back({kFullTag});
+    }
+    auto& mixed_src = src.stages.back();
+    auto& mixed_dst = dst.stages[1];
+    for (auto* side : {&src, &dst}) {
+        auto& root                       = side->stages.front();
+        root.main_shards.groups["mixed"] = root.main_shards.groups.at(kFullTag);
+        root.layer_tags.front().push_back("mixed");
+    }
+    mixed_src.main_shards.groups["mixed"] = mixed_src.main_shards.groups.at(kFullTag);
+    mixed_dst.main_shards.groups["mixed"] = mixed_dst.main_shards.groups.at(kFullTag);
+    mixed_src.layer_tags[2].push_back("mixed");
+    mixed_dst.layer_tags[3].push_back("mixed");
+    const auto result = KVCacheTransferPlanner::planStages(src, dst, "request");
+    ASSERT_TRUE(result.ok()) << result.error.ToString();
+    std::set<size_t> draft_positions;
+    int              mixed_routes = 0;
+    for (const auto& route : result.plan.routes) {
+        ASSERT_FALSE(route.layers.empty());
+        if (route.cache_tag == "mixed") {
+            ASSERT_EQ(route.layers.size(), 1u);
+            const auto& layer = route.layers.front();
+            if (layer.global_id == 5) {
+                EXPECT_EQ(layer.src_local_id, 2);
+                EXPECT_EQ(layer.dst_local_id, 3);
+            } else {
+                EXPECT_EQ(layer.global_id, 0);
+                EXPECT_EQ(layer.src_local_id, 0);
+                EXPECT_EQ(layer.dst_local_id, 0);
+            }
+            ++mixed_routes;
+        }
+        for (const auto& layer : route.layers) {
+            EXPECT_LE(layer.global_id, 8);
+            if (layer.global_id == 8) {
+                EXPECT_EQ(route.src_bytes, 2 * kMlaBlockBytes);
+                EXPECT_EQ(route.dst_rank, 2);
+                EXPECT_EQ(layer.src_local_id, 5);
+                EXPECT_EQ(layer.dst_local_id, 2);
+                for (auto pos : KVCacheTransferPlanner::resolveKeys(route.src_keys, 5)) {
+                    if (pos >= 2) {  // A Decode hit on the first two keys leaves [2, 5) to copy.
+                        EXPECT_TRUE(draft_positions.insert(pos).second);
+                    }
+                }
+            }
+        }
+    }
+    EXPECT_EQ(mixed_routes, 4);
+    EXPECT_EQ(draft_positions, (std::set<size_t>{2, 3, 4}));
+}
+
+TEST(PlannerPipeline, RejectsInvalidCoverageAndWorkerMapping) {
+    const auto src                     = pipeline({3, 5}, mlaLayout(1));
+    const auto dst                     = pipeline({2, 4, 2}, mlaLayout(1));
+    auto       overlap                 = dst;
+    overlap.stages[1].main_layer_begin = 1;
+    EXPECT_FALSE(KVCacheTransferPlanner::planStages(src, overlap, "request").ok());
+
+    auto duplicate_worker                        = dst;
+    duplicate_worker.stages[1].worker_indices[0] = 0;
+    EXPECT_FALSE(KVCacheTransferPlanner::planStages(src, duplicate_worker, "request").ok());
+
+    auto missing_src_tag = src;
+    missing_src_tag.stages[1].layer_tags[2].clear();
+    const auto missing = KVCacheTransferPlanner::planStages(missing_src_tag, dst, "request");
+    EXPECT_FALSE(missing.ok());
+    EXPECT_TRUE(missing.plan.routes.empty());
+    EXPECT_NE(missing.error.ToString().find("PP stage 1 local_layer=2"), std::string::npos);
+
+    auto missing_dst_tag = dst;
+    missing_dst_tag.stages[1].layer_tags[3].clear();
+    const auto missing_destination = KVCacheTransferPlanner::planStages(src, missing_dst_tag, "request");
+    EXPECT_FALSE(missing_destination.ok());
+    EXPECT_TRUE(missing_destination.plan.routes.empty());
+    EXPECT_NE(missing_destination.error.ToString().find("empty or duplicate layer tags"), std::string::npos);
+}
+
+TEST(PlannerPipeline, RejectsMissingDecodeDraftLayers) {
+    auto src = pipeline({8}, mlaLayout(1));
+    auto dst = pipeline({3, 5}, mlaLayout(1));
+    for (auto* side : {&src, &dst}) {
+        auto& tail        = side->stages.back();
+        tail.draft_shards = tail.main_shards;
+    }
+    auto& src_layers = src.stages.back().layer_tags;
+    dst.stages.back().layer_tags.resize(7, {kFullTag});
+    for (int published = 0; published < 2; ++published) {
+        src_layers.resize(8 + published, {kFullTag});
+        const auto result = KVCacheTransferPlanner::planStages(src, dst, "request");
+        EXPECT_FALSE(result.ok());
+        EXPECT_TRUE(result.plan.routes.empty());
+        EXPECT_NE(result.error.ToString().find("Prefill is missing draft layers required by Decode"),
+                  std::string::npos);
+    }
+    for (int published = 2; published <= 3; ++published) {
+        src_layers.resize(8 + published, {kFullTag});
+        const auto result = KVCacheTransferPlanner::planStages(src, dst, "request");
+        ASSERT_TRUE(result.ok()) << result.error.ToString();
+        std::set<int> transferred_draft_layers;
+        for (const auto& route : result.plan.routes) {
+            for (const auto& layer : route.layers) {
+                if (layer.global_id >= 8) {
+                    transferred_draft_layers.insert(layer.global_id);
+                    EXPECT_EQ(route.dst_rank, 1);
+                }
+            }
+        }
+        EXPECT_EQ(transferred_draft_layers, (std::set<int>{8, 9}));
+    }
+}
+
+TEST(PlannerPipeline, UsesExplicitWorkerIndicesInRoutesAndDigest) {
+    const auto src      = pipeline({8}, mlaLayout(1));
+    auto       dst      = pipeline({3, 5}, mlaLayout(2));
+    const auto original = KVCacheTransferPlanner::planStages(src, dst, "request");
+    ASSERT_TRUE(original.ok()) << original.error.ToString();
+
+    std::swap(dst.stages[0].worker_indices[1], dst.stages[1].worker_indices[1]);
+    const auto remapped = KVCacheTransferPlanner::planStages(src, dst, "request");
+    ASSERT_TRUE(remapped.ok()) << remapped.error.ToString();
+    ASSERT_EQ(remapped.plan.routes.size(), 4u);
+    ASSERT_FALSE(remapped.plan.routes[1].layers.empty());
+    ASSERT_FALSE(remapped.plan.routes[3].layers.empty());
+    EXPECT_EQ(remapped.plan.routes[1].dst_rank, 3);
+    EXPECT_EQ(remapped.plan.routes[1].layers.front().global_id, 0);
+    EXPECT_EQ(remapped.plan.routes[3].dst_rank, 1);
+    EXPECT_EQ(remapped.plan.routes[3].layers.front().global_id, 3);
+    EXPECT_NE(remapped.plan.digest(), original.plan.digest());
+}
 
 // ===========================================================================
 // 组 A：plan() 产出的 route 集与字段
@@ -223,10 +408,10 @@ TEST(PlannerGroupA, A2_SymmetricRrCp) {
 
 // 用例 A3: 非对称 CP —— prefill 按 CP 分 4 片，decode 不分片
 TEST(PlannerGroupA, DecodeWithPeerCpFlagReceivesEveryLogicalKey) {
-    auto src = mlaLayout(2, CPRotateMethod::ALL_GATHER, true);
-    src.pc.role_type = RoleType::PREFILL;
-    auto dst = mlaLayout(2, CPRotateMethod::PREFILL_CP, true);
-    dst.pc.role_type = RoleType::DECODE;
+    auto src          = mlaLayout(2, CPRotateMethod::ALL_GATHER, true);
+    src.pc.role_type  = RoleType::PREFILL;
+    auto dst          = mlaLayout(2, CPRotateMethod::PREFILL_CP, true);
+    dst.pc.role_type  = RoleType::DECODE;
     const auto result = KVCacheTransferPlanner::plan(src, dst, {kFullTag});
     ASSERT_TRUE(result.ok()) << result.error.ToString();
     for (int rank = 0; rank < 2; ++rank) {
@@ -382,8 +567,7 @@ TEST(PlannerGroupA, A8_HybridRrAndCompactCoexist) {
 
     // FULL group：RR -> 对角线配对
     EXPECT_EQ(result.plan.forTag(kFullTag).size(), 4u);
-    EXPECT_EQ(rankPairs(result.plan, kFullTag),
-              (std::set<std::pair<int, int>>{{0, 0}, {1, 1}, {2, 2}, {3, 3}}));
+    EXPECT_EQ(rankPairs(result.plan, kFullTag), (std::set<std::pair<int, int>>{{0, 0}, {1, 1}, {2, 2}, {3, 3}}));
 
     // SWA group：COMPACT 是复制型子集，全部 CP rank 都是候选源，选举后统一收敛到最小者
     EXPECT_EQ(result.plan.forTag(kSwaTag).size(), 4u);
@@ -396,12 +580,11 @@ TEST(PlannerGroupA, A8_HybridRrAndCompactCoexist) {
 }
 
 TEST(PlannerGroupA, AsymmetricDecodeKeepsCompactGeometryButFullPagesAreUnsharded) {
-    auto state = makeSwaGroup();
+    auto state      = makeSwaGroup();
     state.spec_type = KVCacheSpecType::OpaqueState;
-    auto src = makeLayout(4, CPRotateMethod::ALL_GATHER, true,
-                          {{kFullTag, makeMlaFullGroup()}, {kFixedTag, state}});
+    auto src = makeLayout(4, CPRotateMethod::ALL_GATHER, true, {{kFullTag, makeMlaFullGroup()}, {kFixedTag, state}});
     src.pc.role_type = RoleType::PREFILL;
-    auto dst = ShardLayoutFactory::peerOf(src, 1, true, RoleType::DECODE);
+    auto dst         = ShardLayoutFactory::peerOf(src, 1, true, RoleType::DECODE);
     ASSERT_EQ(dst.cpSize(), 1);
     EXPECT_EQ(dst.physicalCpSize(kFullTag), 1);
     EXPECT_EQ(dst.physicalCpSize(kFixedTag), 4);
@@ -416,21 +599,23 @@ TEST(PlannerGroupA, AsymmetricDecodeKeepsCompactGeometryButFullPagesAreUnsharded
     EXPECT_EQ(full_positions, (std::set<size_t>{0, 1, 2, 3, 4, 5, 6, 7, 8}));
     for (const auto* route : result.plan.forTag(kFixedTag)) {
         EXPECT_EQ(KVCacheTransferPlanner::resolveKeys(route->src_keys, 9), (std::vector<size_t>{7, 8}));
-        EXPECT_EQ(CPSlotMapper::physicalBlockPosition(dst.group(kFixedTag).policy, 7, 9, 0,
-                                                     dst.physicalCpSize(kFixedTag)), 1u);
-        EXPECT_EQ(CPSlotMapper::physicalBlockPosition(dst.group(kFixedTag).policy, 8, 9, 0,
-                                                     dst.physicalCpSize(kFixedTag)), 2u);
+        EXPECT_EQ(
+            CPSlotMapper::physicalBlockPosition(dst.group(kFixedTag).policy, 7, 9, 0, dst.physicalCpSize(kFixedTag)),
+            1u);
+        EXPECT_EQ(
+            CPSlotMapper::physicalBlockPosition(dst.group(kFixedTag).policy, 8, 9, 0, dst.physicalCpSize(kFixedTag)),
+            2u);
     }
     EXPECT_FALSE(result.plan.forTag(kFixedTag).empty());
 }
 
 // 用例 A9: CP 字节切分（prefill 预切片、decode 持整块）
 TEST(PlannerGroupA, A9_CpByteSlicing) {
-    auto sliced_group      = makeSwaGroup();
+    auto sliced_group            = makeSwaGroup();
     sliced_group.policy.cp_slice = CpBlockSliceMode::PAYLOAD_BYTES;
     sliced_group.pre_sliced      = true;
 
-    auto whole_group        = makeSwaGroup();
+    auto whole_group            = makeSwaGroup();
     whole_group.policy.cp_slice = CpBlockSliceMode::PAYLOAD_BYTES;
     whole_group.pre_sliced      = false;
 
@@ -517,8 +702,7 @@ TEST(PlannerGroupA, A11_BothSidesShardedButUnequalIsRejected) {
     const auto result = KVCacheTransferPlanner::plan(src, dst, {kFullTag});
 
     ASSERT_FALSE(result.ok());
-    EXPECT_NE(result.error.ToString().find("unsupported CP topology"), std::string::npos)
-        << result.error.ToString();
+    EXPECT_NE(result.error.ToString().find("unsupported CP topology"), std::string::npos) << result.error.ToString();
     EXPECT_TRUE(result.plan.routes.empty());
 }
 
@@ -531,8 +715,7 @@ TEST(PlannerGroupA, A11b_BothSidesShardedAndEqualIsAllowed) {
     ASSERT_TRUE(result.ok()) << result.error.ToString();
 
     EXPECT_EQ(result.plan.routes.size(), 4u);
-    EXPECT_EQ(rankPairs(result.plan, kFullTag),
-              (std::set<std::pair<int, int>>{{0, 0}, {1, 1}, {2, 2}, {3, 3}}));
+    EXPECT_EQ(rankPairs(result.plan, kFullTag), (std::set<std::pair<int, int>>{{0, 0}, {1, 1}, {2, 2}, {3, 3}}));
     for (const auto* r : result.plan.forTag(kFullTag)) {
         // 白名单挡住不等情形之后，模数恒为源端 CP 片数、剩余值恒为源端 CP 位置
         EXPECT_EQ(r->src_keys.modulus, 4);
@@ -622,9 +805,9 @@ TEST(PlannerGroupB, StateKeySpanDoesNotFollowDecodeCpSize) {
 }
 
 TEST(PlannerGroupB, LinearStateRejectsUnsupportedAsymmetricHeadSharding) {
-    auto group      = makeMhaFullGroup();
-    group.spec_type = KVCacheSpecType::LinearAttention;
-    group.policy    = defaultCacheGroupPolicy(CacheGroupType::LINEAR);
+    auto group            = makeMhaFullGroup();
+    group.spec_type       = KVCacheSpecType::LinearAttention;
+    group.policy          = defaultCacheGroupPolicy(CacheGroupType::LINEAR);
     group.policy.cp_slice = CpBlockSliceMode::NONE;
     for (const auto& sizes : {std::pair<int, int>{2, 1}, {1, 2}}) {
         const auto src = makeLayout(sizes.first, CPRotateMethod::DISABLED, false, {{kFixedTag, group}});
@@ -636,11 +819,32 @@ TEST(PlannerGroupB, LinearStateRejectsUnsupportedAsymmetricHeadSharding) {
         EXPECT_NE(result.error.ToString().find("LinearAttention asymmetric head sharding"), std::string::npos);
     }
     const auto symmetric = makeLayout(2, CPRotateMethod::DISABLED, false, {{kFixedTag, group}});
-    const auto result = KVCacheTransferPlanner::plan(symmetric, symmetric, {kFixedTag});
+    const auto result    = KVCacheTransferPlanner::plan(symmetric, symmetric, {kFixedTag});
     ASSERT_TRUE(result.ok()) << result.error.ToString();
     for (const auto& route : result.plan.routes) {
         EXPECT_EQ(route.src_partition.count, 1);
         EXPECT_EQ(route.dst_partition.count, 1);
+    }
+}
+
+TEST(PlannerGroupB, MlaLinearStateUsesMatchingSegmentsForAsymmetricHeadSharding) {
+    auto group      = makeMhaFullGroup();
+    group.spec_type = KVCacheSpecType::LinearAttention;
+    group.policy    = defaultCacheGroupPolicy(CacheGroupType::LINEAR);
+    auto src        = makeLayout(4, CPRotateMethod::DISABLED, false, {{kFixedTag, group}});
+    auto dst        = makeLayout(2, CPRotateMethod::DISABLED, false, {{kFixedTag, group}});
+    src.use_mla     = true;
+    dst.use_mla     = true;
+
+    const auto result = KVCacheTransferPlanner::plan(src, dst, {kFixedTag});
+    ASSERT_TRUE(result.ok()) << result.error.ToString();
+    ASSERT_EQ(result.plan.routes.size(), 4);
+    for (const auto& route : result.plan.routes) {
+        EXPECT_EQ(route.src_partition.count, 1);
+        EXPECT_EQ(route.dst_partition.count, 2);
+        EXPECT_TRUE(route.src_partition.segment_linear_state);
+        EXPECT_TRUE(route.dst_partition.segment_linear_state);
+        EXPECT_EQ(route.src_bytes, route.dst_bytes);
     }
 }
 
@@ -749,7 +953,7 @@ TEST(PlannerGroupB, B5_AsymmetricCpRoutesAreCompleteAndDisjoint) {
     const auto result = KVCacheTransferPlanner::plan(src, dst, {kFullTag});
     ASSERT_TRUE(result.ok()) << result.error.ToString();
 
-    constexpr size_t kCount = 8;
+    constexpr size_t      kCount = 8;
     std::multiset<size_t> all;
     for (const auto* r : result.plan.forDecodeRank(0)) {
         for (size_t key : KVCacheTransferPlanner::resolveKeys(r->src_keys, kCount)) {
@@ -773,7 +977,7 @@ TEST(PlannerGroupB, B5_AsymmetricCpRoutesAreCompleteAndDisjoint) {
 // 选举出的那条 route 覆盖全部剩余类，必须被折叠成 modulus=1 的「全取」，
 // 否则只会取到 1/cp_size 的键。
 TEST(PlannerGroupB, B6_ReplicatedSourceCollapsesToTakeAll) {
-    auto replicated_group           = makeMhaFullGroup();
+    auto replicated_group              = makeMhaFullGroup();
     replicated_group.policy.cp_mapping = CpBlockMappingMode::NONE;  // 复制而非 RR
 
     const auto src = makeLayout(4, CPRotateMethod::ALL_GATHER, /*sharded=*/true, {{kFullTag, replicated_group}});
@@ -820,8 +1024,8 @@ TEST(PlannerGroupC, C1_HeadShardCountNotDivisible) {
 
 // 用例 C2: 两侧全局块大小不一致
 TEST(PlannerGroupC, C2_GlobalBlockBytesMismatch) {
-    auto       src = mhaLayout(8);
-    const auto dst = mhaLayout(4);
+    auto       src                             = mhaLayout(8);
+    const auto dst                             = mhaLayout(4);
     src.groups[kFullTag].kv_block_stride_bytes = 16384;  // 全局还原为 131072 != 262144
 
     const auto result = KVCacheTransferPlanner::plan(src, dst, {kFullTag});
@@ -845,7 +1049,7 @@ TEST(PlannerGroupC, C3_SpecTypeMismatch) {
 
 // 用例 C4: 同名 group 的类型不一致
 TEST(PlannerGroupC, C4_GroupTypeMismatch) {
-    const auto src = makeLayout(4, CPRotateMethod::DISABLED, false, {{kFullTag, makeMhaFullGroup()}});
+    const auto src         = makeLayout(4, CPRotateMethod::DISABLED, false, {{kFullTag, makeMhaFullGroup()}});
     auto       swa_as_full = makeSwaGroup();
     const auto dst         = makeLayout(4, CPRotateMethod::DISABLED, false, {{kFullTag, swa_as_full}});
 
@@ -900,12 +1104,11 @@ ShardLayout buildCandidate(const LayoutCandidate& c) {
 
 /// dst rank d 在给定序列长度下实际需要的逻辑位置。
 std::set<size_t> neededKeys(const ShardLayout& dst, const std::string& tag, int dst_rank, size_t count) {
-    std::set<size_t>  out;
+    std::set<size_t> out;
     CacheGroupPolicy policy = dst.group(tag).policy;
-    policy.cp_mapping        = dst.effectiveMapping(tag);
+    policy.cp_mapping       = dst.effectiveMapping(tag);
     for (size_t pos = 0; pos < count; ++pos) {
-        if (CPSlotMapper::physicalBlockPosition(policy, pos, count, dst.cpRank(dst_rank), dst.cpSize())
-                .has_value()) {
+        if (CPSlotMapper::physicalBlockPosition(policy, pos, count, dst.cpRank(dst_rank), dst.cpSize()).has_value()) {
             out.insert(pos);
         }
     }
@@ -938,8 +1141,8 @@ TEST(PlannerGroupD, D1_D2_CompletenessDisjointnessAndShape) {
             ++checked;
 
             const std::string ctx = "src(tp=" + std::to_string(sc.tp_size) + ",sharded=" + std::to_string(sc.sharded)
-                                    + ") dst(tp=" + std::to_string(dc.tp_size) + ",sharded="
-                                    + std::to_string(dc.sharded) + ")";
+                                    + ") dst(tp=" + std::to_string(dc.tp_size)
+                                    + ",sharded=" + std::to_string(dc.sharded) + ")";
 
             // D2：两侧字节数相等
             expectAllRouteBytesMatch(result.plan);
@@ -977,8 +1180,8 @@ TEST(PlannerGroupD, D1_D2_CompletenessDisjointnessAndShape) {
                     for (const auto& [key, occupied] : cells) {
                         const std::set<std::pair<int, int>> unique(occupied.begin(), occupied.end());
                         EXPECT_EQ(unique.size(), occupied.size())
-                            << "overlapping destination byte range on key " << key << ", " << ctx
-                            << " count=" << count << " dst_rank=" << d;
+                            << "overlapping destination byte range on key " << key << ", " << ctx << " count=" << count
+                            << " dst_rank=" << d;
                         const auto [p_count, s_count] = grid.at(key);
                         EXPECT_EQ(unique.size(), static_cast<size_t>(p_count * s_count))
                             << "destination byte range not fully covered on key " << key << ", " << ctx
@@ -1023,15 +1226,13 @@ TEST(PlannerGroupD, DigestDistinguishesTailKeySelection) {
     ASSERT_TRUE(result.ok()) << result.error.ToString();
     ASSERT_EQ(result.plan.routes.size(), 1u);
 
-    auto last_one = result.plan;
-    auto last_two = result.plan;
+    auto last_one                          = result.plan;
+    auto last_two                          = result.plan;
     last_one.routes[0].src_keys.tail_count = 1;
     last_two.routes[0].src_keys.tail_count = 2;
 
-    EXPECT_EQ(KVCacheTransferPlanner::resolveKeys(last_one.routes[0].src_keys, 4),
-              (std::vector<size_t>{3}));
-    EXPECT_EQ(KVCacheTransferPlanner::resolveKeys(last_two.routes[0].src_keys, 4),
-              (std::vector<size_t>{2, 3}));
+    EXPECT_EQ(KVCacheTransferPlanner::resolveKeys(last_one.routes[0].src_keys, 4), (std::vector<size_t>{3}));
+    EXPECT_EQ(KVCacheTransferPlanner::resolveKeys(last_two.routes[0].src_keys, 4), (std::vector<size_t>{2, 3}));
     EXPECT_NE(last_one.digest(), last_two.digest());
     EXPECT_NE(result.plan.digest(), last_one.digest());
     EXPECT_NE(result.plan.digest(), last_two.digest());
@@ -1044,43 +1245,42 @@ TEST(PlannerGroupD, FactoryMirrorsCpStatePayloadFromRealSpecs) {
             for (auto mode : {CpBlockSliceMode::PAYLOAD_BYTES, CpBlockSliceMode::EQUAL_BYTES}) {
                 SCOPED_TRACE(::testing::Message() << "cp_size=" << cp_size << " decode_tp=" << decode_tp_size
                                                   << " mode=" << static_cast<int>(mode));
-                auto prefill_pc = makePc(cp_size, CPRotateMethod::ALL_GATHER, true);
-                prefill_pc.role_type = RoleType::PREFILL;
-                auto decode_pc = makePc(decode_tp_size, CPRotateMethod::PREFILL_CP, true);
-                decode_pc.role_type = RoleType::DECODE;
+                auto prefill_pc                             = makePc(cp_size, CPRotateMethod::ALL_GATHER, true);
+                prefill_pc.role_type                        = RoleType::PREFILL;
+                auto decode_pc                              = makePc(decode_tp_size, CPRotateMethod::PREFILL_CP, true);
+                decode_pc.role_type                         = RoleType::DECODE;
                 decode_pc.prefill_cp_config.prefill_cp_size = cp_size;
 
                 auto local_layout = [mode](const ParallelismConfig& pc) {
                     KVCacheSpecDesc desc;
-                    desc.tag                  = kFixedTag;
-                    desc.cache_type           = KVCacheSpecType::OpaqueState;
-                    desc.dtype                = DataType::TYPE_UINT8;
-                    desc.entry_dtype          = DataType::TYPE_UINT8;
-                    desc.entry_elems           = 64;
-                    desc.entry_count_mode      = OpaqueBlockEntryCountMode::EXPLICIT;
-                    desc.explicit_entry_count = 8;
-                    desc.cp                   = CacheCpPolicyDesc{};
-                    desc.cp->slice            = mode;
+                    desc.tag                      = kFixedTag;
+                    desc.cache_type               = KVCacheSpecType::OpaqueState;
+                    desc.dtype                    = DataType::TYPE_UINT8;
+                    desc.entry_dtype              = DataType::TYPE_UINT8;
+                    desc.entry_elems              = 64;
+                    desc.entry_count_mode         = OpaqueBlockEntryCountMode::EXPLICIT;
+                    desc.explicit_entry_count     = 8;
+                    desc.cp                       = CacheCpPolicyDesc{};
+                    desc.cp->slice                = mode;
                     desc.cp->prefill_slice_layout = mode == CpBlockSliceMode::PAYLOAD_BYTES ?
-                                                       CpPrefillSliceLayout::PAYLOAD :
-                                                       CpPrefillSliceLayout::BLOCK_STRIDE;
+                                                        CpPrefillSliceLayout::PAYLOAD :
+                                                        CpPrefillSliceLayout::BLOCK_STRIDE;
                     SpecBuildContext ctx;
                     ctx.seq_size_per_block = kSeqSizePerBlock;
                     ctx.parallelism_config = &pc;
-                    auto spec = FixedStateCacheSpec::build(desc, ctx);
+                    auto      spec         = FixedStateCacheSpec::build(desc, ctx);
                     GroupBase group;
-                    group.tag                       = kFixedTag;
-                    group.spec                      = spec;
-                    group.policy                    = defaultCacheGroupPolicy(CacheGroupType::SWA);
-                    group.policy.cp_slice           = mode;
-                    group.block_num                 = 8;
-                    auto topology = CacheTopology::create({group}, {{0, {kFixedTag}}});
+                    group.tag             = kFixedTag;
+                    group.spec            = spec;
+                    group.policy          = defaultCacheGroupPolicy(CacheGroupType::SWA);
+                    group.policy.cp_slice = mode;
+                    group.block_num       = 8;
+                    auto topology         = CacheTopology::create({group}, {{0, {kFixedTag}}});
                     return ShardLayoutFactory::fromTopology(*topology, pc, pc.role_type, kSeqSizePerBlock);
                 };
-                const auto prefill = local_layout(prefill_pc);
-                const auto decode = local_layout(decode_pc);
-                const auto inferred_prefill =
-                    ShardLayoutFactory::peerOf(decode, cp_size, true, RoleType::PREFILL);
+                const auto prefill          = local_layout(prefill_pc);
+                const auto decode           = local_layout(decode_pc);
+                const auto inferred_prefill = ShardLayoutFactory::peerOf(decode, cp_size, true, RoleType::PREFILL);
                 const auto inferred_decode =
                     ShardLayoutFactory::peerOf(prefill, decode_tp_size, true, RoleType::DECODE);
                 EXPECT_EQ(inferred_prefill.group(kFixedTag).k_block_payload_bytes,
@@ -1092,7 +1292,7 @@ TEST(PlannerGroupD, FactoryMirrorsCpStatePayloadFromRealSpecs) {
                 EXPECT_EQ(inferred_decode.group(kFixedTag).kv_block_stride_bytes,
                           decode.group(kFixedTag).kv_block_stride_bytes);
 
-                const auto on_decode = KVCacheTransferPlanner::plan(inferred_prefill, decode, {kFixedTag});
+                const auto on_decode  = KVCacheTransferPlanner::plan(inferred_prefill, decode, {kFixedTag});
                 const auto on_prefill = KVCacheTransferPlanner::plan(prefill, inferred_decode, {kFixedTag});
                 ASSERT_TRUE(on_decode.ok()) << on_decode.error.ToString();
                 ASSERT_TRUE(on_prefill.ok()) << on_prefill.error.ToString();
@@ -1186,14 +1386,11 @@ TEST(PlannerGroupD, D4_MirrorConsistencyAcrossSides) {
             const auto decode_as_seen_by_prefill =
                 ShardLayout::forPeer(prefill_self, decode_self.pc, /*peer_is_prefill_role=*/false);
 
-            const auto on_decode =
-                KVCacheTransferPlanner::plan(prefill_as_seen_by_decode, decode_self, {kFullTag});
-            const auto on_prefill =
-                KVCacheTransferPlanner::plan(prefill_self, decode_as_seen_by_prefill, {kFullTag});
+            const auto on_decode  = KVCacheTransferPlanner::plan(prefill_as_seen_by_decode, decode_self, {kFullTag});
+            const auto on_prefill = KVCacheTransferPlanner::plan(prefill_self, decode_as_seen_by_prefill, {kFullTag});
 
             ASSERT_EQ(on_decode.ok(), on_prefill.ok())
-                << "src tp=" << sc.tp_size << " dst tp=" << dc.tp_size
-                << " decode_err=" << on_decode.error.ToString()
+                << "src tp=" << sc.tp_size << " dst tp=" << dc.tp_size << " decode_err=" << on_decode.error.ToString()
                 << " prefill_err=" << on_prefill.error.ToString();
             if (!on_decode.ok()) {
                 continue;
@@ -1220,29 +1417,31 @@ TEST(PlannerGroupD, D4_MirrorConsistencyAcrossSides) {
     EXPECT_GT(checked, 0);
 }
 
-// 用例 D4b: 线上 factory 必须把角色相关的 CP method 规范化，不能照抄本端配置。
-// Prefill ALL_GATHER 的 attention cache 不按 TP 切 head，而 Decode PREFILL_CP 仍按 TP 切；
-// 两端仅知道对端 TP/CP 分片开关时，也必须独立推导出完全相同的 plan。
-TEST(PlannerGroupD, D4b_FactoryMirrorConsistencyForPrefillCpToDecodeTp) {
-    auto prefill_self = mhaLayout(2, CPRotateMethod::ALL_GATHER, /*sharded=*/false);
-    auto decode_self  = mhaLayout(2, CPRotateMethod::PREFILL_CP, /*sharded=*/false);
+// A non-sharded CP Prefill still has different attention head geometry from
+// ordinary TP. Decode must consume the advertised layout, not infer the CP
+// method from its own configuration or from cp_size == 1.
+TEST(PlannerGroupD, D4b_AdvertisedLayoutConsistencyForPrefillCpToDecodeTp) {
+    auto prefill_self         = mhaLayout(2, CPRotateMethod::ALL_GATHER, /*sharded=*/false);
+    auto decode_self          = mhaLayout(2, CPRotateMethod::PREFILL_CP, /*sharded=*/false);
     prefill_self.pc.role_type = RoleType::PREFILL;
     decode_self.pc.role_type  = RoleType::DECODE;
 
-    const auto prefill_as_seen_by_decode =
-        ShardLayoutFactory::peerOf(decode_self, /*peer_tp_size=*/2, /*peer_kv_cache_sharded=*/false, RoleType::PREFILL);
-    const auto decode_as_seen_by_prefill =
-        ShardLayoutFactory::peerOf(prefill_self, /*peer_tp_size=*/2, /*peer_kv_cache_sharded=*/false, RoleType::DECODE);
+    P2PShardLayoutPB advertised_prefill;
+    encodeP2PShardLayout(prefill_self, &advertised_prefill);
+    ShardLayout prefill_as_seen_by_decode;
+    ASSERT_TRUE(decodeP2PShardLayout(advertised_prefill, RoleType::PREFILL, prefill_as_seen_by_decode));
+    P2PShardLayoutPB advertised_decode;
+    encodeP2PShardLayout(decode_self, &advertised_decode);
+    ShardLayout decode_as_seen_by_prefill;
+    ASSERT_TRUE(decodeP2PShardLayout(advertised_decode, RoleType::DECODE, decode_as_seen_by_prefill));
 
     EXPECT_EQ(prefill_as_seen_by_decode.pc.prefill_cp_config.method, CPRotateMethod::ALL_GATHER);
     EXPECT_EQ(decode_as_seen_by_prefill.pc.prefill_cp_config.method, CPRotateMethod::PREFILL_CP);
     EXPECT_EQ(prefill_as_seen_by_decode.headShardCount(kFullTag), 1);
     EXPECT_EQ(decode_as_seen_by_prefill.headShardCount(kFullTag), 2);
 
-    const auto on_decode =
-        KVCacheTransferPlanner::plan(prefill_as_seen_by_decode, decode_self, {kFullTag});
-    const auto on_prefill =
-        KVCacheTransferPlanner::plan(prefill_self, decode_as_seen_by_prefill, {kFullTag});
+    const auto on_decode  = KVCacheTransferPlanner::plan(prefill_as_seen_by_decode, decode_self, {kFullTag});
+    const auto on_prefill = KVCacheTransferPlanner::plan(prefill_self, decode_as_seen_by_prefill, {kFullTag});
     ASSERT_TRUE(on_decode.ok()) << on_decode.error.ToString();
     ASSERT_TRUE(on_prefill.ok()) << on_prefill.error.ToString();
     ASSERT_EQ(on_decode.plan.routes.size(), on_prefill.plan.routes.size());
@@ -1373,24 +1572,23 @@ TEST(PlannerReplicaBalance, MultipleDecodeDpRequestsBalanceFullMlaTransfers) {
 }
 
 TEST(PlannerReplicaBalance, SameHostDecodeDpsDisperseFullMlaRequestsWithIndependentCounters) {
-    constexpr int kDecodeDpCount = 8;
+    constexpr int             kDecodeDpCount = 8;
     const std::vector<size_t> expected_keys{0, 1, 2, 3, 4, 5, 6};
     for (int prefill_ranks : {2, 4, 8}) {
         const auto src = mlaLayout(prefill_ranks);
         for (int request = 0; request < 32; ++request) {
             std::vector<size_t> transferred_bytes(prefill_ranks, 0);
             for (int dp = 0; dp < kDecodeDpCount; ++dp) {
-                auto dst = mlaLayout(1);
+                auto dst       = mlaLayout(1);
                 dst.pc.dp_size = kDecodeDpCount;
                 dst.pc.dp_rank = dp;
                 // Same IP and independent counters starting at the same value.
                 // Distinct arrival times supply distinct ip_counter_time handoff keys.
                 const auto key = "10.0.0.1_" + std::to_string(request) + "_"
                                  + std::to_string(1700000000000000LL + request * 100 + dp);
-                const auto offset = KVCacheTransferPlanner::sourceReplicaOffset(key, prefill_ranks);
+                const auto offset    = KVCacheTransferPlanner::sourceReplicaOffset(key, prefill_ranks);
                 const auto on_decode = KVCacheTransferPlanner::plan(
-                    ShardLayoutFactory::peerOf(dst, prefill_ranks, false, RoleType::PREFILL),
-                    dst, {kFullTag}, offset);
+                    ShardLayoutFactory::peerOf(dst, prefill_ranks, false, RoleType::PREFILL), dst, {kFullTag}, offset);
                 const auto on_prefill = KVCacheTransferPlanner::plan(
                     src, ShardLayoutFactory::peerOf(src, 1, false, RoleType::DECODE), {kFullTag}, offset);
                 ASSERT_TRUE(on_decode.ok()) << on_decode.error.ToString();

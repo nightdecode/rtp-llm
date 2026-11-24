@@ -17,6 +17,7 @@
 #include "rtp_llm/cpp/cache/block_tree_cache/group_set/GroupSet.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/load/LoadAsyncContext.h"
 #include "rtp_llm/cpp/cache/CPSlotMapper.h"
+#include "rtp_llm/cpp/cache/LinearKVCacheSpec.h"
 #include "rtp_llm/cpp/metrics/RtpLLMMetrics.h"
 #include <unordered_map>
 #include "rtp_llm/cpp/utils/TimeUtil.h"
@@ -2184,6 +2185,28 @@ std::vector<BlockInfo> CoordinatorCacheManager::convertIndexToBuffer(
     validateGroupIdForLayer(layer_id, group_id);
     return kv_cache_groups_[static_cast<size_t>(group_id)]->convertIndexToBuffer(
         layer_id, block_id, partition_count, partition_id);
+}
+
+std::vector<BlockInfo> CoordinatorCacheManager::convertLinearStatePartition(
+    int layer_id, const std::string& group_tag, int block_id, int partition_count, int partition_id) const {
+    const auto* spec  = dynamic_cast<const LinearKVCacheSpec*>(config_.topology().group(group_tag).spec.get());
+    const auto  block = convertIndexToBuffer(layer_id, group_tag, block_id);
+    RTP_LLM_CHECK_WITH_INFO(spec && block.size() == 1 && block.front().addr
+                                && block.front().size_bytes == spec->block_size_bytes(),
+                            "invalid LINEAR cache block for P2P transfer: layer=%d tag=%s block=%d",
+                            layer_id,
+                            group_tag.c_str(),
+                            block_id);
+    const auto             segments = spec->transferSegments(partition_count, partition_id);
+    std::vector<BlockInfo> result;
+    result.reserve(segments.size());
+    for (const auto& [offset, bytes] : segments) {
+        auto part       = block.front();
+        part.addr       = static_cast<char*>(part.addr) + offset;
+        part.size_bytes = bytes;
+        result.push_back(part);
+    }
+    return result;
 }
 
 void CoordinatorCacheManager::blockBatchCopy(const BlockIdPair* begin_ptr, const BlockIdPair* end_ptr) {

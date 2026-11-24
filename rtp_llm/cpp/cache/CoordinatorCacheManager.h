@@ -69,6 +69,8 @@ public:
     virtual std::vector<BlockInfo> convertIndexToBuffer(int layer_id, const std::string& group_tag, int block_id) const;
     virtual std::vector<BlockInfo> convertIndexToBuffer(
         int layer_id, const std::string& group_tag, int block_id, int partition_count, int partition_id) const;
+    std::vector<BlockInfo> convertLinearStatePartition(
+        int layer_id, const std::string& group_tag, int block_id, int partition_count, int partition_id) const;
     virtual std::shared_ptr<KVCacheResource>
     incrKVCacheRef(const KVCacheResource& kvcache_resource, const CacheKeysType& cache_keys, bool is_connector = false);
     virtual GroupedCacheLayerLayout allLayerCacheBase() const;

@@ -66,7 +66,7 @@ std::vector<size_t> KVCacheTransferPlanner::resolveKeys(const KeyShardSpec& spec
         return out;
     }
     const size_t modulus = static_cast<size_t>(std::max(1, spec.modulus));
-    const size_t residue  = static_cast<size_t>(std::max(0, spec.residue)) % modulus;
+    const size_t residue = static_cast<size_t>(std::max(0, spec.residue)) % modulus;
 
     const size_t split_count = static_cast<size_t>(std::max(1, spec.replica_split_count));
     const size_t split_index = static_cast<size_t>(std::max(0, spec.replica_split_index));
@@ -115,8 +115,7 @@ bool KVCacheTransferPlanner::ownsPosition(
     return CPSlotMapper::physicalBlockPosition(policy, pos, count, cp_rank, side.physicalCpSize(tag)).has_value();
 }
 
-ErrorInfo
-KVCacheTransferPlanner::validateTag(const ShardLayout& src, const ShardLayout& dst, const std::string& tag) {
+ErrorInfo KVCacheTransferPlanner::validateTag(const ShardLayout& src, const ShardLayout& dst, const std::string& tag) {
     if (!src.hasGroup(tag) || !dst.hasGroup(tag)) {
         return planError("tag '" + tag + "' missing on " + (src.hasGroup(tag) ? "dst" : "src") + " layout");
     }
@@ -124,8 +123,9 @@ KVCacheTransferPlanner::validateTag(const ShardLayout& src, const ShardLayout& d
     const auto& dg = dst.group(tag);
 
     if (sg.policy.group_type != dg.policy.group_type) {
-        return planError(std::string("group_type mismatch for tag '") + tag + "': src="
-                         + cacheGroupTypeName(sg.policy.group_type) + " dst=" + cacheGroupTypeName(dg.policy.group_type));
+        return planError(std::string("group_type mismatch for tag '") + tag
+                         + "': src=" + cacheGroupTypeName(sg.policy.group_type)
+                         + " dst=" + cacheGroupTypeName(dg.policy.group_type));
     }
     if (src.cache_key_tokens_per_block == 0 || src.cache_key_tokens_per_block != dst.cache_key_tokens_per_block) {
         return planError("cache-key token stride mismatch or zero for tag '" + tag
@@ -154,15 +154,12 @@ KVCacheTransferPlanner::validateTag(const ShardLayout& src, const ShardLayout& d
         return planError(oss.str());
     }
     if (sg.spec_type != dg.spec_type) {
-        return planError(std::string("spec_type mismatch for tag '") + tag
-                         + "': src=" + KVCacheSpecTypeToString(sg.spec_type)
-                         + " dst=" + KVCacheSpecTypeToString(dg.spec_type));
+        return planError(std::string("spec_type mismatch for tag '") + tag + "': src="
+                         + KVCacheSpecTypeToString(sg.spec_type) + " dst=" + KVCacheSpecTypeToString(dg.spec_type));
     }
 
-    // Linear state is [ssm][conv], not equally sized K/V regions. The
-    // execution converter cannot repartition it across unequal head shards.
-    if (sg.spec_type == KVCacheSpecType::LinearAttention
-        && src.headShardCount(tag) != dst.headShardCount(tag)) {
+    if (sg.spec_type == KVCacheSpecType::LinearAttention && src.headShardCount(tag) != dst.headShardCount(tag)
+        && !(src.use_mla && dst.use_mla)) {
         return planError("LinearAttention asymmetric head sharding is unsupported for tag '" + tag + "'");
     }
     // The side with fewer shards must partition each larger block. Even an
@@ -209,8 +206,7 @@ KVCacheTransferPlanner::validateTag(const ShardLayout& src, const ShardLayout& d
         const size_t dst_global = dst.effectiveGlobalBlockBytes(tag);
         if (src_global != dst_global) {
             std::ostringstream oss;
-            oss << "global block bytes mismatch for tag '" << tag << "': src=" << src_global
-                << " dst=" << dst_global;
+            oss << "global block bytes mismatch for tag '" << tag << "': src=" << src_global << " dst=" << dst_global;
             return planError(oss.str());
         }
     }
@@ -227,8 +223,7 @@ KVCacheTransferPlanner::validateTag(const ShardLayout& src, const ShardLayout& d
     if (dst.cpSize() != 1 && dst.cpSize() != src.cpSize()) {
         std::ostringstream oss;
         oss << "unsupported CP topology for tag '" << tag << "': src cp_size=" << src.cpSize()
-            << " dst cp_size=" << dst.cpSize()
-            << "; dst must be either unsharded (1) or exactly match src";
+            << " dst cp_size=" << dst.cpSize() << "; dst must be either unsharded (1) or exactly match src";
         return planError(oss.str());
     }
 
@@ -272,8 +267,9 @@ KVCacheTransferPlanner::validateTag(const ShardLayout& src, const ShardLayout& d
         if (side.headShardCount(tag) > 1) {
             std::ostringstream oss;
             oss << "tag '" << tag << "' is double-sharded on " << sideName(is_src)
-                << " side: head_shard_count=" << side.headShardCount(tag) << " and block round-robin cp_size="
-                << side.cpSize() << "; rank r only holds (head r) x (block == r mod cp_size), "
+                << " side: head_shard_count=" << side.headShardCount(tag)
+                << " and block round-robin cp_size=" << side.cpSize()
+                << "; rank r only holds (head r) x (block == r mod cp_size), "
                 << "so most (head, block) pairs are held by nobody";
             return planError(oss.str());
         }
@@ -395,8 +391,8 @@ ErrorInfo KVCacheTransferPlanner::buildCpPairs(const ShardLayout&   src,
                 // 非 FULL group（COMPACT/SWA）本就只在部分位置有 cache 条目，跳过。
                 if (is_full_group) {
                     std::ostringstream oss;
-                    oss << "tag '" << tag << "' has no provider for logical position residue " << pos
-                        << " (mod " << modulus << ") needed by dst cp_rank " << dst_cp;
+                    oss << "tag '" << tag << "' has no provider for logical position residue " << pos << " (mod "
+                        << modulus << ") needed by dst cp_rank " << dst_cp;
                     return planError(oss.str());
                 }
                 continue;
@@ -426,8 +422,8 @@ ErrorInfo KVCacheTransferPlanner::buildCpPairs(const ShardLayout&   src,
         int collapsed_modulus = modulus;
         int collapsed_residue = residues.front();
         if (collapseResidues(residues, modulus, collapsed_modulus, collapsed_residue)) {
-            pair.keys.modulus = collapsed_modulus;
-            pair.keys.residue = collapsed_residue;
+            pair.keys.modulus           = collapsed_modulus;
+            pair.keys.residue           = collapsed_residue;
             pair.keys.include_final_key = is_compact;
             pair.keys.tail_count        = tail_count;
             if (is_compact) {
@@ -439,11 +435,11 @@ ErrorInfo KVCacheTransferPlanner::buildCpPairs(const ShardLayout&   src,
             std::set<int> unique(residues.begin(), residues.end());
             bool          first = true;
             for (int r : unique) {
-                CpPair per_residue      = pair;
-                per_residue.keys.modulus = modulus;
-                per_residue.keys.residue = r;
+                CpPair per_residue                 = pair;
+                per_residue.keys.modulus           = modulus;
+                per_residue.keys.residue           = r;
                 per_residue.keys.include_final_key = is_compact && first;
-                per_residue.keys.tail_count         = tail_count;
+                per_residue.keys.tail_count        = tail_count;
                 if (per_residue.keys.include_final_key) {
                     ++final_key_route_count[{dst_cp, slice_index}];
                 }
@@ -456,8 +452,8 @@ ErrorInfo KVCacheTransferPlanner::buildCpPairs(const ShardLayout&   src,
     for (const auto& [key, count] : final_key_route_count) {
         if (count > 1) {
             std::ostringstream oss;
-            oss << "tag '" << tag << "' would attach the COMPACT final key to " << count
-                << " routes for dst cp_rank " << key.first
+            oss << "tag '" << tag << "' would attach the COMPACT final key to " << count << " routes for dst cp_rank "
+                << key.first
                 << ", which would overlap their key sets; this src/dst CP mapping combination is unsupported";
             return planError(oss.str());
         }
@@ -608,10 +604,16 @@ PlanResult KVCacheTransferPlanner::plan(const ShardLayout&              src,
                     route.src_keys      = cp_pair.keys;
                     route.src_partition = head_pair.src_partition;
                     route.dst_partition = head_pair.dst_partition;
+                    if (src.group(tag).spec_type == KVCacheSpecType::LinearAttention
+                        && (route.src_partition.count > 1 || route.dst_partition.count > 1)) {
+                        // Both peers need the same segment order, including the peer sending a full head shard.
+                        route.src_partition.segment_linear_state = true;
+                        route.dst_partition.segment_linear_state = true;
+                    }
                     assignSlices(src, dst, tag, cp_pair, route.src_slice, route.dst_slice);
 
-                    route.src_bytes = viewBytes(src.group(tag), route.src_partition, route.src_slice);
-                    route.dst_bytes = viewBytes(dst.group(tag), route.dst_partition, route.dst_slice);
+                    route.src_bytes                  = viewBytes(src.group(tag), route.src_partition, route.src_slice);
+                    route.dst_bytes                  = viewBytes(dst.group(tag), route.dst_partition, route.dst_slice);
                     route.cache_key_tokens_per_block = src.cache_key_tokens_per_block;
                     route.group_tokens_per_block     = src.group(tag).seq_size_per_block;
 
@@ -635,20 +637,239 @@ PlanResult KVCacheTransferPlanner::plan(const ShardLayout&              src,
     return result;
 }
 
-uint64_t TransferPlan::digest() const {
-    // FNV-1a over the route fields, in vector order.
-    uint64_t       hash  = 14695981039346656037ULL;
-    constexpr auto prime = 1099511628211ULL;
-    auto           mix   = [&hash](uint64_t value) {
+namespace {
+
+struct PlanDigest {
+    uint64_t hash = 14695981039346656037ULL;
+
+    void mix(uint64_t value) {
         for (int i = 0; i < 8; ++i) {
             hash ^= (value >> (i * 8)) & 0xffULL;
-            hash *= prime;
+            hash *= 1099511628211ULL;
         }
+    }
+
+    void mixString(const std::string& value) {
+        mix(value.size());
+        for (unsigned char byte : value) {
+            mix(byte);
+        }
+    }
+};
+
+ErrorInfo validatePipeline(const PipelineTransferLayout& side, int& main_layers, PlanDigest& digest) {
+    if (side.stages.empty() || side.worker_count == 0) {
+        return planError("PP layout has no stages or workers");
+    }
+    digest.mix(side.worker_count);
+    digest.mix(side.stages.size());
+    std::set<int> used_workers;
+    for (size_t s = 0; s < side.stages.size(); ++s) {
+        const auto& stage = side.stages[s];
+        if (stage.main_layer_begin != main_layers || stage.main_layer_count <= 0
+            || stage.layer_tags.size() < static_cast<size_t>(stage.main_layer_count)
+            || stage.layer_tags.size() > static_cast<size_t>(std::numeric_limits<int>::max() - main_layers)) {
+            return planError("invalid main-layer interval for PP stage " + std::to_string(s));
+        }
+        main_layers += stage.main_layer_count;
+        const bool has_draft = stage.layer_tags.size() > static_cast<size_t>(stage.main_layer_count);
+        const auto tp        = stage.main_shards.pc.tp_size;
+        if (has_draft && (s + 1 != side.stages.size() || stage.draft_shards.pc.tp_size != tp)) {
+            return planError("invalid draft layout for PP stage " + std::to_string(s));
+        }
+        if (tp <= 0 || tp > kMaxPlanRankCount || stage.worker_indices.size() != static_cast<size_t>(tp)) {
+            return planError("worker count does not match TP width for PP stage " + std::to_string(s));
+        }
+        digest.mix(stage.main_layer_begin);
+        digest.mix(stage.main_layer_count);
+        digest.mix(stage.worker_indices.size());
+        for (int worker : stage.worker_indices) {
+            if (worker < 0 || static_cast<size_t>(worker) >= side.worker_count || !used_workers.insert(worker).second) {
+                return planError("invalid or duplicate worker index for PP stage " + std::to_string(s));
+            }
+            digest.mix(worker);
+        }
+        for (const auto* shards : {&stage.main_shards, &stage.draft_shards}) {
+            digest.mix(shards->rankCount());
+            digest.mix(shards->pc.get_attn_tp_size());
+            digest.mix(shards->cpSize());
+            digest.mix(shards->cache_key_tokens_per_block);
+            digest.mix(shards->use_mla);
+            digest.mix(shards->use_group_cache_transfer_policy);
+            digest.mix(shards->groups.size());
+            for (const auto& [tag, group] : shards->groups) {
+                const int heads = group.head_shard_count;
+                if (heads <= 0 || shards->pc.get_attn_tp_size() % heads != 0) {
+                    return planError("invalid head shard count for PP stage " + std::to_string(s) + " tag=" + tag);
+                }
+                digest.mixString(tag);
+                digest.mix(static_cast<int>(group.policy.group_type));
+                digest.mix(static_cast<int>(group.policy.cp_mapping));
+                digest.mix(static_cast<int>(group.policy.cp_slice));
+                digest.mix(group.policy.active_tail_blocks);
+                digest.mix(group.spec_type);
+                digest.mix(group.kv_block_stride_bytes);
+                digest.mix(group.kv_scale_stride_bytes);
+                digest.mix(group.k_block_payload_bytes);
+                digest.mix(group.seq_size_per_block);
+                digest.mix(group.pre_sliced);
+                digest.mix(group.global_kv_heads);
+                digest.mix(heads);
+                digest.mix(shards->physicalCpSize(tag));
+            }
+        }
+        digest.mix(stage.layer_tags.size());
+        for (size_t layer = 0; layer < stage.layer_tags.size(); ++layer) {
+            const auto& shards =
+                layer < static_cast<size_t>(stage.main_layer_count) ? stage.main_shards : stage.draft_shards;
+            const auto&                 tags = stage.layer_tags[layer];
+            const std::set<std::string> ordered(tags.begin(), tags.end());
+            if (ordered.empty() || ordered.size() != tags.size()) {
+                return planError("empty or duplicate layer tags for PP stage " + std::to_string(s)
+                                 + " local_layer=" + std::to_string(layer));
+            }
+            digest.mix(ordered.size());
+            for (const auto& tag : ordered) {
+                if (tag.empty() || !shards.hasGroup(tag)) {
+                    return planError("missing layout for PP stage " + std::to_string(s) + " tag=" + tag);
+                }
+                if (!side.stages.front().main_shards.hasGroup(tag)) {
+                    return planError("PP cache tag has no Stage 0 block table: " + tag);
+                }
+                digest.mixString(tag);
+            }
+        }
+    }
+    return used_workers.size() == side.worker_count ? ErrorInfo::OkStatus() : planError("PP worker list is incomplete");
+}
+
+}  // namespace
+
+PlanResult KVCacheTransferPlanner::planStages(const PipelineTransferLayout& prefill,
+                                              const PipelineTransferLayout& decode,
+                                              const std::string&            unique_key) {
+    PlanDigest layout_digest;
+    int        prefill_main = 0, decode_main = 0;
+    auto       error = validatePipeline(prefill, prefill_main, layout_digest);
+    if (error.ok()) {
+        error = validatePipeline(decode, decode_main, layout_digest);
+    }
+    if (!error.ok()) {
+        return {{}, std::move(error)};
+    }
+    if (prefill_main != decode_main) {
+        return {{}, planError("Prefill and Decode cover different main-model layers")};
+    }
+    const auto draftCount = [](const auto& stage) {
+        return static_cast<int>(stage.layer_tags.size()) - stage.main_layer_count;
     };
+    const int draft_layers         = draftCount(decode.stages.back());
+    const int prefill_draft_layers = draftCount(prefill.stages.back());
+    if (prefill_draft_layers < draft_layers) {
+        return {{},
+                planError("Prefill is missing draft layers required by Decode: Prefill="
+                          + std::to_string(prefill_draft_layers) + " Decode=" + std::to_string(draft_layers))};
+    }
+
+    TransferPlan result;
+    result.layout_digest = layout_digest.hash;
+    for (size_t s = 0, d = 0; s < prefill.stages.size() && d < decode.stages.size();) {
+        const auto& src     = prefill.stages[s];
+        const auto& dst     = decode.stages[d];
+        const int   src_end = src.main_layer_begin + src.main_layer_count;
+        const int   dst_end = dst.main_layer_begin + dst.main_layer_count;
+        const auto  append_routes =
+            [&](int begin, int end, const ShardLayout& src_shards, const ShardLayout& dst_shards) -> ErrorInfo {
+            // Order by the exact layer set, then by tag, then by the TP planner's route order.
+            std::map<std::string, std::vector<int>> layers_by_tag;
+            for (int layer = begin; layer < end; ++layer) {
+                const auto& src_tags = src.layer_tags[layer - src.main_layer_begin];
+                for (const auto& tag : dst.layer_tags[layer - dst.main_layer_begin]) {
+                    if (std::find(src_tags.begin(), src_tags.end(), tag) == src_tags.end()) {
+                        return planError("Prefill is missing global layer " + std::to_string(layer) + " tag=" + tag);
+                    }
+                    layers_by_tag[tag].push_back(layer);
+                }
+            }
+            std::vector<std::pair<std::vector<int>, std::string>> groups;
+            for (auto& [tag, layers] : layers_by_tag) {
+                groups.emplace_back(std::move(layers), tag);
+            }
+            std::sort(groups.begin(), groups.end());
+            const auto offset = sourceReplicaOffset(unique_key, src_shards.rankCount());
+            for (const auto& [layers, tag] : groups) {
+                auto shards = plan(src_shards, dst_shards, {tag}, offset);
+                if (!shards.ok()) {
+                    return shards.error;
+                }
+                std::set<int> covered_lanes;
+                for (auto& route : shards.plan.routes) {
+                    covered_lanes.insert(route.dst_rank);
+                    const size_t src_scale = src_shards.group(tag).kv_scale_stride_bytes;
+                    const size_t dst_scale = dst_shards.group(tag).kv_scale_stride_bytes;
+                    const auto   src_parts = static_cast<size_t>(route.src_partition.count);
+                    const auto   dst_parts = static_cast<size_t>(route.dst_partition.count);
+                    if (src_scale % src_parts != 0 || dst_scale % dst_parts != 0
+                        || src_scale / src_parts != dst_scale / dst_parts
+                        || (src_scale != 0 && (route.src_slice.count > 1 || route.dst_slice.count > 1))) {
+                        return planError("incompatible scale layout for PP transfer tag=" + tag);
+                    }
+                    if (result.routes.size() >= static_cast<size_t>(std::numeric_limits<int>::max())) {
+                        return planError("PP transfer has too many routes");
+                    }
+                    route.route_id                = static_cast<int>(result.routes.size());
+                    route.src_rank                = src.worker_indices[route.src_rank];
+                    route.dst_rank                = dst.worker_indices[route.dst_rank];
+                    route.src_slice_payload_bytes = src_shards.group(tag).k_block_payload_bytes;
+                    route.dst_slice_payload_bytes = dst_shards.group(tag).k_block_payload_bytes;
+                    for (int layer : layers) {
+                        route.layers.push_back({layer, layer - src.main_layer_begin, layer - dst.main_layer_begin});
+                    }
+                    result.routes.push_back(std::move(route));
+                }
+                if (covered_lanes.size() != dst.worker_indices.size()) {
+                    return planError("incomplete PP route coverage for global layer " + std::to_string(layers.front())
+                                     + " tag=" + tag);
+                }
+            }
+            return ErrorInfo::OkStatus();
+        };
+        error = append_routes(std::max(src.main_layer_begin, dst.main_layer_begin),
+                              std::min(src_end, dst_end),
+                              src.main_shards,
+                              dst.main_shards);
+        if (error.ok() && src_end == prefill_main && dst_end == decode_main && draft_layers > 0) {
+            error = append_routes(prefill_main, prefill_main + draft_layers, src.draft_shards, dst.draft_shards);
+        }
+        if (!error.ok()) {
+            return {{}, std::move(error)};
+        }
+        s += src_end <= dst_end;
+        d += dst_end <= src_end;
+    }
+    return {std::move(result), ErrorInfo::OkStatus()};
+}
+
+uint64_t TransferPlan::digest() const {
+    PlanDigest digest;
+    const auto mix = [&digest](uint64_t value) { digest.mix(value); };
+    if (layout_digest != 0) {
+        mix(layout_digest);
+    }
     for (const auto& r : routes) {
         mix(static_cast<uint64_t>(r.route_id));
         mix(static_cast<uint64_t>(r.src_rank));
         mix(static_cast<uint64_t>(r.dst_rank));
+        if (!r.layers.empty()) {
+            mix(r.layers.size());
+            for (const auto& layer : r.layers) {
+                mix(layer.global_id);
+                mix(layer.src_local_id);
+                mix(layer.dst_local_id);
+            }
+            mix(r.src_slice_payload_bytes);
+            mix(r.dst_slice_payload_bytes);
+        }
         for (char c : r.cache_tag) {
             mix(static_cast<uint64_t>(static_cast<unsigned char>(c)));
         }
@@ -662,6 +883,9 @@ uint64_t TransferPlan::digest() const {
         mix(static_cast<uint64_t>(r.src_partition.id));
         mix(static_cast<uint64_t>(r.dst_partition.count));
         mix(static_cast<uint64_t>(r.dst_partition.id));
+        if (r.src_partition.segment_linear_state && r.dst_partition.segment_linear_state) {
+            mix(1);
+        }
         mix(static_cast<uint64_t>(r.src_slice.mode));
         mix(static_cast<uint64_t>(r.src_slice.count));
         mix(static_cast<uint64_t>(r.src_slice.index));
@@ -673,12 +897,10 @@ uint64_t TransferPlan::digest() const {
         mix(static_cast<uint64_t>(r.cache_key_tokens_per_block));
         mix(static_cast<uint64_t>(r.group_tokens_per_block));
     }
-    return hash;
+    return digest.hash;
 }
 
-ShardLayout ShardLayout::forPeer(const ShardLayout&       self,
-                                 const ParallelismConfig& peer_pc,
-                                 bool                     peer_is_prefill_role) {
+ShardLayout ShardLayout::forPeer(const ShardLayout& self, const ParallelismConfig& peer_pc, bool peer_is_prefill_role) {
     ShardLayout peer;
     peer.pc                              = peer_pc;
     peer.cache_key_tokens_per_block      = self.cache_key_tokens_per_block;
@@ -695,8 +917,8 @@ ShardLayout ShardLayout::forPeer(const ShardLayout&       self,
         g.pre_sliced = peer_is_prefill_role && slice_active;
 
         // 还原全局再除对端因子；等价于以替换后的 pc 调 localKvHeadNumForSpec。
-        const size_t global_kv    = self.effectiveGlobalBlockBytes(tag);
-        size_t       divisor      = static_cast<size_t>(std::max(1, peer.headShardCount(tag)));
+        const size_t global_kv = self.effectiveGlobalBlockBytes(tag);
+        size_t       divisor   = static_cast<size_t>(std::max(1, peer.headShardCount(tag)));
         if (g.pre_sliced) {
             divisor *= static_cast<size_t>(std::max(1, peer.cpSize()));
         }
@@ -705,8 +927,8 @@ ShardLayout ShardLayout::forPeer(const ShardLayout&       self,
         // PAYLOAD_BYTES changes the spec's payload as well as its stride.
         // EQUAL_BYTES only slices the stride; its spec still describes the full
         // payload, so it must not use the stride's CP divisor here.
-        size_t global_payload = self.group(tag).k_block_payload_bytes
-                                * static_cast<size_t>(std::max(1, self.headShardCount(tag)));
+        size_t global_payload =
+            self.group(tag).k_block_payload_bytes * static_cast<size_t>(std::max(1, self.headShardCount(tag)));
         if (self.group(tag).pre_sliced && self.effectiveSlice(tag) == CpBlockSliceMode::PAYLOAD_BYTES) {
             global_payload *= static_cast<size_t>(self.cpSize());
         }
@@ -717,12 +939,11 @@ ShardLayout ShardLayout::forPeer(const ShardLayout&       self,
         g.k_block_payload_bytes = global_payload / payload_divisor;
 
         if (self.group(tag).kv_scale_stride_bytes > 0) {
-            const size_t self_divisor = static_cast<size_t>(std::max(1, self.headShardCount(tag)))
-                                        * (self.group(tag).pre_sliced ?
-                                               static_cast<size_t>(std::max(1, self.cpSize())) :
-                                               1);
+            const size_t self_divisor =
+                static_cast<size_t>(std::max(1, self.headShardCount(tag)))
+                * (self.group(tag).pre_sliced ? static_cast<size_t>(std::max(1, self.cpSize())) : 1);
             const size_t global_scale = self.group(tag).kv_scale_stride_bytes * self_divisor;
-            g.kv_scale_stride_bytes    = global_scale / divisor;
+            g.kv_scale_stride_bytes   = global_scale / divisor;
         }
     }
     return peer;
