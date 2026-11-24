@@ -67,6 +67,17 @@ alias(
 )
 
 runfiles_alias(
+    name = "pace_smoke_manager_startup_config",
+    src = select({
+        "@//:using_cuda13_x86": "@pace_test_kvcm_manager_x86//:etc/default_startup_config.json",
+        "@//:using_cuda13_arm": "@pace_test_kvcm_manager_arm//:etc/default_startup_config.json",
+    }),
+    runfile_path = "3rdparty/remote_kv_cache_manager/etc/default_startup_config.json",
+    testonly = True,
+    visibility = ["//rtp_llm/test/smoke:__pkg__"],
+)
+
+runfiles_alias(
     name = "remote_kv_cache_manager_server_bin",
     src = select({
         ":pace_smoke_prebuilt": ":pace_smoke_manager_bin",

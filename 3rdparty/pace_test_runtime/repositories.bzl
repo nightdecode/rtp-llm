@@ -67,5 +67,5 @@ def pace_test_deps():
             type = "tar",
             strip_prefix = "home/admin/kv_cache_manager",
             patch_cmds = ["tar -xzf kv_cache_manager_server.tar.gz"],
-            build_file_content = 'exports_files(["bin/kv_cache_manager_bin"])',
+            build_file_content = 'exports_files(["bin/kv_cache_manager_bin", "etc/default_startup_config.json"])',
         )

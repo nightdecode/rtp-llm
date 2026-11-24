@@ -157,7 +157,10 @@ sh_binary(
         "scripts/start_pace_smoke.py",
         "//tools:nvidia_wheel_env",
     ] + select({
-        "//3rdparty/remote_kv_cache_manager:pace_smoke_prebuilt": ["//3rdparty/pace_test_runtime:runtime"],
+        "//3rdparty/remote_kv_cache_manager:pace_smoke_prebuilt": [
+            "//3rdparty/pace_test_runtime:runtime",
+            "//3rdparty/remote_kv_cache_manager:pace_smoke_manager_startup_config",
+        ],
         "//conditions:default": [],
     }),
 )
