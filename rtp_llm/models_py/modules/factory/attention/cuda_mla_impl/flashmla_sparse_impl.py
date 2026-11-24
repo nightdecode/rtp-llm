@@ -66,6 +66,43 @@ from .rope_emb_new import NewMlaRotaryEmbeddingOp
 # PPU's flash_mla binding requires a concrete tile scheduler (no None path).
 _IS_PPU = is_ppu()
 
+# CUDA Graph 的 padding 行重置，默认开；置 0 做 A/B 对照。
+_DECODE_PAD_RESET = os.environ.get("RTP_GLM_DECODE_PAD_RESET", "1") != "0"
+
+
+def reset_graph_pad_rows(attn_inputs) -> None:
+    """让 CUDA Graph 的 padding 行表现为空请求，而不是满长度请求。
+
+    捕获时 ``sequence_lengths`` 被整条填成 ``max_seq_len - 2``，于是
+    ``sequence_lengths_plus_1_device`` 整条是 ``max_seq_len - 1``；replay 只对前
+    ``current_batch_size`` 行做设备到设备拷贝，padding 行一直保留着捕获时的值。把它们
+    重置成 1 的代码只在投机解码的 target verify 分支里，普通 decode 走不到
+    （rtp_llm/cpp/cuda_graph/cuda_graph_runner.cc）。
+
+    后果是注意力数据并行下没有请求的 rank：padding 行被当成上下文接近 ``max_seq_len``
+    的请求，而同一次 replay 里块表被整体清零、这些行都指向保留块 0，于是 indexer 在块 0
+    上选满 top-k，稀疏注意力按满 top-k 扫一遍。并发 1 实测每层 73.9 μs，sglang 对应的
+    空闲 rank 只要 13.2 μs（两边同一个 ``flash_sparse_prefill_fwd_hs64``，启动网格都是
+    ``(1,1,1,512,1,1)``）。
+
+    块 0 由 BlockPool 永久保留、真实请求不会拿到，所以块表首列为 0 就是 padding 行。
+    判断和写入都在设备上完成，不读回主机，也不依赖真实 batch 的行数。
+    """
+    if not _DECODE_PAD_RESET or getattr(attn_inputs, "is_prefill", True):
+        return
+    lengths = getattr(attn_inputs, "sequence_lengths_plus_1_device", None)
+    block_table = getattr(attn_inputs, "kv_cache_kernel_block_id_device", None)
+    if lengths is None or block_table is None:
+        return
+    if not isinstance(lengths, torch.Tensor) or not isinstance(block_table, torch.Tensor):
+        return
+    if lengths.numel() == 0 or block_table.numel() == 0 or block_table.dim() < 2:
+        return
+    rows = min(int(lengths.shape[0]), int(block_table.shape[0]))
+    if rows == 0:
+        return
+    lengths[:rows].masked_fill_(block_table[:rows, 0] == 0, 1)
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -720,6 +757,9 @@ class SparseMlaImpl(MlaImplBase):
         )
 
     def prepare_cuda_graph(self, attn_inputs: PyAttentionInputs) -> None:
+        # 每次 replay 之前由 C++ 的 callPrepareCudaGraph 调到这里，必须在下面的 fill /
+        # plan 读 sequence_lengths_plus_1_device 之前把 padding 行压回空请求。
+        reset_graph_pad_rows(attn_inputs)
         if (
             _is_multi_token_decode(attn_inputs)
             and isinstance(self.fmha_impl, SparseMlaFp8Op)
