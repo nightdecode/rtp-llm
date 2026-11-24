@@ -260,9 +260,11 @@ void verifyPool(TransferClient& transfer, WriteLocation& write, const std::strin
 int main(int argc, char** argv) {
     using namespace kv_cache_manager;
     try {
-        const std::string usage = "Expected config path, backend type, [--gdr] [--fault CASE SOCKET]";
+        const std::string usage = "Expected config path, backend type, [--gdr|--aft-gdr] [--fault CASE SOCKET]";
         require(argc >= 3, usage);
-        const bool use_gpu = argc > 3 && std::string(argv[3]) == "--gdr";
+        const std::string buffer_mode = argc > 3 ? argv[3] : "";
+        const bool aft_gdr = buffer_mode == "--aft-gdr";
+        const bool use_gpu = buffer_mode == "--gdr" || aft_gdr;
         const int fault_arg = use_gpu ? 4 : 3;
         require(argc == fault_arg || (argc == fault_arg + 3 && std::string(argv[fault_arg]) == "--fault"), usage);
         const std::string fault = argc > fault_arg ? argv[fault_arg + 1] : "";
@@ -278,7 +280,8 @@ int main(int argc, char** argv) {
         require(meta != nullptr, "MetaClient::Create failed");
         params.storage_configs = meta->GetStorageConfig();
         GpuPool full_pool(use_gpu);
-        GpuPool state_pool(use_gpu);
+        GpuPool second_pool(use_gpu && !aft_gdr);
+        const auto& state_pool = aft_gdr ? full_pool : second_pool;
         std::vector<std::vector<uint8_t>> fault_data;
         BlockBuffers fault_buffers;
         if (!fault.empty()) {
@@ -286,8 +289,12 @@ int main(int argc, char** argv) {
             fault_buffers = buffers(fault_data, nullptr);
         }
         auto full = full_pool.createClient(config, params);
-        params.self_location_spec_name = "state";
-        auto state = state_pool.createClient(config, params);
+        std::unique_ptr<TransferClient> separate_state;
+        if (!aft_gdr) {
+            params.self_location_spec_name = "state";
+            separate_state = state_pool.createClient(config, params);
+        }
+        auto* state = aft_gdr ? full.get() : separate_state.get();
         require(full != nullptr && state != nullptr, "TransferClient::Create failed");
         const auto backend = static_cast<StorageType>(std::stoi(argv[2]));
         const int64_t nonce = std::chrono::system_clock::now().time_since_epoch().count();

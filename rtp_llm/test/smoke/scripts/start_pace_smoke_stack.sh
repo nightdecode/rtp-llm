@@ -5,9 +5,10 @@ usage() {
     printf '%s\n' \
         'Usage: start_pace_smoke_stack.sh [--faults] [--source PUBLIC_SHA INTERNAL_SHA MEMPOOL_SHA]' \
         '       UID:GID IMAGE BIN_DIR|- NEW_WORK_DIR' \
-        '       [tcp | aft RDMA_DEVICE | rdma|gdr RDMA_DEVICE [RDMA_PORT [GID_INDEX]]]' \
+        '       [tcp | (aft|aft-rdma|aft-gdr) RDMA_DEVICE | (rdma|gdr) RDMA_DEVICE [RDMA_PORT [GID_INDEX]]]' \
         '       -- [CONSUMER_DOCKER_OPTIONS...] -- COMMAND [ARG ...]' \
-        'Use aft for the Provider-offline GDR test. --faults enables TCP fault cases.' \
+        'Use aft-rdma or aft-gdr for native AFT I/O, aft for the Provider-offline GDR test.' \
+        '--faults enables TCP fault cases.' \
         'Use - to let COMMAND prepare the prebuilt runtime before the stack starts.' \
         'With --source, BIN_DIR is a persistent build cache and COMMAND is run_pace_smoke.sh.'
 }
@@ -61,8 +62,12 @@ case "$transport" in
     tcp)
         if (( ${#options[@]} > 5 )); then usage >&2; exit 2; fi
         ;;
-    aft)
+    aft|aft-rdma|aft-gdr)
         if (( ${#options[@]} != 6 )); then usage >&2; exit 2; fi
+        if (( enable_faults )) && [[ $transport != aft ]]; then
+            printf 'Use aft for Provider-offline recovery or --faults tcp for TCP faults.\n' >&2
+            exit 2
+        fi
         transport_args+=(--rdma-device "${options[5]}")
         for node in /sys/class/infiniband_verbs/uverbs*; do
             if [[ -r $node/ibdev && $(< "$node/ibdev") == "${options[5]}" ]] &&
@@ -321,6 +326,8 @@ wait_http "$!" "$provider_status_url" "$work_dir/provider-status.json"
 consumer_args=()
 if [[ $transport == aft ]]; then
     consumer_args=(--provider-offline-dir "$state/run/offline")
+elif [[ $transport == aft-rdma ]]; then
+    consumer_args=(--provider-metrics-url "http://$provider_ip:$((data_port_base + 3))/pace/metrics")
 elif (( enable_faults )); then
     fault_socket="$state/fault.sock"
     consumer_args=(--fault-socket "$fault_socket")

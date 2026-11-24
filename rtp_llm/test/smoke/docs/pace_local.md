@@ -12,18 +12,21 @@ transport counters and Bazel test outputs in the new run directory.
 
 | Launcher mode | Test |
 | --- | --- |
+| `aft-rdma RDMA_DEVICE` | Native AFT read/write smoke with CPU buffers. Checks payload bytes and requires a completed Provider RDMA read. |
+| `aft-gdr RDMA_DEVICE` | Native AFT read/write smoke with GPU buffers. Requires successful GPUDirect read bytes; writes use staging. |
 | `aft RDMA_DEVICE` | Primary RDMA test: one Qwen Prefill with native AFT and GDR reads. Takes the Provider offline and verifies safe release of the original RTP frozen blocks. |
 | `tcp` (default) | TENT TCP SDK smoke with byte-for-byte readback. Add `--faults` for slow reads, slow writes, and packet loss. No RTP thaw assertion. |
 | `rdma RDMA_DEVICE` or `gdr RDMA_DEVICE` | Existing TENT transport diagnostics. Checks payload and transport counters only. |
 
-Use an x86_64 Linux CUDA13 RTP development image. For `aft`, expose a
-GPUDirect-capable GPU and a native AFT-compatible HCA with port 1 active.
+Use an x86_64 Linux CUDA13 RTP development image. All AFT modes need a native
+AFT-compatible HCA with port 1 active; `aft-gdr` and `aft` also need a
+GPUDirect-capable GPU.
 The model build needs `internal_source` and compiles the late KVCM read-safety
 recovery from this checkout; no source overlay is needed. Keep the KVCM SDK
 and PACE Consumer compatible with late read-safety queries when building them
-from custom commits. AFT will not fall back to TCP or host staging for the read.
-The test uses DRAM Push without SSD, and the Consumer waits for the RTP client's
-GPU memory registration before advertising its connections.
+from custom commits. The AFT profiles use DRAM Push without SSD, and both
+GPU-read cases require actual GPUDirect reads. In those modes the Consumer
+waits for GPU memory registration before advertising its connections.
 
 Run from the public checkout (`repo`). Set `test_user` to the launcher user's
 non-root `UID:GID`, except that a root launcher can select a non-root test user.
@@ -33,7 +36,7 @@ not already exist. Set `git_options` as shown below before running the command.
 
 ```bash
 scripts="$repo/rtp_llm/test/smoke/scripts"
-transport=(tcp)                  # Or (aft "$hca"), (rdma "$hca"), (gdr "$hca").
+transport=(tcp)                   # Or (aft-rdma "$hca"), (aft-gdr "$hca"), (aft "$hca").
 faults=()                         # Use (--faults) for TCP fault cases.
 source_args=()                    # Set the three pins below to build from source.
 runtime=-                        # Use the pinned prebuilt runtime by default.
@@ -200,8 +203,11 @@ owns the PACE processes.
 
 The launcher records the selected `transport` in the Consumer fixture. The
 contract checks payload contents and uses that mode to select the transport
-counters. For GDR, it uses GPU buffers and requires matching native RDMA and
-GDR byte deltas in both directions. An explicit `--test_arg=--transport=...`
+counters. TENT `gdr` requires matching RDMA and GDR byte deltas in both
+directions. The two native AFT smoke modes use the same contract target and
+reject TENT traffic. They require Provider RDMA read bytes in `aft-rdma` and
+Consumer GPUDirect read bytes in `aft-gdr`, respectively. The Provider-offline
+mode `aft` remains a separate model case. An explicit `--test_arg=--transport=...`
 must agree with the fixture. Use this argument to set the mode for older
 fixtures without the field.
 

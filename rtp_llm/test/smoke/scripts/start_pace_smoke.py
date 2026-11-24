@@ -36,7 +36,7 @@ def start(args, parser):
     if not 1024 <= args.port_base <= 65532:
         parser.error("--port-base must be between 1024 and 65532")
     data_role = args.role in ("consumer", "provider")
-    aft = args.transport == "aft"
+    aft = args.transport in ("aft", "aft-rdma", "aft-gdr")
     if data_role:
         if not all((args.meta_url, args.interface)):
             parser.error("a data service requires --meta-url and --interface")
@@ -73,7 +73,7 @@ def start(args, parser):
             env["TAIR_MEMPOOL_META_HEALTH_PROBE_BUDGET_MS"] = "500"
     else:
         env.setdefault("TAIR_MEMPOOL_PROVIDER_HTTP_THREADS", "4")
-        zero_copy = "0" if args.transport == "tcp" else "1"
+        zero_copy = "0" if args.transport in ("tcp", "aft-rdma") else "1"
         client_env = {
             "TAIR_MEMPOOL_SOCK": str(work_dir / "mp.sock"),
             "TAIR_MEMPOOL_DATA_SOCK": str(work_dir / "mp_data.sock"),
@@ -86,6 +86,7 @@ def start(args, parser):
         }
         if aft:
             client_env.update({
+                "TAIR_MEMPOOL_PIPELINE_WRITE": "0",
                 "TAIR_MEMPOOL_VCNS_IO_TIMEOUT_MS": "400",
                 "TAIR_MEMPOOL_PROMOTE_TIMEOUT_MS": "700",
                 "TAIR_MEMPOOL_RESOLVER_TIMEOUT_MS": "1000",
@@ -101,7 +102,7 @@ def start(args, parser):
                 (work_dir / "pid").write_text(f"{os.getpid()}\n")
             else:
                 role_args.append("--clientregister")
-                env["TAIR_MEMPOOL_EXPECTED_EXTERNAL_CLIENTS"] = "1"
+                env["TAIR_MEMPOOL_EXPECTED_EXTERNAL_CLIENTS"] = zero_copy
         else:
             role_args = ["--use_tent", "--tiering_mode", "off"]
             tent_transport = "tcp" if args.transport == "tcp" else "rdma"
@@ -132,6 +133,8 @@ def start(args, parser):
                 fixture["fault_socket"] = args.fault_socket
             if args.provider_offline_dir:
                 fixture["provider_offline_dir"] = args.provider_offline_dir
+            if args.provider_metrics_url:
+                fixture["provider_metrics_url"] = args.provider_metrics_url
             (work_dir / "fixture.json").write_text(json.dumps(fixture, indent=2) + "\n")
         cache_args = ["-R", "10"] if args.role == "consumer" else ["-R", "0", "-c"]
         command = [
@@ -153,8 +156,11 @@ def main():
     parser.add_argument("--port-base", type=int)
     parser.add_argument("--meta-url")
     parser.add_argument("--provider-status-url")
+    parser.add_argument("--provider-metrics-url")
     parser.add_argument("--interface")
-    parser.add_argument("--transport", choices=("aft", "tcp", "rdma", "gdr"), default="rdma")
+    parser.add_argument(
+        "--transport", choices=("aft", "aft-rdma", "aft-gdr", "tcp", "rdma", "gdr"), default="rdma"
+    )
     parser.add_argument("--rdma-device")
     parser.add_argument("--rdma-port", type=int, default=1)
     parser.add_argument("--gid-index", type=int, default=0)

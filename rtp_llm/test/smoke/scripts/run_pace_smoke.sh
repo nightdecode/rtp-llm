@@ -29,7 +29,7 @@ case ${PACE_SMOKE_TRANSPORT:-} in
         model_args=(--model)
         target=//rtp_llm/test/smoke:remote_cache_pace_provider_offline
         ;;
-    tcp|rdma|gdr) target=//rtp_llm/test/smoke:remote_cache_pace_contract ;;
+    tcp|rdma|gdr|aft-rdma|aft-gdr) target=//rtp_llm/test/smoke:remote_cache_pace_contract ;;
     *) usage >&2; exit 2 ;;
 esac
 
