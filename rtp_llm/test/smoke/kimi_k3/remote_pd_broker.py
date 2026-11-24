@@ -125,7 +125,7 @@ def _diagnostic_endpoints(items):
             and item.keys() == {"rank", "kind", "port"}
             and type(item["rank"]) is int
             and 0 <= item["rank"] < 8
-            and item["kind"] in ("rpc", "cache_tcp", "cache_rdma", "http")
+            and item["kind"] in ("rpc", "p2p_transfer", "http")
             and type(item["port"]) is int
             and 0 < item["port"] <= 65535
             for item in items

@@ -835,10 +835,10 @@ class PdReadinessTest(unittest.TestCase):
         return role
 
     def test_expected_ports_cover_every_rank_and_both_decode_owners(self):
-        prefill = worker.pd_endpoints(27188, 1)
-        decode = worker.pd_endpoints(28188, 2)
-        self.assertEqual(len(prefill), 25)
-        self.assertEqual(len(decode), 26)
+        prefill = worker.pd_endpoints("prefill", 27188, 1)
+        decode = worker.pd_endpoints("decode", 28188, 2)
+        self.assertEqual(len(prefill), 9)
+        self.assertEqual(len(decode), 18)
         self.assertEqual(
             [item for item in decode if item["kind"] == "http"],
             [
@@ -848,12 +848,30 @@ class PdReadinessTest(unittest.TestCase):
         )
         self.assertEqual(
             [item for item in prefill if item["rank"] == 7],
+            [{"rank": 7, "kind": "rpc", "port": 27252}],
+        )
+        self.assertEqual(
+            [item for item in decode if item["kind"] == "p2p_transfer"],
             [
-                {"rank": 7, "kind": "rpc", "port": 27252},
-                {"rank": 7, "kind": "cache_tcp", "port": 27253},
-                {"rank": 7, "kind": "cache_rdma", "port": 27255},
+                {"rank": rank, "kind": "p2p_transfer", "port": 28191 + 9 * rank}
+                for rank in range(8)
             ],
         )
+
+    def test_prefill_becomes_ready_without_legacy_cache_store_listeners(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            role = self.role(root)
+            ports = {27188, *(27189 + rank * 9 for rank in range(8))}
+            with patch.object(
+                worker, "listening_tcp_ports", return_value=ports
+            ), patch.object(worker.urllib.request, "build_opener") as opener:
+                opener.return_value.open.return_value = contextlib.nullcontext(
+                    SimpleNamespace(status=200)
+                )
+                self.assertEqual(role.status(), {"healthy": True})
+            state = json.loads((root / "readiness.json").read_text())
+            self.assertFalse(state["rdma_transfer_verified"])
 
     def test_proc_tables_require_listen_state_and_matching_address(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -902,11 +920,11 @@ class PdReadinessTest(unittest.TestCase):
         self.assertNotIn(port, worker.listening_tcp_ports("127.0.0.1"))
 
     def test_any_missing_rank_endpoint_blocks_decode_readiness(self):
-        for missing in (28252, 28253, 28255, 28224):
+        for missing in (28252, 28254, 28224):
             with self.subTest(port=missing), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 role = self.role(root, "decode")
-                ports = {item["port"] for item in worker.pd_endpoints(28188, 2)}
+                ports = {item["port"] for item in worker.pd_endpoints("decode", 28188, 2)}
                 with patch.object(
                     worker, "listening_tcp_ports", return_value=ports - {missing}
                 ), patch.object(worker.urllib.request, "build_opener") as opener:
@@ -925,7 +943,7 @@ class PdReadinessTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             role = self.role(root, "decode")
-            ports = {item["port"] for item in worker.pd_endpoints(28188, 2)}
+            ports = {item["port"] for item in worker.pd_endpoints("decode", 28188, 2)}
             with patch.object(
                 worker, "listening_tcp_ports", return_value=ports
             ), patch.object(worker.urllib.request, "build_opener") as opener:

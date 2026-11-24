@@ -235,10 +235,10 @@ class RendezvousTest(unittest.TestCase):
             "elapsed_ms": 20,
             "stage": "waiting_for_logs",
             "markers": {"max_weight_load_ms": 17, "max_model_load_ms": 18},
-            "missing_listeners": [{"kind": "rpc", "rank": 0, "port": 27189}],
+            "missing_listeners": [{"kind": "p2p_transfer", "rank": 0, "port": 28191}],
             "unhealthy_http": [],
         }
-        message = {"role": "prefill", "phase": "health_wait", "data": data}
+        message = {"role": "decode", "phase": "health_wait", "data": data}
 
         def send(body, path=url, bearer=token, method="POST"):
             connection = http.client.HTTPConnection(

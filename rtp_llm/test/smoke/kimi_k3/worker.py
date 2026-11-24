@@ -147,15 +147,18 @@ def _request_progress_event(line):
     return event
 
 
-def pd_endpoints(start_port, dp_size):
-    """Endpoints used by the fixed eight-rank PD profile in this launcher."""
+def pd_endpoints(role, start_port, dp_size):
+    """Fixed RPC, frontend, and Decode P2P endpoints for the PD profile."""
     if dp_size not in (1, 2):
         raise ValueError("PD readiness requires DP1 or DP2")
     endpoints = []
     for rank in range(PREFILL_TP_SIZE):
         base = start_port + rank * WORKER_PORT_STRIDE
-        for kind, offset in (("rpc", 1), ("cache_tcp", 2), ("cache_rdma", 4)):
-            endpoints.append({"rank": rank, "kind": kind, "port": base + offset})
+        endpoints.append({"rank": rank, "kind": "rpc", "port": base + 1})
+        # Decode listens for P2P transfer requests on cache_store_listen_port + 1.
+        # Prefill's Barex RDMA sender binds a dynamically assigned data port.
+        if role == "decode":
+            endpoints.append({"rank": rank, "kind": "p2p_transfer", "port": base + 3})
         if rank % (PREFILL_TP_SIZE // dp_size) == 0:
             endpoints.append({"rank": rank, "kind": "http", "port": base})
     return endpoints
@@ -625,7 +628,7 @@ class Worker:
                 f"service_log={service_log}"
             )
         dp_size = self.config.get("decode_dp", 1) if self.role == "decode" else 1
-        endpoints = pd_endpoints(self.host["port"], dp_size)
+        endpoints = pd_endpoints(self.role, self.host["port"], dp_size)
         listeners = listening_tcp_ports(self.host["ip"])
         missing = [item for item in endpoints if item["port"] not in listeners]
         unhealthy_http = []
