@@ -168,6 +168,9 @@ message GenerateConfigPB {
     bool prefill_only = 76;
     bool frontend_metric_streaming = 77;
     google.protobuf.Int32Value logits_index = 78;
+    bool return_logprobs = 79;
+    uint32 top_logprobs = 80;
+    bool profile_light = 81;
 }
 
 message MMPreprocessConfigPB {
@@ -354,6 +357,10 @@ message AuxInfoPB {
     int32 disk_reuse_len = 31;
     int32 prefill_disk_reuse_len = 32;
     int32 decode_disk_reuse_len = 33;
+    bool xgrammar_update_timeout = 34;
+    oneof speculative_verified_draft_tokens_presence {
+        int64 speculative_verified_draft_tokens = 35;
+    }
 }
 
 message PromptLogitsOutputPB {
@@ -376,6 +383,11 @@ message FlattenOutputPB {
     PromptLogitsOutputPB prompt_logits = 9;
     // Output of the deployment-registered post-layers CustomHandler.
     TensorPB custom_output = 10;
+    TensorPB token_logprobs = 11;
+    TensorPB top_logprob_token_ids = 12;
+    TensorPB top_logprobs = 13;
+    repeated int32 logprobs_offsets = 14;
+    repeated int32 logprobs_counts = 15;
 }
 
 message GenerateOutputsPB {
@@ -540,12 +552,14 @@ message StartProfileRequestPB {
     int32 start_step = 2;
     int32 num_steps = 3;
     bool enable_all_rank = 4;
+    bool profile_light = 5;
 }
 
 message StartProfileInternalRequestPB {
     string trace_name = 1;
     int32 start_step = 2;
     int32 num_steps = 3;
+    bool profile_light = 4;
 }
 
 message TorchAllocatorDumpRequestPB {
@@ -571,11 +585,6 @@ message TorchAllocatorDumpResponsePB {
 
 message CheckHealthResponsePB {
     string health = 1;
-}
-
-message UpdateEplbConfigRequestPB {
-    string mode = 1;
-    int32 update_time = 2;
 }
 
 enum TaskPhase {
@@ -719,6 +728,7 @@ message EmbeddingInputPB {
     bool gen_timeline = 7;
     int32 profile_step = 8;
     string profile_trace_name = 9;
+    bool profile_light = 10;
 }
 
 message EmbeddingHealthRequestPB {
@@ -1113,6 +1123,29 @@ message TransferCompletionForgetResponsePB {
     repeated TransferCompletionForgetEntryPB entries = 2;
 }
 
+// The ordered incarnation list certifies that every member closed admission
+// and drained. It prevents an idle rank from exiting while a busy DP rank runs.
+message ShutdownRequestPB {
+    string          group_id          = 1;
+    repeated string drained_instances = 2;
+    bool            begin_shutdown    = 3;
+    int64           deadline_unix_ms  = 4;
+    // Optional release provenance. An empty instance id is the legacy protocol
+    // and does not imply that rank 0 (the scalar default) holds the certificate.
+    // A sender advertises only its own rank/incarnation, bound to this exact
+    // drained_instances vector. This is a trusted-worker protocol, not auth.
+    uint32 sender_rank        = 5;
+    string sender_instance_id = 6;
+}
+
+message ShutdownResponsePB {
+    bool            draining          = 1;
+    uint64 onflight = 2;
+    string instance_id = 3;
+    repeated string drained_instances = 4;
+    int64 deadline_unix_ms = 5;
+}
+
 message FunctionRequestPB {
     oneof request {
         MemoryOperationRequestPB mem_request = 1;
@@ -1120,6 +1153,7 @@ message FunctionRequestPB {
         P2PConnectorBroadcastTpRequestPB p2p_request = 3;
         TransferCompletionQueryRequestPB completion_query = 5;
         TransferCompletionForgetRequestPB completion_forget = 6;
+        ShutdownRequestPB shutdown_request = 4;
     }
 }
 
@@ -1214,6 +1248,7 @@ message FunctionResponsePB {
         P2PConnectorBroadcastTpResponsePB p2p_response = 3;
         TransferCompletionQueryResponsePB completion_query = 5;
         TransferCompletionForgetResponsePB completion_forget = 6;
+        ShutdownResponsePB shutdown_response = 4;
     }
 }
 
@@ -1313,7 +1348,6 @@ service RpcService {
     rpc BatchGenerateCall(BatchGenerateInputPB) returns (BatchGenerateOutputsPB);
 
     rpc CheckHealth(EmptyPB) returns (CheckHealthResponsePB);
-    rpc UpdateEplbConfig(UpdateEplbConfigRequestPB) returns (EmptyPB);
     rpc SetPause(EmptyPB) returns (EmptyPB);
     rpc SetRestart(EmptyPB) returns (EmptyPB);
     rpc SetLogLevel(SetLogLevelRequestPB) returns (EmptyPB);
