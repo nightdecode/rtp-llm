@@ -7,9 +7,28 @@ import triton.language as tl
 
 @triton.jit
 def _q_norm_rope(
-    X, F, Y, D: tl.constexpr, RD: tl.constexpr, H: tl.constexpr, EPS: tl.constexpr
+    X,
+    F,
+    Y,
+    D: tl.constexpr,
+    RD: tl.constexpr,
+    H: tl.constexpr,
+    EPS: tl.constexpr,
+    ROWS: tl.constexpr = 1,
+    N=0,
 ):
-    row = tl.program_id(0).to(tl.int64)
+    # ROWS > 1 walks several rows per program (Prefill grids otherwise launch
+    # one tiny program per head row); each row's arithmetic is unchanged.
+    for r in tl.static_range(ROWS):
+        row = tl.program_id(0).to(tl.int64) * ROWS + r
+        if ROWS == 1 or row < N:
+            _q_norm_rope_row(X, F, Y, row, D, RD, H, EPS)
+
+
+@triton.jit
+def _q_norm_rope_row(
+    X, F, Y, row, D: tl.constexpr, RD: tl.constexpr, H: tl.constexpr, EPS: tl.constexpr
+):
     off = tl.arange(0, D)
     x = tl.load(X + row * D + off).to(tl.float32)
     # Official Q normalization is BF16 torch arithmetic, unlike weighted
@@ -72,7 +91,9 @@ def q_norm_rope(x, freqs_cis, rope_head_dim=64, *, eps=1e-6, out=None):
         return y
     out = torch.empty_like(x) if out is None else out
     if x.numel():
-        _q_norm_rope[(x.numel() // 512,)](
+        rows = x.numel() // 512
+        per_program = 8 if rows >= 65536 else 1
+        _q_norm_rope[(triton.cdiv(rows, per_program),)](
             x,
             torch.view_as_real(freqs_cis),
             out,
@@ -80,6 +101,8 @@ def q_norm_rope(x, freqs_cis, rope_head_dim=64, *, eps=1e-6, out=None):
             64,
             x.shape[-2],
             eps,
+            per_program,
+            rows,
             num_warps=4,
             enable_fp_fusion=False,
         )
