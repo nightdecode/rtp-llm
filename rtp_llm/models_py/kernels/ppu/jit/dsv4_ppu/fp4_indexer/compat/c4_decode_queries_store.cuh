@@ -94,7 +94,7 @@ struct FusedC4DecodeQueriesStore {
       tvm::ffi::TensorView block_table, int32_t state_entries, int32_t state_tokens,
       tvm::ffi::TensorView cache) {
     using namespace host;
-    static_assert(kQueries >= 2 && kQueries <= 4);
+    static_assert(kQueries >= 2 && kQueries <= 8);
     auto batch = SymbolicSize{"batch"};
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();

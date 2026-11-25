@@ -144,6 +144,24 @@ def compress4_decode_store(
     return True
 
 
+_REPORTED_FALLBACKS = set()
+
+
+def _report_decode_queries_fallback(failed, detail):
+    """Log each distinct reason once: a silent fallback hides a per-step loop."""
+    if failed in _REPORTED_FALLBACKS:
+        return
+    _REPORTED_FALLBACKS.add(failed)
+    import logging
+
+    logging.warning(
+        "[ppu-fp4-indexer] fused MTP C4 decode store falls back to the "
+        "per-query loop: failed=%s detail=%s",
+        ",".join(failed),
+        detail,
+    )
+
+
 def project_compress4_decode_queries_store(
     state,
     x,
@@ -165,40 +183,66 @@ def project_compress4_decode_queries_store(
     changes the PPU reduction's rounding. Return False before any mutation
     for layouts outside the qualified decode contract.
     """
-    if x.ndim != 3 or x.shape[1] not in (2, 3, 4):
+    # Each request's queries run in order inside one warp, so the width only
+    # bounds the unrolled loop; DSpARK with five drafts uses width six.
+    if x.ndim != 3 or not 2 <= x.shape[1] <= 8:
+        _report_decode_queries_fallback(("width",), x.shape)
         return False
     batch, width, hidden = x.shape
     metadata = (meta.positions, meta.b_idx, meta.state_slots, meta.kv_slots)
     tensors = (state, x, projection_weight, ape, weight, freqs, cache, *metadata)
-    if not (
-        x.is_cuda
-        and 1 <= batch <= 32
-        and hidden == 4096
-        and page_size == 64
-        and state_entries in (8, 12)
-        and state_tokens > 0
-        and state_tokens % 4 == 0
-        and state.numel() % 2048 == 0
-        and cache.numel() % 4352 == 0
-        and all(t.is_contiguous() and t.device == x.device for t in tensors)
-        and x.dtype == projection_weight.dtype == torch.bfloat16
-        and projection_weight.shape == (512, hidden)
-        and all(t.dtype == torch.float32 for t in (state, ape, weight, freqs))
-        and all(
-            t.shape == (batch * width,) and t.dtype in (torch.int32, torch.int64)
-            for t in metadata
+    checks = (
+        ("cuda", x.is_cuda),
+        # One warp per request: batch only sizes the grid (decode graphs go to 64).
+        ("batch", 1 <= batch <= 128),
+        ("hidden", hidden == 4096),
+        ("page_size", page_size == 64),
+        # Ring pages are four entries; DSpARK width six sizes the ring at 16.
+        ("state_entries", state_entries >= 8 and state_entries % 4 == 0),
+        ("state_tokens", state_tokens > 0 and state_tokens % 4 == 0),
+        ("state_numel", state.numel() % 2048 == 0),
+        ("cache_numel", cache.numel() % 4352 == 0),
+        (
+            "contiguous_device",
+            all(t.is_contiguous() and t.device == x.device for t in tensors),
+        ),
+        ("x_dtype", x.dtype == projection_weight.dtype == torch.bfloat16),
+        ("projection_shape", projection_weight.shape == (512, hidden)),
+        (
+            "fp32_dtype",
+            all(t.dtype == torch.float32 for t in (state, ape, weight, freqs)),
+        ),
+        (
+            "metadata",
+            all(
+                t.shape == (batch * width,) and t.dtype in (torch.int32, torch.int64)
+                for t in metadata
+            ),
+        ),
+        (
+            "block_table",
+            block_table.ndim == 2
+            and block_table.shape[1] > 0
+            and block_table.stride(1) == 1
+            and block_table.device == x.device
+            and block_table.dtype in (torch.int32, torch.int64),
+        ),
+        ("cache_dtype", cache.dtype == torch.uint8),
+        ("ape_weight_shape", ape.shape == (8, 128) and weight.shape == (128,)),
+        ("freqs", freqs.ndim == 2 and freqs.shape[1] == 64),
+    )
+    failed = tuple(name for name, ok in checks if not ok)
+    if failed:
+        _report_decode_queries_fallback(
+            failed,
+            dict(
+                batch=batch,
+                width=width,
+                page_size=page_size,
+                state_entries=state_entries,
+                state_tokens=state_tokens,
+            ),
         )
-        and block_table.ndim == 2
-        and block_table.shape[1] > 0
-        and block_table.stride(1) == 1
-        and block_table.device == x.device
-        and block_table.dtype in (torch.int32, torch.int64)
-        and cache.dtype == torch.uint8
-        and ape.shape == (8, 128)
-        and weight.shape == (128,)
-        and freqs.ndim == 2
-        and freqs.shape[1] == 64
-    ):
         return False
     projected = torch.empty((width, batch, 512), dtype=torch.float32, device=x.device)
     for index in range(width):
