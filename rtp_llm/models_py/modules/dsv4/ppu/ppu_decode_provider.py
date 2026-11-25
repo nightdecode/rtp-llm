@@ -154,6 +154,18 @@ class PpuDecodeProvider(PpuModuleProvider):
         if exact_backend not in ("w4a8", "routea"):
             raise ValueError("DSV4_PPU_MEGAMOE_EXACT_BACKEND must be w4a8 or routea")
         self._exact_backend = exact_backend
+        # The exact strategies run the single shared expert through Route A's
+        # MegaMoE scheduler, which needs eight EP1 expert slots and pays for the
+        # seven unreachable ones.  "linear" drops to the plain FP8 linears the
+        # TP MegaMoE prefill strategy already uses for the same weights.
+        exact_shared = self.execution_options.get(
+            "DSV4_PPU_MEGAMOE_EXACT_SHARED", "megamoe"
+        )
+        if exact_shared not in ("megamoe", "linear"):
+            raise ValueError(
+                "DSV4_PPU_MEGAMOE_EXACT_SHARED must be megamoe or linear"
+            )
+        self.exact_shared_expert = exact_shared == "megamoe"
         w4a8_max_tokens = self.execution_options.get(
             "DSV4_PPU_MEGAMOE_W4A8_MAX_TOKENS"
         )

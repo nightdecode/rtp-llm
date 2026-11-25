@@ -150,7 +150,14 @@ class PpuEPMoE(nn.Module):
             "w2_w": layer_weights[W.v4_shared_w2_w],
             "w2_s": layer_weights[W.v4_shared_w2_s],
         }
-        exact_shared = getattr(self._strategy, "build_shared_expert", None)
+        # Route A's MegaMoE shared expert keeps the exact strategies bit-exact
+        # against Route A.  Providers that opt out fall back to the plain FP8
+        # linears the TP MegaMoE strategies already use.
+        exact_shared = (
+            getattr(self._strategy, "build_shared_expert", None)
+            if getattr(platform_provider, "exact_shared_expert", True)
+            else None
+        )
         self.shared_experts = (
             exact_shared(shared_weights, swiglu_limit)
             if callable(exact_shared)

@@ -369,6 +369,17 @@ class MegaMoEContractTest(unittest.TestCase):
                     {**options, "DSV4_PPU_MEGAMOE_W4A8_MAX_TOKENS": value}
                 )
 
+    def test_provider_exact_shared_switch_selects_plain_linears(self):
+        options = {**DECODE_EXECUTION_OPTIONS, "DSV4_PPU_DECODE_MOE_BACKEND": "megamoe"}
+        self.assertTrue(PpuDecodeProvider(options).exact_shared_expert)
+        self.assertFalse(
+            PpuDecodeProvider(
+                {**options, "DSV4_PPU_MEGAMOE_EXACT_SHARED": "linear"}
+            ).exact_shared_expert
+        )
+        with self.assertRaisesRegex(ValueError, "megamoe or linear"):
+            PpuDecodeProvider({**options, "DSV4_PPU_MEGAMOE_EXACT_SHARED": "fp8"})
+
     def test_provider_defers_selection_until_ep_config_is_available(self):
         provider = PpuDecodeProvider(DECODE_EXECUTION_OPTIONS)
         with patch("rtp_llm.models_py.modules.dsv4.ppu.moe.ppu_ep_moe.PpuEPMoE") as ctor:
