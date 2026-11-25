@@ -124,6 +124,9 @@ def _v4_fp8_linear(w: torch.Tensor, s: torch.Tensor, *, platform_provider=None):
     return platform_provider.build_fp8_linear(_default_factory, w, s)
 
 
+_PREFILL_BF16_ATTN_REDUCE = os.environ.get("DSV4_PPU_PREFILL_BF16_ATTN_REDUCE", "0") == "1"
+
+
 class AttentionFP8(_BaseAttentionFP8):
     prefill_fast_protocol = "dsv4.fp8-attention.v1"
 
@@ -139,6 +142,10 @@ class AttentionFP8(_BaseAttentionFP8):
         """Match the official TP contract: accumulate wo_b partials in FP32."""
         if self.tp_size <= 1:
             return
+        if _PREFILL_BF16_ATTN_REDUCE:
+            # Opt-in: half the all-reduce bytes and no FP32 round trip, at the
+            # cost of BF16 accumulation across the TP partials.
+            return super()._prefill_output_all_reduce(out)
         from rtp_llm.models_py.distributed.collective_torch import Group, all_reduce
 
         with record_function_range("dsv4.fp8.attn.out.tp_all_reduce_fp32"):
