@@ -127,6 +127,11 @@ class PpuTPMoE(nn.Module):
             )
         self._strategy.setup_weights(layer_weights)
         self.strategy_name = self._strategy.name
+        # One Triton pass for the routed SwiGLU instead of eight eager ops over
+        # the [routes, 2*inter] activations; same FP32 order, one BF16 round.
+        self._strategy.fused_swiglu = platform_provider._bool(
+            "DSV4_PPU_PREFILL_FUSED_SWIGLU", False
+        )
         if self._strategy.routed_tp_size != tp_size:
             raise ValueError(
                 "Shared/routed BF16 reduction requires TP-sharded routed weights"

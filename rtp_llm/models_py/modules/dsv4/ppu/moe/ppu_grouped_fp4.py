@@ -709,16 +709,25 @@ class PpuGroupedW4A8Strategy(PpuGroupedFP4Strategy):
         if shared_schedule is not None:
             shared_schedule.after_up()
 
-        gate, up = gate_up.chunk(2, dim=-1)
-        gate, up = gate.float(), up.float()
         limit = float(self.cfg.swiglu_limit)
-        if limit > 0:
-            gate.clamp_(max=limit)
-            up.clamp_(min=-limit, max=limit)
         compact_weights = weights.reshape(-1).index_select(0, permutation).float()
-        hidden = torch.nn.functional.silu(gate).mul_(up)
-        hidden.mul_(compact_weights.unsqueeze(-1))
-        hidden = hidden.to(torch.bfloat16).contiguous()
+        if getattr(self, "fused_swiglu", False):
+            from rtp_llm.models_py.kernels.ppu.moe.ppu_shared_swiglu import (
+                silu_mul_weighted_bf16,
+            )
+
+            hidden = silu_mul_weighted_bf16(
+                gate_up, compact_weights.contiguous(), limit if limit > 0 else 0.0
+            )
+        else:
+            gate, up = gate_up.chunk(2, dim=-1)
+            gate, up = gate.float(), up.float()
+            if limit > 0:
+                gate.clamp_(max=limit)
+                up.clamp_(min=-limit, max=limit)
+            hidden = torch.nn.functional.silu(gate).mul_(up)
+            hidden.mul_(compact_weights.unsqueeze(-1))
+            hidden = hidden.to(torch.bfloat16).contiguous()
         hidden_payload, hidden_scale = _quantize_block128_ue8m0_fp8(hidden)
         down = torch.empty((total, dim), dtype=torch.bfloat16, device=x.device)
         if shared_schedule is not None:
