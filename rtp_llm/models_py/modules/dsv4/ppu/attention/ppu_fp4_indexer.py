@@ -522,6 +522,34 @@ class PpuFP4Attention(AttentionFP8):
         if self.wo_a is None:
             raise RuntimeError("PPU grouped output projection was not bound")
         output = o.view(B, S, self.n_heads, self.head_dim)
+        # Opt-in FP8 wo_a (DSV4_PPU_DECODE_WO_A_FP8): quantizes the attention
+        # output, which the default BF16 path deliberately avoids (case 1199).
+        if getattr(self.wo_a, "fuse_inverse_rope_quant", False):
+            from rtp_llm.models_py.kernels.ppu.attention.ppu_decode_fused_quant import (
+                inverse_rope_fp8_permute,
+                supports_inverse_rope_fp8_permute,
+            )
+            from rtp_llm.models_py.modules.dsv4.ppu.attention.ppu_wo_a import (
+                PpuWoAFp8Linear,
+            )
+
+            if (
+                type(self.wo_a) is PpuWoAFp8Linear
+                and self.wo_a.sglang_layout
+                and self.wo_a.quantization == "v2_row"
+                and supports_inverse_rope_fp8_permute(
+                    output, freqs_cis, self.rope_head_dim, self.n_groups
+                )
+            ):
+                payload, scale = inverse_rope_fp8_permute(
+                    output,
+                    freqs_cis,
+                    self.rope_head_dim,
+                    self.n_groups,
+                    column_major_scales=True,
+                )
+                projected = self.wo_a.forward_permuted(payload, scale)
+                return projected.view(B, S, self.n_groups, self.wo_a.rank)
         inverse_rope_inplace(output, freqs_cis, self.rope_head_dim)
         return self.wo_a(output.reshape(B, S, self.n_groups, -1))
 

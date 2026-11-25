@@ -123,6 +123,9 @@ class PpuDecodeProvider(PpuModuleProvider):
             raise ValueError("DSV4_PPU_MTP_BATCH_INDEXER must be 0 or 1")
         self._mtp_batch_indexer = batch_indexer == "1"
         self._decode_fusions = self._bool("DSV4_PPU_DECODE_FUSIONS", False)
+        # FP8 wo_a quantizes the sparse-attention output; the BF16 default
+        # keeps the official precision boundary, so it is a separate opt-in.
+        self._decode_wo_a_fp8 = self._bool("DSV4_PPU_DECODE_WO_A_FP8", False)
         self._moe_backend = self.execution_options.get(
             "DSV4_PPU_DECODE_MOE_BACKEND", "deepep"
         )
@@ -207,7 +210,7 @@ class PpuDecodeProvider(PpuModuleProvider):
         linear = super().build_wo_a_fp8_linear(
             default_factory, *args, quantization="v2_row", **kwargs
         )
-        linear.fuse_inverse_rope_quant = self._decode_fusions
+        linear.fuse_inverse_rope_quant = self._decode_wo_a_fp8
         return linear
 
     def build_shared_expert(self, *args, **kwargs):
