@@ -138,12 +138,17 @@ class SparseAttnV4DecodeFp8Op:
         extra_topk_idxs: Optional[torch.Tensor] = None,
         extra_topk_length: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        from rtp_llm.models_py.utils.flash_mla_legacy import (
-            flash_mla_with_kvcache,  # type: ignore[import-not-found]
-        )
-
+        # Resolve the legacy module only when no backend was injected. That
+        # module deliberately re-resolves per attribute access so tests can
+        # substitute a fake, which makes every call pay a failed
+        # ``flash_mla_legacy`` import; platforms that inject a backend (PPU)
+        # would then discard the result anyway.
         if self._flash_mla_backend is not None:
             flash_mla_with_kvcache = self._flash_mla_backend
+        else:
+            from rtp_llm.models_py.utils.flash_mla_legacy import (
+                flash_mla_with_kvcache,  # type: ignore[import-not-found]
+            )
 
         B, q_len, H, D = q.shape
         # FlashMLA expects 4D q ``(batch_size, seq_len_q, num_heads_q, head_dim)``
