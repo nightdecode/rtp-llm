@@ -57,6 +57,7 @@ class PpuFP4Compressor(CompressorFP8):
             self._state_tokens_per_block,
             self._kv_pool_view,
             self._kv_eb,
+            fold_projection=getattr(self, "_fold_decode_projection", False),
         )
 
     def __init__(self, *args, compressor_weights, **kwargs):

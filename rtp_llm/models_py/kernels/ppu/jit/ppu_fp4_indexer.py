@@ -176,12 +176,14 @@ def project_compress4_decode_queries_store(
     state_tokens,
     cache,
     page_size,
+    fold_projection=False,
 ):
     """Project MTP queries and fuse ordered C4 transitions for each request.
 
-    Keep the original B-by-512 FP32 GEMMs: folding B and Q or using bmm
-    changes the PPU reduction's rounding. Return False before any mutation
-    for layouts outside the qualified decode contract.
+    Keep the original B-by-512 FP32 GEMMs by default: folding B and Q
+    changes the PPU reduction's rounding. ``fold_projection`` opts into one
+    (Q*B)-by-512 GEMM, which differs only at FP32 rounding level. Return
+    False before any mutation for layouts outside the qualified decode contract.
     """
     # Each request's queries run in order inside one warp, so the width only
     # bounds the unrolled loop; DSpARK with five drafts uses width six.
@@ -245,13 +247,21 @@ def project_compress4_decode_queries_store(
         )
         return False
     projected = torch.empty((width, batch, 512), dtype=torch.float32, device=x.device)
-    for index in range(width):
+    if fold_projection:
         torch.mm(
-            x[:, index],
+            x.transpose(0, 1).reshape(width * batch, hidden),
             projection_weight.t(),
             out_dtype=torch.float32,
-            out=projected[index],
+            out=projected.view(width * batch, 512),
         )
+    else:
+        for index in range(width):
+            torch.mm(
+                x[:, index],
+                projection_weight.t(),
+                out_dtype=torch.float32,
+                out=projected[index],
+            )
     dtype_mask = sum(
         (t.dtype == torch.int64) << i for i, t in enumerate((*metadata, block_table))
     )

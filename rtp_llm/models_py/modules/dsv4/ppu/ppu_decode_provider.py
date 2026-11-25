@@ -126,6 +126,11 @@ class PpuDecodeProvider(PpuModuleProvider):
         # FP8 wo_a quantizes the sparse-attention output; the BF16 default
         # keeps the official precision boundary, so it is a separate opt-in.
         self._decode_wo_a_fp8 = self._bool("DSV4_PPU_DECODE_WO_A_FP8", False)
+        # One GEMM for all MTP queries in the fused C4 store instead of one per
+        # query; differs from the per-query loop only at FP32 rounding level.
+        self._indexer_fold_projection = self._bool(
+            "DSV4_PPU_INDEXER_FOLDED_PROJECTION", False
+        )
         self._moe_backend = self.execution_options.get(
             "DSV4_PPU_DECODE_MOE_BACKEND", "deepep"
         )
@@ -246,6 +251,9 @@ class PpuDecodeProvider(PpuModuleProvider):
                 linear._attn_gemm_profile = self._attn_profile
         if attention.indexer is not None:
             attention.indexer.compressor._fuse_decode_queries = self._decode_fusions
+            attention.indexer.compressor._fold_decode_projection = (
+                self._indexer_fold_projection
+            )
             attention.indexer._fuse_query_slices = self._decode_fusions
             attention.indexer._fuse_topk_order = self._decode_fusions
             attention.indexer.compressor._fuse_decode_store = self._decode_fusions
