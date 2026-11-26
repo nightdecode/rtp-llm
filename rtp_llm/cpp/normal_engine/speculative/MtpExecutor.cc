@@ -1904,9 +1904,18 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
                 }
                 auto& sampler_input = sampler_input_status.value();
                 holdSamplerInputHostBuffers(buffer_holder_, sampler_input);
-                sampler_output           = std::move(sampler_->forward(sampler_input));
-                sampler_output.all_probs = sampler_output.all_probs.reshape(
-                    {(int64_t)batch_size, (int64_t)(propose_step_ + 1), (int64_t)vocab_size_});
+                sampler_output = std::move(sampler_->forward(sampler_input));
+                if (sampler_output.all_probs.defined()) {
+                    sampler_output.all_probs = sampler_output.all_probs.reshape(
+                        {(int64_t)batch_size, (int64_t)(propose_step_ + 1), (int64_t)vocab_size_});
+                } else {
+                    // Every row is greedy (see the ReturnAllProbs selection above):
+                    // the rejection kernel indexes a dense target buffer but only
+                    // stochastic rows use its values, so it needs no initialization.
+                    sampler_output.all_probs = torch::empty(
+                        {(int64_t)batch_size, (int64_t)(propose_step_ + 1), (int64_t)vocab_size_},
+                        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+                }
 
                 // rejection sampling
                 auto params = gatherSpeculativeSamplingParams(streams);
@@ -3012,7 +3021,11 @@ void MtpExecutor::prepareStreams(const std::list<GenerateStreamPtr>& streams,
         }
 
         // set base properties
-        if (!use_mtp_snapshot) {
+        // Rejection sampling reads target probabilities only for stochastic
+        // rows. DSpARK proposals are point masses, so greedy DSpARK streams
+        // verify by token identity and can keep the sampler's argmax fast path
+        // (no softmax / top-k renorm over the vocabulary).
+        if (!use_mtp_snapshot && (!is_block_draft_ || stream->generateConfig()->stochastic())) {
             stream->setReturnAllProbs(ReturnAllProbsMode::DEFAULT);
         }
         if (!use_mtp_snapshot && stream->getSPOutputBuffer() == nullptr) {
