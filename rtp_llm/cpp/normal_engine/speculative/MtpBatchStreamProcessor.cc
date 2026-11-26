@@ -992,6 +992,22 @@ void MtpBatchStreamProcessor::overlayMtpCacheSnapshots(const StreamGroups& strea
     }
 }
 
+// Penalty and no-repeat processors are the only readers of verify-row token
+// history. The sampler writes its result into the last column, which is also
+// the only column rejection sampling and the accept-length cap read.
+static bool specSamplerNeedsTokenHistory(const SamplerInputs& inputs, size_t rows) {
+    const auto* repetition = inputs.repetition_penalty.data_ptr<float>();
+    const auto* presence   = inputs.presence_penalty.data_ptr<float>();
+    const auto* frequency  = inputs.frequency_penalty.data_ptr<float>();
+    const auto* ngram      = inputs.no_repeat_ngram_size.data_ptr<int32_t>();
+    for (size_t i = 0; i < rows; ++i) {
+        if (repetition[i] != 1.0f || presence[i] != 0.0f || frequency[i] != 0.0f || ngram[i] > 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 absl::StatusOr<SamplerInputs>
 MtpBatchStreamProcessor::gatherSpecSamplerInput(const StreamGroups&                         stream_groups,
                                                 const GptModelOutputs&                      model_output,
@@ -1012,24 +1028,29 @@ MtpBatchStreamProcessor::gatherSpecSamplerInput(const StreamGroups&             
     SamplerInputs sampler_inputs =
         allocateSamplerInputs(stream_groups, total_batch_size, total_batch_size, propose_step_);
     fillSamplerCommonInputs(sampler_inputs, all_streams, true, propose_step_);
+    // Without history readers, skip filling and uploading every row's full
+    // history (48 rows x ~48k tokens = 9.2 MB per DSpARK step at 64 requests).
+    const bool needs_history = specSamplerNeedsTokenHistory(sampler_inputs, total_batch_size);
 
-    int64_t batch_idx = 0;
-    for (auto& stream : all_streams) {
-        auto complete_token_ids = stream->completeTokenIds();
-        auto seq_len            = static_cast<int64_t>(stream->seqLength());
+    if (needs_history) {
+        int64_t batch_idx = 0;
+        for (auto& stream : all_streams) {
+            auto complete_token_ids = stream->completeTokenIds();
+            auto seq_len            = static_cast<int64_t>(stream->seqLength());
 
-        copyScoreSamplerTokenIds(
-            sampler_inputs.token_ids, complete_token_ids, batch_idx, static_cast<int64_t>(score_len), seq_len);
-        RTP_LLM_CHECK_WITH_INFO(
-            seq_len + static_cast<int64_t>(propose_step_) <= static_cast<int64_t>(sampler_inputs.step + 1),
-            "MTP verify sampler history exceeds its allocated width: seq_len=%ld gamma=%zu step=%zu",
-            seq_len,
-            propose_step_,
-            sampler_inputs.step);
-        batch_idx += static_cast<int64_t>(score_len);
-        RTP_LLM_LOG_DEBUG("stream [%s], sampler inputs token ids = [%s]",
-                          stream->streamLogTag().c_str(),
-                          tensorDebugStringWithData<int32_t>(sampler_inputs.token_ids).c_str());
+            copyScoreSamplerTokenIds(
+                sampler_inputs.token_ids, complete_token_ids, batch_idx, static_cast<int64_t>(score_len), seq_len);
+            RTP_LLM_CHECK_WITH_INFO(
+                seq_len + static_cast<int64_t>(propose_step_) <= static_cast<int64_t>(sampler_inputs.step + 1),
+                "MTP verify sampler history exceeds its allocated width: seq_len=%ld gamma=%zu step=%zu",
+                seq_len,
+                propose_step_,
+                sampler_inputs.step);
+            batch_idx += static_cast<int64_t>(score_len);
+            RTP_LLM_LOG_DEBUG("stream [%s], sampler inputs token ids = [%s]",
+                              stream->streamLogTag().c_str(),
+                              tensorDebugStringWithData<int32_t>(sampler_inputs.token_ids).c_str());
+        }
     }
 
     RTP_LLM_CHECK_WITH_INFO(model_output.logits.dim() == 2
@@ -1054,49 +1075,56 @@ MtpBatchStreamProcessor::gatherSpecSamplerInput(const StreamGroups&             
                                 && draft_token_ids.size(1) == gamma,
                             "MTP verify draft tokens must be int32 [B,gamma]");
 
-    // The sampler already needs token history on device. Fill every proposal
-    // slot once for all score rows, then let each row's sequence length expose
-    // exactly proposals [0, score_position).
-    auto token_ids_gpu = sampler_inputs.token_ids.to(torch::kCUDA, /*non_blocking=*/true);
-    auto histories     = token_ids_gpu.view({batch_size, rows, static_cast<int64_t>(sampler_inputs.step + 1)});
-    auto proposals     = draft_token_ids.to(torch::kCUDA, /*non_blocking=*/true)
-                         .contiguous()
-                         .view({batch_size, 1, gamma})
-                         .expand({batch_size, rows, gamma});
-    torch::Tensor proposal_columns;
+    if (!needs_history) {
+        // One output column; step + 1 keeps matching the token buffer width.
+        sampler_inputs.step      = 0;
+        sampler_inputs.token_ids = torch::zeros({static_cast<int64_t>(total_batch_size), 1},
+                                                torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+    } else {
+        // The sampler already needs token history on device. Fill every proposal
+        // slot once for all score rows, then let each row's sequence length expose
+        // exactly proposals [0, score_position).
+        auto token_ids_gpu = sampler_inputs.token_ids.to(torch::kCUDA, /*non_blocking=*/true);
+        auto histories     = token_ids_gpu.view({batch_size, rows, static_cast<int64_t>(sampler_inputs.step + 1)});
+        auto proposals     = draft_token_ids.to(torch::kCUDA, /*non_blocking=*/true)
+                             .contiguous()
+                             .view({batch_size, 1, gamma})
+                             .expand({batch_size, rows, gamma});
+        torch::Tensor proposal_columns;
 #if defined(USE_PPU) && USE_PPU
-    proposal_index_host_holder_.release();
-    auto base_lengths_host = sampler_inputs.sequence_lengths.view({batch_size, rows})
-                                 .select(1, 0)
-                                 .to(torch::kLong)
-                                 .contiguous();
-    auto proposal_columns_host =
-        torch::empty({batch_size, 1, gamma},
-                     torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU).pinned_memory(true));
-    const auto* base_lengths_ptr     = base_lengths_host.data_ptr<int64_t>();
-    auto*       proposal_columns_ptr = proposal_columns_host.data_ptr<int64_t>();
-    for (int64_t b = 0; b < batch_size; ++b) {
-        for (int64_t j = 0; j < gamma; ++j) {
-            proposal_columns_ptr[b * gamma + j] = base_lengths_ptr[b] + j;
+        proposal_index_host_holder_.release();
+        auto base_lengths_host = sampler_inputs.sequence_lengths.view({batch_size, rows})
+                                     .select(1, 0)
+                                     .to(torch::kLong)
+                                     .contiguous();
+        auto proposal_columns_host =
+            torch::empty({batch_size, 1, gamma},
+                         torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU).pinned_memory(true));
+        const auto* base_lengths_ptr     = base_lengths_host.data_ptr<int64_t>();
+        auto*       proposal_columns_ptr = proposal_columns_host.data_ptr<int64_t>();
+        for (int64_t b = 0; b < batch_size; ++b) {
+            for (int64_t j = 0; j < gamma; ++j) {
+                proposal_columns_ptr[b * gamma + j] = base_lengths_ptr[b] + j;
+            }
         }
-    }
-    proposal_index_host_holder_.hold_host(proposal_columns_host);
-    proposal_columns = proposal_columns_host
-                           .to(torch::Device(torch::kCUDA), torch::kLong, /*non_blocking=*/true)
-                           .view({batch_size, 1, gamma})
-                           .expand({batch_size, rows, gamma});
+        proposal_index_host_holder_.hold_host(proposal_columns_host);
+        proposal_columns = proposal_columns_host
+                               .to(torch::Device(torch::kCUDA), torch::kLong, /*non_blocking=*/true)
+                               .view({batch_size, 1, gamma})
+                               .expand({batch_size, rows, gamma});
 #else
-    auto base_lengths = sampler_inputs.sequence_lengths.view({batch_size, rows})
-                            .select(1, 0)
-                            .to(torch::Device(torch::kCUDA), torch::kLong, /*non_blocking=*/true)
-                            .view({batch_size, 1, 1});
-    auto proposal_offsets =
-        torch::arange(gamma, torch::TensorOptions().dtype(torch::kLong).device(torch::Device(torch::kCUDA)))
-            .view({1, 1, gamma});
-    proposal_columns = (base_lengths + proposal_offsets).expand({batch_size, rows, gamma});
+        auto base_lengths = sampler_inputs.sequence_lengths.view({batch_size, rows})
+                                .select(1, 0)
+                                .to(torch::Device(torch::kCUDA), torch::kLong, /*non_blocking=*/true)
+                                .view({batch_size, 1, 1});
+        auto proposal_offsets =
+            torch::arange(gamma, torch::TensorOptions().dtype(torch::kLong).device(torch::Device(torch::kCUDA)))
+                .view({1, 1, gamma});
+        proposal_columns = (base_lengths + proposal_offsets).expand({batch_size, rows, gamma});
 #endif
-    histories.scatter_(2, proposal_columns, proposals);
-    sampler_inputs.token_ids = std::move(token_ids_gpu);
+        histories.scatter_(2, proposal_columns, proposals);
+        sampler_inputs.token_ids = std::move(token_ids_gpu);
+    }
 
     // lm_head shards may contain TP-alignment padding. Synthetic columns must
     // not participate in target sampling or the rejection distribution.
