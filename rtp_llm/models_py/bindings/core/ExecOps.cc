@@ -674,6 +674,21 @@ torch::Tensor execSampleFromProbs(const torch::Tensor& probabilities) {
     return sampleFromProbs(probabilities);
 }
 
+torch::Tensor execRowArgmax(const torch::Tensor& values) {
+    // One reduction pass over a few long rows leaves most SMs idle: on PPU an
+    // [8, 129280] argmax takes 45 us, while reducing 1280-wide segments first
+    // takes 29 us. Both passes keep the first maximal index, as argmax does.
+    constexpr int64_t kSegment = 1280;
+    if (values.dim() != 2 || values.size(0) > 16 || values.size(1) % kSegment != 0 || !values.is_contiguous()) {
+        return values.argmax(-1);
+    }
+    const auto rows     = values.size(0);
+    const auto segments = values.size(1) / kSegment;
+    auto [segment_max, segment_index] = values.view({rows, segments, kSegment}).max(-1);
+    auto best_segment                 = segment_max.argmax(-1, /*keepdim=*/true);
+    return (best_segment * kSegment + segment_index.gather(1, best_segment)).squeeze(1);
+}
+
 BeamSearchOutput execSampleBeamSearch(BeamSearchParams params) {
     return sampleBeamSearch(std::move(params));
 }

@@ -104,6 +104,7 @@ void fusedStridedCopy(const FusedStridedCopyParams& params);
 
 GreedyOutput     execSampleGreedy(const GreedyParams& params);
 torch::Tensor    execSampleFromProbs(const torch::Tensor& probabilities);
+torch::Tensor    execRowArgmax(const torch::Tensor& values);
 BeamSearchOutput execSampleBeamSearch(BeamSearchParams params);
 void             execRejectionSampling(const RejectionSamplingParams& params);
 void             execMappingDraft2Target(const MappingDraft2TargetParams& params);

@@ -113,11 +113,13 @@ SamplerOutput SpeculativeSampler::sampleDSparkDraftGreedy(const torch::Tensor& b
     token_columns.reserve(propose_step_);
     for (int64_t step = 0; step < static_cast<int64_t>(propose_step_); ++step) {
         auto markov_embedding = markov_w1.index_select(0, previous_tokens);
-        auto markov_bias      = torch::mm(markov_embedding, markov_w2.transpose(0, 1));
-        // FP32 + BF16 promotes the bias exactly as the explicit FP32 cast in
-        // sampleDSparkDraft does. A greedy q is the argmax one-hot of these
-        // logits at any positive temperature, so no softmax is needed.
-        auto draft_tokens = (proposal_logits.select(1, step) + markov_bias).argmax(-1);
+        // Same FP32 logits as sampleDSparkDraft; a separate cast keeps the
+        // add on the vectorized FP32 path (a mixed BF16 + FP32 add is not).
+        auto logits = torch::mm(markov_embedding, markov_w2.transpose(0, 1)).to(torch::kFloat32);
+        logits.add_(proposal_logits.select(1, step));
+        // A greedy q is the argmax one-hot of these logits at any positive
+        // temperature, so no softmax is needed.
+        auto draft_tokens = execRowArgmax(logits);
         if (d2t_map_.defined()) {
             draft_tokens = d2t_map_.index_select(0, draft_tokens);
         }
