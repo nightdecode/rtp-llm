@@ -178,22 +178,34 @@ std::pair<torch::Tensor, torch::Tensor> makeSamplingSeedOffsetTensors(const std:
     return {seed_d, offset_d};
 }
 
+bool hasAdditivePenalty(const std::optional<torch::Tensor>& penalty, int64_t batch_size) {
+    if (!penalty.has_value() || !penalty->defined()) {
+        return false;
+    }
+    const auto* values = penalty->data_ptr<float>();
+    return std::any_of(values, values + batch_size, [](auto t) { return t != 0.0f; });
+}
+
 bool canUseCompactSamplerOutput(const GreedyParams& params) {
     return params.token_ids.is_cuda() && params.token_ids.is_contiguous() && params.token_ids.dim() == 2
            && params.token_ids.scalar_type() == torch::kInt32 && params.token_ids.size(0) == params.logits.size(0)
            && params.token_ids.size(0) > 1 && params.token_ids.size(1) > 1;
 }
 
-void processLogits(const GreedyParams& params, const torch::Tensor& device_tokens, torch::Tensor& transposed_tokens) {
+void processLogits(const GreedyParams& params,
+                   const torch::Tensor& device_tokens,
+                   torch::Tensor&       transposed_tokens,
+                   bool                 apply_temperature) {
     const auto vocab_size_padded  = params.logits.size(1);
     const auto decoder_batch_size = params.sequence_lengths.size(0);
     const auto batch_size         = params.logits.size(0);
     const auto step               = params.step;
     auto       cur_stream         = at::cuda::getCurrentCUDAStream().stream();
 
-    if (std::any_of(params.temperature.data_ptr<float>(),
-                    params.temperature.data_ptr<float>() + batch_size,
-                    [&](auto t) { return t != 1.0f; })) {
+    if (apply_temperature
+        && std::any_of(params.temperature.data_ptr<float>(),
+                       params.temperature.data_ptr<float>() + batch_size,
+                       [&](auto t) { return t != 1.0f; })) {
         auto temperature_gpu = params.temperature.to(torch::kCUDA, true);
         applySamplerTemperature(params.logits, temperature_gpu, cur_stream);
     }
@@ -456,6 +468,9 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
                                    || std::any_of(params.do_sample.value().data_ptr<bool>(),
                                                   params.do_sample.value().data_ptr<bool>() + batch_size,
                                                   [&](auto t) { return t; });
+    auto       top_k_ptr         = params.top_k.data_ptr<int32_t>();
+    const bool argmax_only       = std::all_of(top_k_ptr, top_k_ptr + batch_size, [&](auto t) { return t == 1; })
+                             && !params.output_all_probs.has_value() && !params.cum_log_probs.has_value();
     if (need_do_sample) {
         torch::Tensor selected_logits;
         torch::Tensor mask_tensor;
@@ -464,7 +479,15 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
             mask_tensor        = do_sample_gpu.reshape({(int64_t)batch_size, 1}).logical_not();
             selected_logits    = params.logits.masked_select(mask_tensor);
         }
-        processLogits(params, device_tokens, transposed_tokens);
+        // The argmax path reads only the row maximum. Scaling by a positive
+        // 1 / (temperature + 1e-6) keeps it unless an additive presence or
+        // frequency penalty is applied after the scaling.
+        const auto* temperature   = params.temperature.data_ptr<float>();
+        const bool  scale_neutral = argmax_only
+                                   && std::all_of(temperature, temperature + batch_size, [](auto t) { return t >= 0.0f; })
+                                   && !hasAdditivePenalty(params.presence_penalty, batch_size)
+                                   && !hasAdditivePenalty(params.frequency_penalty, batch_size);
+        processLogits(params, device_tokens, transposed_tokens, /*apply_temperature=*/!scale_neutral);
         if (has_not_do_sample) {
             params.logits.masked_scatter_(mask_tensor, selected_logits);
         }
@@ -476,9 +499,7 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
     GreedyOutput output;
     // fast path for topk = 1
     // TODO: Support output_all_probs and cum_log_probs in this fast path.
-    auto top_k_ptr = params.top_k.data_ptr<int32_t>();
-    if (std::all_of(top_k_ptr, top_k_ptr + batch_size, [&](auto t) { return t == 1; })
-        && !params.output_all_probs.has_value() && !params.cum_log_probs.has_value()) {
+    if (argmax_only) {
         samples_t.copy_(torch::argmax(params.logits, -1, /*keepdim=*/false), true);
     } else {
         output = flashinferSampleGreedy(params, samples_t);

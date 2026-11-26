@@ -74,6 +74,14 @@ public:
                                     const torch::Tensor& markov_w2,
                                     size_t               draft_vocab_size) const;
 
+    // All-greedy batches: the same Markov chain with argmax proposals and a
+    // point-mass q, so no dense distribution is materialized.
+    SamplerOutput sampleDSparkDraftGreedy(const torch::Tensor& base_logits,
+                                          const torch::Tensor& anchors,
+                                          const torch::Tensor& markov_w1,
+                                          const torch::Tensor& markov_w2,
+                                          size_t               draft_vocab_size) const;
+
     SamplerOutput sampleDFlashDraft(const torch::Tensor&                base_logits,
                                     const std::list<GenerateStreamPtr>& streams,
                                     size_t                              draft_vocab_size) const;

@@ -89,6 +89,48 @@ SamplerOutput SpeculativeSampler::sampleDSparkDraft(const torch::Tensor& base_lo
     return output;
 }
 
+SamplerOutput SpeculativeSampler::sampleDSparkDraftGreedy(const torch::Tensor& base_logits,
+                                                          const torch::Tensor& anchors,
+                                                          const torch::Tensor& markov_w1,
+                                                          const torch::Tensor& markov_w2,
+                                                          size_t               draft_vocab_size) const {
+    RTP_LLM_PROFILE_SCOPE("speculative_sampler.sample_dspark_draft_greedy");
+    RTP_LLM_CHECK_WITH_INFO(anchors.defined() && anchors.is_cuda(),
+                            "DSpARK anchors must be a CUDA tensor with one token per request");
+    const auto batch_size = anchors.numel();
+    RTP_LLM_CHECK_WITH_INFO(base_logits.defined() && base_logits.is_cuda() && base_logits.is_contiguous()
+                                && base_logits.scalar_type() == torch::kFloat32 && base_logits.dim() == 2
+                                && base_logits.size(0) == batch_size * static_cast<int64_t>(propose_step_)
+                                && base_logits.size(1) >= static_cast<int64_t>(draft_vocab_size),
+                            "DSpARK C++ lm_head must emit contiguous CUDA FP32 [B*gamma,vocab_padded] logits with "
+                            "vocab_padded >= draft vocab size");
+
+    auto previous_tokens = anchors.reshape({batch_size}).to(torch::kLong);
+    auto proposal_logits =
+        base_logits.narrow(1, 0, draft_vocab_size)
+            .view({batch_size, static_cast<int64_t>(propose_step_), static_cast<int64_t>(draft_vocab_size)});
+    std::vector<torch::Tensor> token_columns;
+    token_columns.reserve(propose_step_);
+    for (int64_t step = 0; step < static_cast<int64_t>(propose_step_); ++step) {
+        auto markov_embedding = markov_w1.index_select(0, previous_tokens);
+        auto markov_bias      = torch::mm(markov_embedding, markov_w2.transpose(0, 1));
+        // FP32 + BF16 promotes the bias exactly as the explicit FP32 cast in
+        // sampleDSparkDraft does. A greedy q is the argmax one-hot of these
+        // logits at any positive temperature, so no softmax is needed.
+        auto draft_tokens = (proposal_logits.select(1, step) + markov_bias).argmax(-1);
+        if (d2t_map_.defined()) {
+            draft_tokens = d2t_map_.index_select(0, draft_tokens);
+        }
+        token_columns.push_back(draft_tokens);
+        previous_tokens = draft_tokens;
+    }
+
+    SamplerOutput output;
+    output.token_ids                = torch::stack(token_columns, 1).to(torch::kInt32);
+    output.token_ids_are_point_mass = true;
+    return output;
+}
+
 torch::Tensor dflashDraftProbabilities(const torch::Tensor& logits, const GenerateConfig& config) {
     TORCH_CHECK(logits.dim() == 2 && logits.size(1) > 0, "DFlash logits must be [tokens,vocab]");
     auto scores = logits.to(torch::kFloat32);

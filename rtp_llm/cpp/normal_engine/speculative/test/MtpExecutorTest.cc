@@ -3573,7 +3573,8 @@ TEST_F(MtpExecutorTest, testDSparkDraftGreedyRequestsCollapseQToArgmaxOneHot) {
 
         auto output =
             components.executor->sampleDSparkDraft(stream_groups, base_logits.reshape({gamma, vocab_size}), anchors);
-        EXPECT_TRUE(torch::allclose(output.all_probs, expected_q));
+        EXPECT_TRUE(output.token_ids_are_point_mass);
+        EXPECT_FALSE(output.all_probs.defined());
         EXPECT_TRUE(torch::equal(output.token_ids.cpu(), expected_q.argmax(-1).to(torch::kInt32).cpu()));
     }
 
@@ -3588,8 +3589,62 @@ TEST_F(MtpExecutorTest, testDSparkDraftGreedyRequestsCollapseQToArgmaxOneHot) {
 
         auto output =
             components.executor->sampleDSparkDraft(stream_groups, base_logits.reshape({gamma, vocab_size}), anchors);
-        EXPECT_TRUE(torch::allclose(output.all_probs, expected_q));
+        EXPECT_TRUE(output.token_ids_are_point_mass);
+        EXPECT_FALSE(output.all_probs.defined());
         EXPECT_TRUE(torch::equal(output.token_ids.cpu(), expected_q.argmax(-1).to(torch::kInt32).cpu()));
+    }
+}
+
+TEST_F(MtpExecutorTest, testDSparkDraftGreedyBatchFollowsMarkovArgmaxChain) {
+    constexpr int32_t batch_size = 2;
+    constexpr int32_t gamma      = 5;
+    constexpr int32_t vocab_size = 5;
+
+    MtpExecutorTestConfig test_config;
+    test_config.vocab_size           = vocab_size;
+    test_config.gen_num_per_cycle    = gamma;
+    test_config.vocab_size_override  = vocab_size;
+    test_config.sp_type              = SP_TYPE_DSPARK;
+    test_config.dspark_mask_token_id = 0;
+    auto components                  = createMtpExecutorComponents(test_config);
+
+    auto first_stream =
+        createContextStream(components.model_config, components.runtime_config, components.resource_context, {0, 1});
+    first_stream->generateConfig()->do_sample = false;
+    auto second_stream =
+        createContextStream(components.model_config, components.runtime_config, components.resource_context, {1, 2});
+    second_stream->generateConfig()->top_k       = 1;
+    second_stream->generateConfig()->temperature = 0.0f;
+    StreamGroups stream_groups({first_stream, second_stream});
+
+    auto markov_w1 =
+        torch::tensor({0.0f, 0.3f, 0.6f, 0.9f, 1.2f}, torch::kBFloat16).reshape({vocab_size, 1}).to(torch::kCUDA);
+    auto markov_w2 =
+        torch::tensor({-0.4f, -0.2f, 0.0f, 0.2f, 0.4f}, torch::kBFloat16).reshape({vocab_size, 1}).to(torch::kCUDA);
+    components.executor->dspark_markov_w1_ = markov_w1;
+    components.executor->dspark_markov_w2_ = markov_w2;
+
+    // Base logits differ by less than the Markov bias, so a chain that keeps
+    // conditioning on the anchor picks different tokens.
+    auto base_logits = torch::tensor({0.10f, 0.12f, 0.08f, 0.0f, 0.05f}, torch::kFloat32)
+                           .repeat({batch_size * gamma, 1})
+                           .to(torch::kCUDA);
+    auto anchors = torch::tensor({0, 4}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+
+    auto output = components.executor->sampleDSparkDraft(stream_groups, base_logits, anchors);
+
+    ASSERT_TRUE(output.token_ids_are_point_mass);
+    ASSERT_FALSE(output.all_probs.defined());
+    ASSERT_EQ((std::vector<int64_t>{batch_size, gamma}), output.token_ids.sizes().vec());
+    ASSERT_EQ(torch::kInt32, output.token_ids.scalar_type());
+    auto proposal_logits = base_logits.view({batch_size, gamma, vocab_size});
+    auto previous_tokens = anchors.to(torch::kLong);
+    for (int64_t step = 0; step < gamma; ++step) {
+        auto markov_bias =
+            torch::mm(markov_w1.index_select(0, previous_tokens), markov_w2.transpose(0, 1)).to(torch::kFloat32);
+        auto expected = (proposal_logits.select(1, step) + markov_bias).argmax(-1);
+        EXPECT_TRUE(torch::equal(output.token_ids.select(1, step).cpu(), expected.to(torch::kInt32).cpu()));
+        previous_tokens = expected;
     }
 }
 

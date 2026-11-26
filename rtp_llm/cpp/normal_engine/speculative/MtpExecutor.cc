@@ -2721,6 +2721,7 @@ SamplerOutput MtpExecutor::sampleDSparkDraft(const StreamGroups&  stream_groups,
         torch::empty({batch_size}, torch::TensorOptions().dtype(torch::kFloat32).pinned_memory(true));
     auto*           temperatures         = temperature_cpu.data_ptr<float>();
     int64_t         row                  = 0;
+    bool            all_greedy           = true;
     constexpr float kMinDraftTemperature = 1.0e-6f;
     for (const auto& stream : stream_groups.allStreams()) {
         // DSpARK admission is configuration-defined. needTilingForSampling()
@@ -2742,6 +2743,13 @@ SamplerOutput MtpExecutor::sampleDSparkDraft(const StreamGroups&  stream_groups,
         // request temperature.
         temperatures[row++] =
             config->stochastic() ? std::max(config->temperature, kMinDraftTemperature) : kMinDraftTemperature;
+        all_greedy = all_greedy && !config->stochastic();
+    }
+    if (all_greedy) {
+        // Rejection compares greedy rows by token id only, so the dense q of
+        // the general path is never read.
+        return speculative_sampler_->sampleDSparkDraftGreedy(
+            base_logits, anchors, dspark_markov_w1_, dspark_markov_w2_, draft_vocab_size_);
     }
     buffer_holder_.hold_host(temperature_cpu);
     auto temperature = temperature_cpu.to(base_logits.device(), /*non_blocking=*/true);
