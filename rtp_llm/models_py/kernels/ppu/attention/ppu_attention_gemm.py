@@ -4,12 +4,17 @@ from functools import lru_cache
 
 # (groups, N, K) -> M -> (block M, block N, warp M, warp N, stages).
 # Keep unmeasured shapes on the library's normal dispatch path.
+# M = 36/48 are DSpARK verify blocks (6 rows for each of 6/8 requests); one
+# M890P card, library default -> tile: wq_b 32.7/34.2 -> 26.0/26.3 us,
+# wo_b (M = 36) 31.7 -> 30.9 us. wo_a and wo_b at M = 48 keep the default.
 _TILES = {
     (1, 32768, 1024): {
         8: (16, 128, 16, 32, 3),
         16: (32, 64, 16, 32, 4),
         24: (32, 64, 16, 32, 4),
         32: (32, 64, 16, 32, 4),
+        36: (64, 64, 32, 32, 3),
+        48: (64, 64, 32, 32, 3),
     },
     (8, 1024, 4096): {
         8: (16, 128, 16, 32, 4),
@@ -22,6 +27,7 @@ _TILES = {
         16: (16, 64, 16, 16, 4),
         24: (16, 64, 16, 16, 4),
         32: (16, 64, 16, 16, 4),
+        36: (64, 64, 32, 32, 4),
     },
 }
 
