@@ -312,8 +312,31 @@ def norm_rope_store(
     )
 
 
-def paged_score(q, q_scales, weights, cache, block_table, lengths, max_context):
-    """Read native FP4 pages directly and retain FP32 Decode logits."""
+def paged_score_schedule(lengths, page_size, heads):
+    """DeepGEMM split plan for ``paged_score`` over int32 ``[tokens, 1]`` lengths.
+
+    Without the (next_n, heads, packed bytes per head, bytes per element)
+    hint, PPU DeepGEMM plans in its compatibility mode: 48 verify rows over
+    ~11k entries take 88 us instead of 42 us, with bitwise-identical logits.
+    """
+    import deep_gemm
+
+    return deep_gemm.get_paged_mqa_logits_metadata(
+        lengths,
+        page_size,
+        deep_gemm.get_num_sms(),
+        metadata_extra=(1, heads, 64, 1),
+    )
+
+
+def paged_score(
+    q, q_scales, weights, cache, block_table, lengths, max_context, schedule=None
+):
+    """Read native FP4 pages directly and retain FP32 Decode logits.
+
+    ``schedule`` is an optional ``paged_score_schedule`` result for the same
+    ``lengths`` and page size, shared by the CSA layers of one step.
+    """
     import deep_gemm
 
     if q.ndim != 4 or q.shape[1] != 1 or q.shape[-1] != 64:
@@ -323,15 +346,8 @@ def paged_score(q, q_scales, weights, cache, block_table, lengths, max_context):
     if lengths.dtype != torch.int32 or block_table.dtype != torch.int32:
         raise ValueError("FP4 paged Decode requires int32 lengths and block tables")
     page_size = cache.shape[1]
-    # Without the (next_n, heads, packed bytes per head, bytes per element)
-    # hint, PPU DeepGEMM plans in its compatibility mode: 48 verify rows over
-    # ~11k entries take 88 us instead of 42 us, with bitwise-identical logits.
-    schedule = deep_gemm.get_paged_mqa_logits_metadata(
-        lengths,
-        page_size,
-        deep_gemm.get_num_sms(),
-        metadata_extra=(1, q.shape[2], q.shape[-1], 1),
-    )
+    if schedule is None:
+        schedule = paged_score_schedule(lengths, page_size, q.shape[2])
     return deep_gemm.fp8_fp4_paged_mqa_logits(
         (q.contiguous(), q_scales.contiguous()),
         cache.view(cache.shape[0], page_size, 1, 68),

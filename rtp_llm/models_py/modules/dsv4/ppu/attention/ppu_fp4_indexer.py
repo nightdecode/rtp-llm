@@ -15,6 +15,7 @@ from rtp_llm.models_py.kernels.ppu.jit.ppu_fp4_indexer import (
     compress4_decode,
     norm_rope_store,
     paged_score,
+    paged_score_schedule,
     quantize_q,
     topk_bf16,
     topk_decode,
@@ -279,6 +280,8 @@ class PpuFP4Indexer(IndexerFP8):
         *,
         q_producer_stream=None,
         decode_streams=None,
+        prefetched_weights=None,
+        step_cache=None,
     ):
         if x.ndim != 3 or x.shape[1] not in (1, 2, 3, 4, 5, 6):
             raise ValueError("FP4 Indexer requires Decode or a 1..6 row verify block")
@@ -304,8 +307,16 @@ class PpuFP4Indexer(IndexerFP8):
             return out_topk_buffer
         if self._batch_mtp_queries:
             return self._forward_decode_queries_batched(
-                x, qr, start_pos, out_topk_buffer, compressor_meta
+                x,
+                qr,
+                start_pos,
+                out_topk_buffer,
+                compressor_meta,
+                prefetched_weights=prefetched_weights,
+                step_cache=step_cache,
             )
+        if prefetched_weights is not None:
+            raise ValueError("Prefetched Indexer work requires batched verify queries")
         queries = qr.reshape(batch, query_length, -1)
         output = out_topk_buffer.reshape(batch, query_length, self.index_topk)
         # Reuse contiguous scratch across query positions. Output slices have
@@ -350,25 +361,126 @@ class PpuFP4Indexer(IndexerFP8):
             output[:, index : index + 1].copy_(step_output)
         return out_topk_buffer
 
-    def _forward_decode_queries_batched(self, x, qr, start_pos, out_topk_buffer, meta):
-        """Batch stateless work; retain chronological C4 state transitions."""
-        batch, width = x.shape[:2]
-        tokens = batch * width
-        x, qr = x.contiguous(), qr.contiguous()
+    def _check_decode_queries(self, x, meta):
         if self._cp_ctx is not None and self._cp_ctx.cp_size > 1:
             raise ValueError("FP4 Indexer CP is not qualified")
         if self._kv_pool_view is None or self._kv_block_table is None:
             raise RuntimeError("FP4 Indexer Decode pools were not bound")
-        if meta.positions.numel() != tokens or not out_topk_buffer.is_contiguous():
-            raise ValueError(
-                "Batched Indexer requires request-major metadata and contiguous output"
+        if meta.positions.numel() != x.shape[0] * x.shape[1]:
+            raise ValueError("Batched Indexer requires request-major metadata")
+
+    def _update_decode_queries_compressor(self, x, start_pos, meta):
+        """Chronological C4 state/KV updates for every query of the block."""
+        batch, width = x.shape[:2]
+        fused_compressor = self.compressor.try_forward_decode_queries(x, meta)
+        for index in range(0 if fused_compressor else width):
+            prepared = None
+            if batch > 1 and getattr(self, "_fuse_query_slices", False):
+                from rtp_llm.models_py.kernels.ppu.attention.ppu_query_slice import (
+                    prepare_indexer_query,
+                )
+
+                prepared = prepare_indexer_query(x, None, start_pos, meta, index)
+            if prepared is None:
+                step = slice_compressor_query(meta, batch, width, index)
+                step_x = x[:, index : index + 1].contiguous()
+                step_start = start_pos + index
+            else:
+                step_x, _, step_start, step = prepared
+            self.compressor.forward_decode_vectorized(
+                step_x,
+                step_start,
+                meta=step,
+                position_ids=step.positions.reshape(batch, 1),
             )
+
+    def prefetch_decode_queries(self, x, start_pos, meta):
+        """Issue the verify-block work that reads only ``x``.
+
+        The head-weight projection and the C4 compressor update do not read
+        QR, so the attention issues them on the Indexer stream before its QKV
+        projection; ``_forward_decode_queries_batched`` then computes only Q,
+        scores and TopK. Returns the raw head weights for that call.
+        """
+        batch, width = x.shape[:2]
+        x = x.contiguous()
+        self._check_decode_queries(x, meta)
+        self.compressor.freqs_cis = self.freqs_cis
+        self._propagate_pool_to_nested()
+        try:
+            weights = F.linear(x.reshape(batch * width, -1), self.weights_proj)
+            self._update_decode_queries_compressor(x, start_pos, meta)
+        finally:
+            self._clear_nested_pool()
+        return weights
+
+    def _decode_score_inputs(self, meta, batch, width, step_cache):
+        """Per-token lengths, request-expanded table and score schedule.
+
+        These depend only on step metadata and the shared Indexer block
+        table, so CSA layers of one step reuse them through ``step_cache``.
+        Entries never cross the eager/capture boundary: the capture must
+        record its own producers.
+        """
+        tokens = batch * width
+        lengths = meta.compressed_lens_per_token
+        if lengths is None:
+            lengths = (meta.positions + 1) // self.compress_ratio
+        capacity = self._kv_block_table.shape[1] * self._kv_eb
+        score_width = max(32, min(capacity, self._kv_cache_t or capacity))
+        key = None
+        if step_cache is not None:
+            key = (
+                "fp4_indexer_score",
+                torch.cuda.is_current_stream_capturing(),
+                batch,
+                width,
+                score_width,
+                self.n_heads,
+                self._kv_pool_view.shape[1],
+                self._kv_block_table.data_ptr(),
+                tuple(self._kv_block_table.shape),
+                lengths.data_ptr(),
+            )
+            cached = step_cache.get(key)
+            if cached is not None:
+                return cached
+        # C4 writes only newly completed compressed entries. Each query's
+        # own length excludes later appended entries.
+        lengths = lengths.reshape(tokens, 1).to(torch.int32).contiguous()
+        table = self._kv_block_table[:batch].to(torch.int32)
+        table = table.repeat_interleave(width, dim=0).contiguous()
+        schedule = paged_score_schedule(lengths, self._kv_pool_view.shape[1], self.n_heads)
+        inputs = (lengths, table, schedule, score_width)
+        if key is not None:
+            step_cache[key] = inputs
+        return inputs
+
+    def _forward_decode_queries_batched(
+        self,
+        x,
+        qr,
+        start_pos,
+        out_topk_buffer,
+        meta,
+        prefetched_weights=None,
+        step_cache=None,
+    ):
+        """Batch stateless work; retain chronological C4 state transitions."""
+        batch, width = x.shape[:2]
+        tokens = batch * width
+        x, qr = x.contiguous(), qr.contiguous()
+        self._check_decode_queries(x, meta)
+        if not out_topk_buffer.is_contiguous():
+            raise ValueError("Batched Indexer requires contiguous output")
         self.compressor.freqs_cis = self.freqs_cis
         self._propagate_pool_to_nested()
         try:
             q = self._compute_indexer_q(qr, None, apply_rope=False)
             q = q.reshape(tokens, self.n_heads, 128).contiguous()
-            weights = F.linear(x.reshape(tokens, -1), self.weights_proj)
+            weights = prefetched_weights
+            if weights is None:
+                weights = F.linear(x.reshape(tokens, -1), self.weights_proj)
             q, qs, weights = quantize_q(
                 q,
                 weights,
@@ -376,38 +488,11 @@ class PpuFP4Indexer(IndexerFP8):
                 torch.view_as_real(self.freqs_cis).flatten(-2),
                 meta.positions,
             )
-            fused_compressor = self.compressor.try_forward_decode_queries(x, meta)
-            for index in range(0 if fused_compressor else width):
-                prepared = None
-                if batch > 1 and getattr(self, "_fuse_query_slices", False):
-                    from rtp_llm.models_py.kernels.ppu.attention.ppu_query_slice import (
-                        prepare_indexer_query,
-                    )
-
-                    prepared = prepare_indexer_query(x, None, start_pos, meta, index)
-                if prepared is None:
-                    step = slice_compressor_query(meta, batch, width, index)
-                    step_x = x[:, index : index + 1].contiguous()
-                    step_start = start_pos + index
-                else:
-                    step_x, _, step_start, step = prepared
-                self.compressor.forward_decode_vectorized(
-                    step_x,
-                    step_start,
-                    meta=step,
-                    position_ids=step.positions.reshape(batch, 1),
-                )
-            # C4 writes only newly completed compressed entries. Each query's
-            # own length excludes later appended entries; state writes above
-            # must remain ordered even though score/TopK can now be batched.
-            lengths = meta.compressed_lens_per_token
-            if lengths is None:
-                lengths = (meta.positions + 1) // self.compress_ratio
-            lengths = lengths.reshape(tokens, 1).to(torch.int32).contiguous()
-            table = self._kv_block_table[:batch].to(torch.int32)
-            table = table.repeat_interleave(width, dim=0).contiguous()
-            capacity = table.shape[1] * self._kv_eb
-            score_width = max(32, min(capacity, self._kv_cache_t or capacity))
+            if prefetched_weights is None:
+                self._update_decode_queries_compressor(x, start_pos, meta)
+            lengths, table, schedule, score_width = self._decode_score_inputs(
+                meta, batch, width, step_cache
+            )
             logits = paged_score(
                 q.reshape(tokens, 1, self.n_heads, 64),
                 qs.reshape(tokens, 1, self.n_heads),
@@ -416,6 +501,7 @@ class PpuFP4Indexer(IndexerFP8):
                 table,
                 lengths,
                 score_width,
+                schedule=schedule,
             )
             topk_decode(
                 logits.reshape(tokens, score_width),
@@ -606,6 +692,38 @@ class PpuFP4Attention(AttentionFP8):
                     for role in ("q", "weights")
                 }
 
+    def _indexer_decode_meta(self, attn_metadata, bsz, q_len):
+        from rtp_llm.models_py.modules.dsv4.kv_cache_utils import (
+            INDEXER_KV,
+            INDEXER_STATE,
+        )
+
+        return self._decode_compressor_meta_from_metadata(
+            attn_metadata,
+            state_attn_type=INDEXER_STATE,
+            kv_attn_type=INDEXER_KV,
+            bsz=bsz,
+            q_len=q_len,
+        )
+
+    def _batches_indexer_queries(self, q_len):
+        return (
+            self.indexer is not None
+            and q_len > 1
+            and self.indexer._batch_mtp_queries
+        )
+
+    def _decode_prefetch_indexer(self, x, bsz, q_len, start_pos, attn_metadata):
+        """Issue the batched verify Indexer work that reads only ``x``.
+
+        Called on the Indexer stream before the QKV projection; the result is
+        passed back to ``_decode_update_indexer`` once QR exists.
+        """
+        if not self._batches_indexer_queries(q_len):
+            return None
+        meta = self._indexer_decode_meta(attn_metadata, bsz, q_len)
+        return meta, self.indexer.prefetch_decode_queries(x, start_pos, meta)
+
     def _decode_update_indexer(
         self,
         x,
@@ -617,25 +735,36 @@ class PpuFP4Attention(AttentionFP8):
         attn_metadata,
         *,
         q_producer_stream=None,
+        prefetched=None,
     ):
         if q_producer_stream is None:
-            return super()._decode_update_indexer(
-                x, qr, bsz, q_len, start_pos, position_ids, attn_metadata
+            if not self._batches_indexer_queries(q_len):
+                return super()._decode_update_indexer(
+                    x, qr, bsz, q_len, start_pos, position_ids, attn_metadata
+                )
+            meta, weights = (
+                prefetched
+                if prefetched is not None
+                else (self._indexer_decode_meta(attn_metadata, bsz, q_len), None)
             )
-        from rtp_llm.models_py.modules.dsv4.kv_cache_utils import (
-            INDEXER_KV,
-            INDEXER_STATE,
-        )
-
+            # Score lengths, the request-expanded table and the score plan
+            # are identical for every CSA layer of a step.
+            step_cache = attn_metadata.__dict__.setdefault("_ppu_indexer_step_cache", {})
+            return self.indexer.forward_decode_vectorized(
+                x,
+                qr,
+                start_pos,
+                attn_metadata.topk_buffer_compressed[:bsz],
+                position_ids=position_ids,
+                compressor_meta=meta,
+                prefetched_weights=weights,
+                step_cache=step_cache,
+            )
+        if prefetched is not None:
+            raise ValueError("Prefetched Indexer work requires batched verify queries")
         if self.indexer is None or self._decode_indexer_streams is None:
             raise ValueError("Indexer overlap was not prepared for this layer")
-        meta = self._decode_compressor_meta_from_metadata(
-            attn_metadata,
-            state_attn_type=INDEXER_STATE,
-            kv_attn_type=INDEXER_KV,
-            bsz=bsz,
-            q_len=q_len,
-        )
+        meta = self._indexer_decode_meta(attn_metadata, bsz, q_len)
         return self.indexer.forward_decode_vectorized(
             x,
             qr,

@@ -51,6 +51,13 @@ def decode_attention_overlap(attn, x, metadata, streams, *, input_quantized=None
     try:
         qr, kv, q_quantized = None, None, None
         swa_written = False
+        # Batched verify: the Indexer's head weights and C4 compressor read
+        # only X, so they start before the QKV projection below.
+        indexer_prefetched = None
+        prefetch = getattr(attn, "_decode_prefetch_indexer", None)
+        if attn.indexer is not None and prefetch is not None:
+            with torch.cuda.stream(streams["indexer"]):
+                indexer_prefetched = prefetch(x, bsz, q_len, start_pos, metadata)
         # The fused norm indexes every B*Q row and uses its own rotary phase.
         if attn._decode_qkv_projection is not None:
             from rtp_llm.models_py.kernels.ppu.attention.ppu_qkv_norm import (
@@ -118,6 +125,8 @@ def decode_attention_overlap(attn, x, metadata, streams, *, input_quantized=None
                 streams["indexer"].wait_stream(current)
             else:
                 indexer_options["q_producer_stream"] = current
+            if indexer_prefetched is not None:
+                indexer_options["prefetched"] = indexer_prefetched
             if not capturing:
                 qr.record_stream(streams["indexer"])
             with torch.cuda.stream(streams["indexer"]):
