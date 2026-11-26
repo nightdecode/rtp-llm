@@ -41,6 +41,12 @@ class PpuDecodeProvider(PpuModuleProvider):
             "output_dtype": self._moe_output_dtype,
             "gemm_tile": self._moe_tile,
         }
+        if self._moe_backend == "deepep_w4a8":
+            from rtp_llm.models_py.modules.dsv4.ppu.moe.ppu_deepep_w4a8 import (
+                PpuDeepEPW4A8Strategy,
+            )
+
+            strategy_type = PpuDeepEPW4A8Strategy
         if self._moe_backend == "megamoe":
             from rtp_llm.models_py.modules.dsv4.ppu.moe.ppu_mega_moe import (
                 PpuMegaMoEFP4Strategy,
@@ -134,8 +140,10 @@ class PpuDecodeProvider(PpuModuleProvider):
         self._moe_backend = self.execution_options.get(
             "DSV4_PPU_DECODE_MOE_BACKEND", "deepep"
         )
-        if self._moe_backend not in ("deepep", "megamoe"):
-            raise ValueError("DSV4_PPU_DECODE_MOE_BACKEND must be deepep or megamoe")
+        if self._moe_backend not in ("deepep", "deepep_w4a8", "megamoe"):
+            raise ValueError(
+                "DSV4_PPU_DECODE_MOE_BACKEND must be deepep, deepep_w4a8 or megamoe"
+            )
         legacy_overlap = [
             name
             for name in (
