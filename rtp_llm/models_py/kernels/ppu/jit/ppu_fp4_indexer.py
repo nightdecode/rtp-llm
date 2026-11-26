@@ -323,8 +323,14 @@ def paged_score(q, q_scales, weights, cache, block_table, lengths, max_context):
     if lengths.dtype != torch.int32 or block_table.dtype != torch.int32:
         raise ValueError("FP4 paged Decode requires int32 lengths and block tables")
     page_size = cache.shape[1]
+    # Without the (next_n, heads, packed bytes per head, bytes per element)
+    # hint, PPU DeepGEMM plans in its compatibility mode: 48 verify rows over
+    # ~11k entries take 88 us instead of 42 us, with bitwise-identical logits.
     schedule = deep_gemm.get_paged_mqa_logits_metadata(
-        lengths, page_size, deep_gemm.get_num_sms()
+        lengths,
+        page_size,
+        deep_gemm.get_num_sms(),
+        metadata_extra=(1, q.shape[2], q.shape[-1], 1),
     )
     return deep_gemm.fp8_fp4_paged_mqa_logits(
         (q.contiguous(), q_scales.contiguous()),
