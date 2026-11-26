@@ -681,12 +681,18 @@ class DeepSeekV4DSparkModel(DSparkProposerMixin, DeepSeekV4Model):
         block_table: Optional[torch.Tensor],
         tokens_per_block: int,
         graph_metadata: Any,
+        slot_cache: Optional[dict] = None,
     ) -> torch.Tensor:
         """Non-causal fixed-block attention for one draft layer.
 
         The geometry (query rows, paged slots, index width) is platform
         independent; only the four operator calls below differ per platform
         and are delegated to the ``_dspark_*`` hooks.
+
+        ``slot_cache`` (one dict per draft forward) shares the query write
+        slots and the window+query indices across draft layers: they depend
+        only on the block table, positions and pool geometry, and building
+        them is ~60 small kernels per layer.
         """
         batch_size, gamma, _ = x.shape
         if batch_size == 0:
@@ -707,16 +713,21 @@ class DeepSeekV4DSparkModel(DSparkProposerMixin, DeepSeekV4Model):
             # Project and insert all query KVs before attention so each query
             # can read every other query position, including future noise.
             qkv = self._dspark_compute_qkv(attn, x, query_positions.reshape(-1))
-            query_req_ids = torch.arange(
-                batch_size, device=x.device, dtype=torch.long
-            ).repeat_interleave(gamma)
-            query_slots = self._global_pool_slots(
-                block_table,
-                query_req_ids,
-                query_positions.reshape(-1),
-                entries_per_block,
-                tokens_per_block,
-            )
+            cache_key = (entries_per_block, tokens_per_block)
+            cached = slot_cache.get(cache_key) if slot_cache is not None else None
+            if cached is None:
+                query_req_ids = torch.arange(
+                    batch_size, device=x.device, dtype=torch.long
+                ).repeat_interleave(gamma)
+                query_slots = self._global_pool_slots(
+                    block_table,
+                    query_req_ids,
+                    query_positions.reshape(-1),
+                    entries_per_block,
+                    tokens_per_block,
+                )
+            else:
+                query_slots = cached[0]
             decode_write_swa_fp8(
                 kv=qkv.kv,
                 slot_mapping=query_slots,
@@ -726,15 +737,21 @@ class DeepSeekV4DSparkModel(DSparkProposerMixin, DeepSeekV4Model):
                 head_dim=int(attn.head_dim),
             )
 
-            global_indices, topk_length = self._build_noncausal_indices(
-                prefix_lengths,
-                active_requests,
-                block_table,
-                entries_per_block,
-                tokens_per_block,
-            )
-            topk = int(global_indices.shape[-1])
-            global_indices = global_indices.view(batch_size, gamma, topk).contiguous()
+            if cached is None:
+                global_indices, topk_length = self._build_noncausal_indices(
+                    prefix_lengths,
+                    active_requests,
+                    block_table,
+                    entries_per_block,
+                    tokens_per_block,
+                )
+                topk = int(global_indices.shape[-1])
+                global_indices = global_indices.view(batch_size, gamma, topk).contiguous()
+                if slot_cache is not None:
+                    slot_cache[cache_key] = (query_slots, global_indices, topk_length)
+            else:
+                _, global_indices, topk_length = cached
+                topk = int(global_indices.shape[-1])
 
             sched_meta = self._dspark_sched_meta(
                 graph_metadata,
@@ -820,6 +837,7 @@ class DeepSeekV4DSparkModel(DSparkProposerMixin, DeepSeekV4Model):
         # only the attention call is substituted with the non-causal
         # fixed-block variant.
         layer_forward_range = _profiler.make_layer_forward_range()
+        slot_cache: dict = {}
         for layer_idx, layer in enumerate(self.v4.layers):
             with layer_forward_range(layer_idx):
                 hidden = layer.forward_decode(
@@ -835,6 +853,7 @@ class DeepSeekV4DSparkModel(DSparkProposerMixin, DeepSeekV4Model):
                         block_table,
                         tokens_per_block,
                         graph_metadata,
+                        slot_cache,
                     ),
                 )
 
